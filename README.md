@@ -191,6 +191,72 @@ curl -s "http://127.0.0.1:31415/open-terminal?name=${ISSUE}&cwd=${CWD}&cmd=${CMD
 
 The terminal is registered under `SOL-42`, so the hooks above will rename it correctly, and `/close-terminal?name=SOL-42` will close it when the work is done.
 
+## Common patterns
+
+### Pattern 1: Monitor multiple long-running processes
+
+Open a named terminal for each process, then rename it as status changes:
+
+```bash
+# Start a build
+curl "http://127.0.0.1:31415/open-terminal?name=build&cmd=npm%20run%20build"
+
+# From your build script, update the label as it progresses:
+curl "http://127.0.0.1:31415/rename-terminal?name=build&label=build%20%5B%E2%9A%99%EF%B8%8F%20compiling%5D"
+curl "http://127.0.0.1:31415/rename-terminal?name=build&label=build%20%5B%E2%9C%85%20done%5D"
+curl "http://127.0.0.1:31415/rename-terminal?name=build&label=build%20%5B%E2%9D%8C%20failed%5D"
+```
+
+### Pattern 2: Shell hooks for any interactive process
+
+Use zsh `preexec`/`precmd` hooks in `~/.zshrc` to update the tab whenever a command runs — no special tool integration needed:
+
+```zsh
+function preexec() {
+  N=$(basename "$PWD")
+  curl -s "http://127.0.0.1:31415/rename-terminal?name=$N&label=$N%20%5B%E2%9A%99%EF%B8%8F%20working%5D" > /dev/null 2>&1 &
+}
+function precmd() {
+  N=$(basename "$PWD")
+  curl -s "http://127.0.0.1:31415/rename-terminal?name=$N&label=$N%20%5B%E2%8F%B8%20idle%5D" > /dev/null 2>&1 &
+}
+```
+
+This works for any terminal opened via `/open-terminal` — the tab renames whenever a shell command starts or finishes.
+
+> **Note:** This approach only covers shell-level commands. If a process (like an AI agent) runs internally without spawning new shell commands, the shell hooks won't fire during its execution — use tool-level hooks (see Claude Code section) for finer-grained updates.
+
+### Pattern 3: CI / deployment status board
+
+Open a terminal per environment and rename as deploys complete:
+
+```bash
+for env in staging prod; do
+  curl "http://127.0.0.1:31415/open-terminal?name=deploy-$env"
+done
+
+# Later, from your deploy script:
+curl "http://127.0.0.1:31415/rename-terminal?name=deploy-staging&label=staging%20%5B%F0%9F%9F%A1%20deploying%5D"
+curl "http://127.0.0.1:31415/rename-terminal?name=deploy-staging&label=staging%20%5B%E2%9C%85%20live%5D"
+```
+
+### Pattern 4: Issue/task-scoped terminals
+
+Open one terminal per task, named after the task ID. The tab list becomes a live task board:
+
+```bash
+# Open a terminal for each task you're working on
+for issue in TASK-1 TASK-2 TASK-3; do
+  CWD=$(python3 -c "import urllib.parse; print(urllib.parse.quote(\"$HOME/work/$issue\"))")
+  curl "http://127.0.0.1:31415/open-terminal?name=$issue&cwd=$CWD"
+done
+
+# Close when done
+curl "http://127.0.0.1:31415/close-terminal?name=TASK-1"
+```
+
+---
+
 ## After a VS Code reload
 
 The registry is in-memory and resets on every **Developer: Reload Window**. Terminals opened before a reload are no longer tracked — `/rename-terminal` and `/close-terminal` will return `404` for them. Re-open them via `/open-terminal` to re-register.

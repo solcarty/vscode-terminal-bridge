@@ -66,8 +66,11 @@ function activate(context) {
       }
 
       // Make the target terminal active, rename it, restore previous active.
+      // Wait one event-loop tick after show() so VS Code registers the focus
+      // change before we fire renameWithArg (which targets the active terminal).
       const prev = vscode.window.activeTerminal;
       terminal.show(false);
+      await new Promise(r => setTimeout(r, 80));
       await vscode.commands.executeCommand(
         'workbench.action.terminal.renameWithArg',
         { name: label }

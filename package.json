@@ -2,8 +2,12 @@
   "name": "terminal-bridge",
   "displayName": "SDO Terminal Bridge",
   "description": "Opens named terminal tabs via HTTP — used by /worktree-start",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "publisher": "sdo",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/solcarty/vscode-terminal-bridge"
+  },
   "engines": { "vscode": "^1.70.0" },
   "activationEvents": ["onStartupFinished"],
   "main": "./extension.js",

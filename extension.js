@@ -22,17 +22,39 @@ function activate(context) {
 
     if (url.pathname === '/open-terminal') {
       const cwd  = url.searchParams.get('cwd')  || undefined;
-      const cmd  = url.searchParams.get('cmd')  || undefined;
       const name = url.searchParams.get('name') || undefined;
 
-      const terminal = vscode.window.createTerminal({ cwd, name });
+      // color — reserved for future status indicators (e.g. 'terminal.ansiGreen' for done,
+      // 'terminal.ansiRed' for blocked). Passed as a VS Code ThemeColor ID string.
+      const colorId = url.searchParams.get('color') || undefined;
+
+      // icon — reserved for future status icons (e.g. 'check', 'error', 'sync~spin').
+      // Passed as a VS Code ThemeIcon codicon name.
+      const iconId = url.searchParams.get('icon') || undefined;
+
+      const options = { cwd, name };
+      if (colorId) options.color = new vscode.ThemeColor(colorId);
+      if (iconId)  options.iconPath = new vscode.ThemeIcon(iconId);
+
+      const terminal = vscode.window.createTerminal(options);
       terminal.show(false); // open panel without stealing editor focus
+
+      // Inject OSC title sequence before the caller's command so the tab
+      // name is set immediately — before preexec/precmd hooks can fire.
+      // Without this, auto-run terminals show the creation `name` until
+      // the first shell hook fires.
+      if (name) {
+        terminal.sendText(`printf '\\033]0;${name}\\007'`, false);
+        terminal.sendText('', true); // flush with newline so the above runs
+      }
+
+      let cmd = url.searchParams.get('cmd') || undefined;
       if (cmd) terminal.sendText(cmd);
 
       if (name) terminals.set(name, terminal);
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, name, cwd, cmd }));
+      res.end(JSON.stringify({ ok: true, name, cwd, cmd, color: colorId, icon: iconId }));
 
     } else if (url.pathname === '/close-terminal') {
       const name = url.searchParams.get('name');

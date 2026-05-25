@@ -4,7 +4,7 @@ const http = require('http');
 let server;
 
 // Stable registry: creation key → terminal instance.
-// Survives OSC-driven display name changes inside the terminal process.
+// Survives display name changes.
 const terminals = new Map();
 
 function activate(context) {
@@ -17,44 +17,65 @@ function activate(context) {
     })
   );
 
-  server = http.createServer((req, res) => {
+  server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
 
     if (url.pathname === '/open-terminal') {
-      const cwd  = url.searchParams.get('cwd')  || undefined;
-      const name = url.searchParams.get('name') || undefined;
+      const cwd     = url.searchParams.get('cwd')   || undefined;
+      const name    = url.searchParams.get('name')  || undefined;
+      const cmd     = url.searchParams.get('cmd')   || undefined;
 
-      // color — reserved for future status indicators (e.g. 'terminal.ansiGreen' for done,
-      // 'terminal.ansiRed' for blocked). Passed as a VS Code ThemeColor ID string.
+      // color — reserved for future status indicators
+      // e.g. 'terminal.ansiGreen' (done), 'terminal.ansiRed' (blocked)
       const colorId = url.searchParams.get('color') || undefined;
 
-      // icon — reserved for future status icons (e.g. 'check', 'error', 'sync~spin').
-      // Passed as a VS Code ThemeIcon codicon name.
-      const iconId = url.searchParams.get('icon') || undefined;
+      // icon — reserved for future status icons
+      // e.g. 'check', 'error', 'sync~spin'
+      const iconId  = url.searchParams.get('icon')  || undefined;
 
       const options = { cwd, name };
-      if (colorId) options.color = new vscode.ThemeColor(colorId);
+      if (colorId) options.color    = new vscode.ThemeColor(colorId);
       if (iconId)  options.iconPath = new vscode.ThemeIcon(iconId);
 
       const terminal = vscode.window.createTerminal(options);
-      terminal.show(false); // open panel without stealing editor focus
-
-      // Inject OSC title sequence before the caller's command so the tab
-      // name is set immediately — before preexec/precmd hooks can fire.
-      // Without this, auto-run terminals show the creation `name` until
-      // the first shell hook fires.
-      if (name) {
-        terminal.sendText(`printf '\\033]0;${name}\\007'`, false);
-        terminal.sendText('', true); // flush with newline so the above runs
-      }
-
-      let cmd = url.searchParams.get('cmd') || undefined;
+      terminal.show(false);
       if (cmd) terminal.sendText(cmd);
-
       if (name) terminals.set(name, terminal);
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, name, cwd, cmd, color: colorId, icon: iconId }));
+
+    } else if (url.pathname === '/rename-terminal') {
+      // Rename a terminal tab via VS Code API — no OSC sequences needed.
+      // Called by Claude Code hooks (PreToolUse/Stop) to show live status:
+      //   curl "http://127.0.0.1:31415/rename-terminal?name=SOL-60&label=SOL-60%20[%E2%9A%99%20working]"
+      const name  = url.searchParams.get('name');
+      const label = url.searchParams.get('label');
+      const terminal = name && terminals.get(name);
+
+      if (!terminal) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Terminal not found', name }));
+        return;
+      }
+
+      if (!label) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'label param required' }));
+        return;
+      }
+
+      // Make the target terminal active, rename it, restore previous active.
+      const prev = vscode.window.activeTerminal;
+      terminal.show(false);
+      await vscode.commands.executeCommand(
+        'workbench.action.terminal.renameWithArg',
+        { name: label }
+      );
+      if (prev && prev !== terminal) prev.show(false);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, name, label }));
 
     } else if (url.pathname === '/close-terminal') {
       const name = url.searchParams.get('name');

@@ -133,7 +133,17 @@ Response:
 
 ### Live status labels via hooks
 
-Add these hooks to `~/.claude/settings.json` to automatically rename terminal tabs as Claude works:
+Three Claude Code hook events map cleanly to terminal-tab states. With all three wired, a glance at the VS Code tab strip tells you exactly which sessions need you — invaluable when running an orchestrator-style setup with many Claude sessions in named tabs:
+
+| Hook event | Label | Meaning |
+|---|---|---|
+| `PreToolUse` | `[⚙️ working]` | Claude is about to invoke a tool |
+| `Stop` | `[⏸ idle]` | Claude finished its turn |
+| `Notification` | `[🛎 needs-input]` | Claude is waiting on you — permission prompt, question, etc. |
+
+The `Notification` hook is the one that actually drives the orchestrator workflow — it distinguishes "finished" from "blocked on you".
+
+Add these hooks to `~/.claude/settings.json`:
 
 ```json
 {
@@ -144,8 +154,9 @@ Add these hooks to `~/.claude/settings.json` to automatically rename terminal ta
         "hooks": [
           {
             "type": "command",
-            "command": "N=$(basename $PWD); curl -s \"http://127.0.0.1:31415/rename-terminal?name=$N&label=$N%20%5B%E2%9A%99%EF%B8%8F%20working%5D\" > /dev/null 2>&1 || true",
-            "async": true
+            "command": "N=$(basename \"$PWD\"); curl -s \"http://127.0.0.1:31415/rename-terminal?name=$N&label=$N%20%5B%E2%9A%99%EF%B8%8F%20working%5D\" > /dev/null 2>&1 || true",
+            "async": true,
+            "timeout": 2
           }
         ]
       }
@@ -156,8 +167,22 @@ Add these hooks to `~/.claude/settings.json` to automatically rename terminal ta
         "hooks": [
           {
             "type": "command",
-            "command": "N=$(basename $PWD); curl -s \"http://127.0.0.1:31415/rename-terminal?name=$N&label=$N%20%5B%E2%8F%B8%20idle%5D\" > /dev/null 2>&1 || true",
-            "async": true
+            "command": "N=$(basename \"$PWD\"); curl -s \"http://127.0.0.1:31415/rename-terminal?name=$N&label=$N%20%5B%E2%8F%B8%20idle%5D\" > /dev/null 2>&1 || true",
+            "async": true,
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "N=$(basename \"$PWD\"); curl -s \"http://127.0.0.1:31415/rename-terminal?name=$N&label=$N%20%5B%F0%9F%9B%8E%20needs-input%5D\" > /dev/null 2>&1 || true",
+            "async": true,
+            "timeout": 2
           }
         ]
       }
@@ -166,7 +191,7 @@ Add these hooks to `~/.claude/settings.json` to automatically rename terminal ta
 }
 ```
 
-This renames the tab to `SOL-60 [⚙️ working]` when Claude uses a tool, and `SOL-60 [⏸ idle]` when it stops — letting you monitor multiple Claude sessions across tabs at a glance.
+This renames the tab to `SOL-60 [⚙️ working]` while Claude is using a tool, `SOL-60 [🛎 needs-input]` when it's blocked on you, and `SOL-60 [⏸ idle]` when it's done.
 
 > **Why `async: true`?** Hook commands run synchronously by default and block Claude's response. `async: true` fires the curl in the background so it doesn't add latency.
 

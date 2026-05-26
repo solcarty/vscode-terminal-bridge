@@ -33,7 +33,21 @@ Scripts running inside a VS Code terminal read `.vscode-bridge-port` from their 
 
 ## Installation
 
-### Option A: Manual (clone and drop in)
+### Option A: Install from VSIX (recommended)
+
+Download the latest `.vsix` from [Releases](../../releases) and run:
+
+```bash
+# VS Code stable:
+code --install-extension terminal-bridge-*.vsix
+
+# VS Code Insiders:
+code-insiders --install-extension terminal-bridge-*.vsix
+```
+
+Then reload VS Code (`Cmd+Shift+P` → **Developer: Reload Window**).
+
+### Option B: Manual (clone and drop in)
 
 ```bash
 # VS Code stable:
@@ -45,15 +59,13 @@ git clone https://github.com/solcarty/vscode-terminal-bridge \
   ~/.vscode-insiders/extensions/sdo.terminal-bridge-0.0.1
 ```
 
-Then reload VS Code (`Cmd+Shift+P` → **Developer: Reload Window**).
+Then reload VS Code.
 
-### Option B: Install from VSIX
+## Workspace requirement
 
-Download the latest `.vsix` from [Releases](../../releases) and run:
+The `.vscode-bridge-port` file is written to each **workspace folder** — a path that VS Code has open as a root in the Explorer. If you open a loose file or a folder that isn't part of a workspace, the port file won't be written and port discovery will fall back to `31415`.
 
-```bash
-code --install-extension terminal-bridge-*.vsix
-```
+For the port file to work correctly, your repo root must be open as a workspace folder (the normal case when you open a folder with `code .` or `code-insiders .`). When you add worktrees with `code --add <path>`, the extension writes the port file there too, so hooks and scripts running inside a worktree terminal always find the right port.
 
 ## VS Code title format (recommended)
 

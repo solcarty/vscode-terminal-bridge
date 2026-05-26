@@ -1,5 +1,7 @@
 const vscode = require('vscode');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const { exec } = require('child_process');
 const { promisify } = require('util');
 
@@ -258,11 +260,14 @@ function activate(context) {
       res.end(JSON.stringify({ ok: true, reindexed: count }));
 
     } else if (url.pathname === '/ping') {
+      const folders = (vscode.workspace.workspaceFolders || []).map(f => f.uri.fsPath);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ok: true,
+        port: activePort,
         ipcHook: process.env.VSCODE_IPC_HOOK || null,
         pid: process.env.VSCODE_PID ? Number(process.env.VSCODE_PID) : null,
+        workspaceFolders: folders,
       }));
 
     } else {
@@ -271,15 +276,52 @@ function activate(context) {
     }
   });
 
-  server.listen(31415, '127.0.0.1', () => {
-    console.log('[terminal-bridge] listening on 127.0.0.1:31415');
-  });
+  // ── Dynamic port binding — try 31415, increment on EADDRINUSE ───────────
+  let activePort = 31415;
+
+  function writePortFiles(port) {
+    const folders = vscode.workspace.workspaceFolders || [];
+    for (const folder of folders) {
+      try {
+        fs.writeFileSync(path.join(folder.uri.fsPath, '.vscode-bridge-port'), String(port), 'utf8');
+      } catch { /* ignore read-only folders */ }
+    }
+  }
+
+  function removePortFiles() {
+    const folders = vscode.workspace.workspaceFolders || [];
+    for (const folder of folders) {
+      try {
+        const p = path.join(folder.uri.fsPath, '.vscode-bridge-port');
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+      } catch { /* ignore */ }
+    }
+  }
+
+  // Re-write port files when the workspace changes (e.g. code --add adds a worktree folder)
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(() => writePortFiles(activePort))
+  );
+
+  function startServer(port) {
+    server.listen(port, '127.0.0.1', () => {
+      activePort = port;
+      console.log(`[terminal-bridge] listening on 127.0.0.1:${port}`);
+      writePortFiles(port);
+    });
+  }
 
   server.on('error', (err) => {
-    console.error('[terminal-bridge] server error:', err.message);
+    if (err.code === 'EADDRINUSE') {
+      startServer(activePort + 1);
+    } else {
+      console.error('[terminal-bridge] server error:', err.message);
+    }
   });
 
-  context.subscriptions.push({ dispose: () => server && server.close() });
+  startServer(activePort);
+
+  context.subscriptions.push({ dispose: () => { removePortFiles(); server && server.close(); } });
 }
 
 function deactivate() {

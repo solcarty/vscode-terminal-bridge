@@ -99,21 +99,37 @@ Response:
 
 ### `GET /rename-terminal`
 
-Renames a tracked terminal tab by its registry name. Uses VS Code's `workbench.action.terminal.renameWithArg` command, which sets a **static label** that persists regardless of shell title sequences.
+Renames a tracked terminal tab and optionally updates its icon and color. Uses VS Code's `workbench.action.terminal.renameWithArg` command with `preserveFocus: true` — **keyboard focus is never stolen** from the editor or active terminal.
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `name` | Yes | Registry name (as passed to `/open-terminal`) |
 | `label` | Yes | New display label for the tab |
+| `icon` | No | VS Code ThemeIcon ID (e.g. `sync~spin`, `bell`, `check`) |
+| `color` | No | VS Code ThemeColor ID (e.g. `terminal.ansiCyan`, `terminal.ansiYellow`, `terminal.ansiGreen`) |
+
+**Recommended label format:** put status first so it's always visible regardless of tab width:
+
+```
+🤖 ⚙️ SOL-69    ← working
+🤖 🛎 SOL-69    ← needs input
+🤖 ⏸ SOL-69    ← idle
+```
 
 ```bash
-curl "http://127.0.0.1:31415/rename-terminal?name=my-tab&label=my-tab%20%5B%E2%9A%99%EF%B8%8F%20working%5D"
-# Sets tab to: my-tab [⚙️ working]
+# Working
+curl "http://127.0.0.1:31415/rename-terminal?name=SOL-69&label=%F0%9F%A4%96%20%E2%9A%99%EF%B8%8F%20SOL-69&icon=sync~spin&color=terminal.ansiCyan"
+
+# Needs input
+curl "http://127.0.0.1:31415/rename-terminal?name=SOL-69&label=%F0%9F%A4%96%20%F0%9F%9B%8E%20SOL-69&icon=bell&color=terminal.ansiYellow"
+
+# Idle
+curl "http://127.0.0.1:31415/rename-terminal?name=SOL-69&label=%F0%9F%A4%96%20%E2%8F%B8%20SOL-69&icon=check&color=terminal.ansiGreen"
 ```
 
 Response:
 ```json
-{ "ok": true, "name": "my-tab", "label": "my-tab [⚙️ working]" }
+{ "ok": true, "name": "SOL-69", "label": "🤖 ⚙️ SOL-69", "icon": "sync~spin", "color": "terminal.ansiCyan" }
 ```
 
 Returns `404` if the terminal is not in the registry (e.g. opened before the last reload).
@@ -145,13 +161,15 @@ Response:
 
 Three Claude Code hook events map cleanly to terminal-tab states. With all three wired, a glance at the VS Code tab strip tells you exactly which sessions need you — invaluable when running an orchestrator-style setup with many Claude sessions in named tabs:
 
-| Hook event | Label | Meaning |
-|---|---|---|
-| `PreToolUse` | `[⚙️ working]` | Claude is about to invoke a tool |
-| `Stop` | `[⏸ idle]` | Claude finished its turn |
-| `Notification` | `[🛎 needs-input]` | Claude is waiting on you — permission prompt, question, etc. |
+Status is always the **first thing** in the label so it's visible no matter how narrow the tab strip gets:
 
-The `Notification` hook is the one that actually drives the orchestrator workflow — it distinguishes "finished" from "blocked on you".
+| Hook event | Tab label | Icon | Color | Meaning |
+|---|---|---|---|---|
+| `PreToolUse` | `🤖 ⚙️ SOL-69` | `sync~spin` | cyan | Claude is running a tool |
+| `Notification` | `🤖 🛎 SOL-69` | `bell` | yellow | Waiting on you — permission prompt, question, etc. |
+| `Stop` | `🤖 ⏸ SOL-69` | `check` | green | Turn complete |
+
+The `🤖` prefix marks the tab as a Claude sub-agent at a glance. The `Notification` hook is the load-bearing one for multi-session orchestration — it's how you distinguish "finished" from "blocked on you".
 
 Add these hooks to `~/.claude/settings.json`:
 
@@ -164,20 +182,7 @@ Add these hooks to `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "N=$(basename \"$PWD\"); curl -s \"http://127.0.0.1:31415/rename-terminal?name=$N&label=$N%20%5B%E2%9A%99%EF%B8%8F%20working%5D\" > /dev/null 2>&1 || true",
-            "async": true,
-            "timeout": 2
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "N=$(basename \"$PWD\"); curl -s \"http://127.0.0.1:31415/rename-terminal?name=$N&label=$N%20%5B%E2%8F%B8%20idle%5D\" > /dev/null 2>&1 || true",
+            "command": "N=$(basename \"$PWD\"); curl -s \"http://127.0.0.1:31415/rename-terminal?name=$N&label=%F0%9F%A4%96%20%E2%9A%99%EF%B8%8F%20$N&icon=sync~spin&color=terminal.ansiCyan\" > /dev/null 2>&1 || true",
             "async": true,
             "timeout": 2
           }
@@ -190,7 +195,20 @@ Add these hooks to `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "N=$(basename \"$PWD\"); curl -s \"http://127.0.0.1:31415/rename-terminal?name=$N&label=$N%20%5B%F0%9F%9B%8E%20needs-input%5D\" > /dev/null 2>&1 || true",
+            "command": "N=$(basename \"$PWD\"); curl -s \"http://127.0.0.1:31415/rename-terminal?name=$N&label=%F0%9F%A4%96%20%F0%9F%9B%8E%20$N&icon=bell&color=terminal.ansiYellow\" > /dev/null 2>&1 || true",
+            "async": true,
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "N=$(basename \"$PWD\"); curl -s \"http://127.0.0.1:31415/rename-terminal?name=$N&label=%F0%9F%A4%96%20%E2%8F%B8%20$N&icon=check&color=terminal.ansiGreen\" > /dev/null 2>&1 || true",
             "async": true,
             "timeout": 2
           }
@@ -201,7 +219,7 @@ Add these hooks to `~/.claude/settings.json`:
 }
 ```
 
-This renames the tab to `SOL-60 [⚙️ working]` while Claude is using a tool, `SOL-60 [🛎 needs-input]` when it's blocked on you, and `SOL-60 [⏸ idle]` when it's done.
+Tabs cycle through `🤖 ⚙️ SOL-69` → `🤖 🛎 SOL-69` → `🤖 ⏸ SOL-69` automatically as Claude works.
 
 > **Why `async: true`?** Hook commands run synchronously by default and block Claude's response. `async: true` fires the curl in the background so it doesn't add latency.
 

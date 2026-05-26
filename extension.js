@@ -97,8 +97,12 @@ function activate(context) {
       res.end(JSON.stringify({ ok: true, name }));
 
     } else if (url.pathname === '/ping') {
-      res.writeHead(200);
-      res.end('pong');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        ipcHook: process.env.VSCODE_IPC_HOOK || null,
+        pid: process.env.VSCODE_PID ? Number(process.env.VSCODE_PID) : null,
+      }));
 
     } else {
       res.writeHead(404);

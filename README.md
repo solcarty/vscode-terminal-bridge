@@ -53,10 +53,20 @@ This gives you:
 
 ### `GET /ping`
 
-Health check. Returns `pong` if the extension is running.
+Health check. Returns JSON with `ok`, `ipcHook`, and `pid` — uniquely identifying the VS Code window the bridge is running in.
 
 ```bash
 curl http://127.0.0.1:31415/ping
+# {"ok":true,"ipcHook":"/Users/you/Library/Application Support/Code - Insiders/1.12-main.sock","pid":1563}
+```
+
+Use this to verify the bridge is running in the **same** VS Code window as your script before calling `/open-terminal`. VS Code sets `$VSCODE_IPC_HOOK` in every terminal it opens — compare that against the `ipcHook` field:
+
+```bash
+BRIDGE_HOOK=$(curl -s http://127.0.0.1:31415/ping | python3 -c "import sys,json; print(json.load(sys.stdin).get('ipcHook',''))")
+if [ "$BRIDGE_HOOK" != "$VSCODE_IPC_HOOK" ]; then
+  echo "⚠️  Bridge is in a different VS Code window — switch windows to see new terminals"
+fi
 ```
 
 ---

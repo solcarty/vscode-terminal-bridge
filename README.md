@@ -49,14 +49,22 @@ Then reload VS Code (`Cmd+Shift+P` → **Developer: Reload Window**).
 
 ### Option B: Manual (clone and drop in)
 
+Clone once into a version-free directory — `git pull` inside it always gives you the latest:
+
 ```bash
 # VS Code stable:
 git clone https://github.com/solcarty/vscode-terminal-bridge \
-  ~/.vscode/extensions/sdo.terminal-bridge-0.0.1
+  ~/.vscode/extensions/sdo.terminal-bridge
 
 # VS Code Insiders:
 git clone https://github.com/solcarty/vscode-terminal-bridge \
-  ~/.vscode-insiders/extensions/sdo.terminal-bridge-0.0.1
+  ~/.vscode-insiders/extensions/sdo.terminal-bridge
+```
+
+To update later:
+
+```bash
+cd ~/.vscode-insiders/extensions/sdo.terminal-bridge && git pull
 ```
 
 Then reload VS Code.
@@ -312,7 +320,7 @@ Copy this into `~/.claude/settings.json` (or merge into your existing `hooks` ke
 ```
 
 > **Why `async: true`?** Hook commands run synchronously by default and block Claude's response. `async: true` fires the curl in the background so it adds no latency.
-
+>
 > **Why not OSC escape sequences?** Claude Code hooks run as detached subprocesses without a controlling TTY, so writing `\033]0;...\007` to `/dev/tty` fails silently. Calling this extension's HTTP API is the reliable alternative.
 
 ### Extending to other hook types

@@ -47,10 +47,16 @@ function activate(context) {
 
     } else if (url.pathname === '/rename-terminal') {
       // Rename a terminal tab via VS Code API — no OSC sequences needed.
-      // Called by Claude Code hooks (PreToolUse/Stop) to show live status:
-      //   curl "http://127.0.0.1:31415/rename-terminal?name=SOL-60&label=SOL-60%20[%E2%9A%99%20working]"
-      const name  = url.searchParams.get('name');
-      const label = url.searchParams.get('label');
+      // Called by Claude Code hooks (PreToolUse/Notification/Stop) to show live status.
+      //
+      // Optional icon + color params update the tab's visual state alongside the label:
+      //   PreToolUse:  icon=sync~spin  color=terminal.ansiCyan
+      //   Notification: icon=bell      color=terminal.ansiYellow
+      //   Stop:         icon=check     color=terminal.ansiGreen
+      const name    = url.searchParams.get('name');
+      const label   = url.searchParams.get('label');
+      const colorId = url.searchParams.get('color') || undefined;
+      const iconId  = url.searchParams.get('icon')  || undefined;
       const terminal = name && terminals.get(name);
 
       if (!terminal) {
@@ -65,20 +71,23 @@ function activate(context) {
         return;
       }
 
-      // Make the target terminal active, rename it, restore previous active.
-      // Wait one event-loop tick after show() so VS Code registers the focus
-      // change before we fire renameWithArg (which targets the active terminal).
+      // Only switch the active terminal if needed — renameWithArg targets the active one.
+      // Use show(true) = preserveFocus so keyboard focus is NEVER stolen from the editor.
       const prev = vscode.window.activeTerminal;
-      terminal.show(false);
-      await new Promise(r => setTimeout(r, 80));
+      const needsSwitch = prev !== terminal;
+      if (needsSwitch) terminal.show(true);
       await vscode.commands.executeCommand(
         'workbench.action.terminal.renameWithArg',
         { name: label }
       );
-      if (prev && prev !== terminal) prev.show(false);
+      if (needsSwitch && prev) prev.show(true);
+
+      // Update icon and color if provided
+      if (iconId)  terminal.iconPath = new vscode.ThemeIcon(iconId);
+      if (colorId) terminal.color    = new vscode.ThemeColor(colorId);
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, name, label }));
+      res.end(JSON.stringify({ ok: true, name, label, icon: iconId, color: colorId }));
 
     } else if (url.pathname === '/close-terminal') {
       const name = url.searchParams.get('name');

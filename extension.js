@@ -181,6 +181,19 @@ function activate(context) {
       res.end(JSON.stringify({ ok: true, name, cwd, cmd, color: colorId, icon: iconId }));
 
     } else if (url.pathname === '/rename-terminal') {
+      // Rename a terminal tab via VS Code API — no OSC sequences needed.
+      // Called by /linear-process at each phase boundary to update label, icon, and color.
+      //
+      // Phase → label/icon/color convention (emoji goes at the front of the label):
+      //   setup       label="🔧 SOL-XX"  icon=hubot  color=terminal.ansiCyan
+      //   planning    label="📋 SOL-XX"  icon=hubot  color=terminal.ansiCyan
+      //   coding      label="⚙️ SOL-XX"  icon=hubot  color=terminal.ansiCyan
+      //   in progress label="▶️ SOL-XX"  icon=hubot  color=terminal.ansiCyan
+      //   blocked     label="🚫 SOL-XX"  icon=error  color=terminal.ansiRed
+      //   done        label="✅ SOL-XX"  icon=check  color=terminal.ansiGreen
+      //
+      // The hubot icon is set at terminal creation (/open-terminal) and persists
+      // as the subagent identity marker. icon= here overrides only for terminal states.
       const name    = url.searchParams.get('name');
       const label   = url.searchParams.get('label');
       const colorId = url.searchParams.get('color') || undefined;

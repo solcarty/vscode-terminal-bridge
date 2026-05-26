@@ -8,6 +8,8 @@ Built to solve a real problem: VS Code extensions and external scripts **cannot*
 
 On activation, the extension starts an HTTP server on `127.0.0.1:31415`. Terminals opened via `/open-terminal` are registered in an internal Map (`name → terminal instance`). This registry survives tab renames and lets you target the right terminal for later `/rename-terminal` and `/close-terminal` calls.
 
+Terminal metadata (`name`, `cwd`, `label`, `color`) is persisted to VS Code workspace state. On every window activation the extension scans all open terminals and re-links any that match a persisted entry or a live `git worktree list` path — so `/rename-terminal` and `/close-terminal` keep working after a **Developer: Reload Window** without any manual intervention.
+
 > **Important:** Only terminals opened via `/open-terminal` with a `name` are tracked. Terminals opened manually in VS Code are not in the registry.
 
 ## Installation
@@ -50,6 +52,19 @@ This gives you:
 - When a terminal is renamed via `/rename-terminal`, the static label overrides this format entirely
 
 ## API
+
+### `GET /reindex`
+
+Manually triggers a re-index scan. Useful right after a **Developer: Reload Window** before the window has received focus (the automatic trigger fires on focus), or from a startup script that wants to confirm the registry is populated.
+
+```bash
+curl http://127.0.0.1:31415/reindex
+# {"ok":true,"reindexed":3}
+```
+
+The `reindexed` count is the number of terminals newly linked in this call (0 if everything was already tracked).
+
+---
 
 ### `GET /ping`
 
@@ -312,7 +327,7 @@ curl "http://127.0.0.1:31415/close-terminal?name=TASK-1"
 
 ## After a VS Code reload
 
-The registry is in-memory and resets on every **Developer: Reload Window**. Terminals opened before a reload are no longer tracked — `/rename-terminal` and `/close-terminal` will return `404` for them. Re-open them via `/open-terminal` to re-register.
+The extension re-indexes automatically. When the window is focused after a reload it scans all open terminals against persisted metadata and active git worktrees, re-linking any match. You can also call `/reindex` explicitly from a script to force a scan without waiting for window focus.
 
 ## Security
 

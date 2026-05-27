@@ -166,14 +166,23 @@ function activate(context) {
       const cmd     = url.searchParams.get('cmd')   || undefined;
       const colorId = url.searchParams.get('color') || undefined;
       const iconId  = url.searchParams.get('icon')  || undefined;
+      // focus=1 steals keyboard focus (old default); omit or focus=0 to preserve focus.
+      const stealFocus = url.searchParams.get('focus') === '1';
 
       const options = { cwd, name };
       if (colorId) options.color    = new vscode.ThemeColor(colorId);
       if (iconId)  options.iconPath = new vscode.ThemeIcon(iconId);
 
       const terminal = vscode.window.createTerminal(options);
-      terminal.show(false);
+      // preserveFocus=true by default so spawning a terminal never yanks the
+      // cursor out of the editor. Pass focus=1 to explicitly steal focus.
+      terminal.show(!stealFocus);
+
+      // Inject CLAUDE_TAB_NAME so hook scripts can resolve the tab name
+      // without relying on basename($PWD) convention.
+      if (name) terminal.sendText(`export CLAUDE_TAB_NAME=${JSON.stringify(name)}`);
       if (cmd) terminal.sendText(cmd);
+
       if (name) {
         terminals.set(name, terminal);
         await persistMetadata(context, name, { cwd, label: name, color: colorId });
@@ -184,22 +193,18 @@ function activate(context) {
 
     } else if (url.pathname === '/rename-terminal') {
       // Rename a terminal tab via VS Code API — no OSC sequences needed.
-      // Called by /linear-process at each phase boundary to update label, icon, and color.
       //
-      // Phase → label/icon/color convention (emoji goes at the front of the label):
-      //   setup       label="🔧 SOL-XX"  icon=hubot  color=terminal.ansiCyan
-      //   planning    label="📋 SOL-XX"  icon=hubot  color=terminal.ansiCyan
-      //   coding      label="⚙️ SOL-XX"  icon=hubot  color=terminal.ansiCyan
-      //   in progress label="▶️ SOL-XX"  icon=hubot  color=terminal.ansiCyan
-      //   blocked     label="🚫 SOL-XX"  icon=error  color=terminal.ansiRed
-      //   done        label="✅ SOL-XX"  icon=check  color=terminal.ansiGreen
+      // quiet=1 mode: silently updates only iconPath and color without activating
+      // the terminal panel. Use this for high-frequency lifecycle hooks (PreToolUse,
+      // Notification, Stop) to avoid panel flicker and focus stealing.
       //
-      // The hubot icon is set at terminal creation (/open-terminal) and persists
-      // as the subagent identity marker. icon= here overrides only for terminal states.
+      // Normal mode: updates label via renameWithArg (requires briefly activating
+      // the target terminal), then restores the previously active terminal.
       const name    = url.searchParams.get('name');
-      const label   = url.searchParams.get('label');
+      const label   = url.searchParams.get('label') || undefined;
       const colorId = url.searchParams.get('color') || undefined;
       const iconId  = url.searchParams.get('icon')  || undefined;
+      const quiet   = url.searchParams.get('quiet') === '1';
       const terminal = name && terminals.get(name);
 
       if (!terminal) {
@@ -208,9 +213,21 @@ function activate(context) {
         return;
       }
 
-      if (!label) {
+      if (!quiet && !label) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: 'label param required' }));
+        res.end(JSON.stringify({ ok: false, error: 'label param required (or pass quiet=1)' }));
+        return;
+      }
+
+      if (quiet) {
+        // Silent update — no terminal activation, no panel flicker.
+        // Only iconPath and color are changed; the label remains as-is.
+        if (iconId)  terminal.iconPath = new vscode.ThemeIcon(iconId);
+        if (colorId) terminal.color    = new vscode.ThemeColor(colorId);
+        if (colorId) await persistMetadata(context, name, { color: colorId });
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, name, label: null, icon: iconId, color: colorId, quiet: true }));
         return;
       }
 
@@ -250,6 +267,58 @@ function activate(context) {
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, name }));
+
+    } else if (url.pathname === '/add-folder') {
+      // Attach a path to the current VS Code workspace without needing the
+      // `code` CLI on $PATH. Idempotent — returns ok:true if already attached.
+      const p = url.searchParams.get('path');
+      if (!p) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'path param required' }));
+        return;
+      }
+
+      const uri = vscode.Uri.file(p);
+      const existing = (vscode.workspace.workspaceFolders || []).find(
+        f => f.uri.fsPath === uri.fsPath
+      );
+      if (existing) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, path: p, added: false, alreadyAttached: true }));
+        return;
+      }
+
+      const indexParam = url.searchParams.get('index');
+      const folderName = url.searchParams.get('name') || undefined;
+      const start = (vscode.workspace.workspaceFolders || []).length;
+      const index = indexParam !== null ? parseInt(indexParam, 10) : start;
+
+      const ok = vscode.workspace.updateWorkspaceFolders(index, 0, { uri, name: folderName });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok, path: p, added: ok, alreadyAttached: false }));
+
+    } else if (url.pathname === '/remove-folder') {
+      // Detach a workspace folder by path. Idempotent — returns ok:true if
+      // the folder wasn't attached to begin with.
+      const p = url.searchParams.get('path');
+      if (!p) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'path param required' }));
+        return;
+      }
+
+      const uri = vscode.Uri.file(p);
+      const folders = vscode.workspace.workspaceFolders || [];
+      const idx = folders.findIndex(f => f.uri.fsPath === uri.fsPath);
+      if (idx === -1) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, path: p, removed: false, wasAttached: false }));
+        return;
+      }
+
+      const ok = vscode.workspace.updateWorkspaceFolders(idx, 1);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok, path: p, removed: ok, wasAttached: true }));
 
     } else if (url.pathname === '/reindex') {
       // Explicit re-index trigger — useful right after a window reload before
@@ -298,7 +367,7 @@ function activate(context) {
     }
   }
 
-  // Re-write port files when the workspace changes (e.g. code --add adds a worktree folder)
+  // Re-write port files when the workspace changes (e.g. /add-folder adds a worktree folder)
   context.subscriptions.push(
     vscode.workspace.onDidChangeWorkspaceFolders(() => writePortFiles(activePort))
   );

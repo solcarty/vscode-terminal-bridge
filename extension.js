@@ -23,11 +23,21 @@ const METADATA_KEY = 'terminalBridgeMetadata';
 // ---------------------------------------------------------------------------
 
 const STATUS_MAP = {
-  'working':     { codicon: 'loading~spin', color: 'terminal.ansiCyan' },
-  'needs-input': { codicon: 'bell-dot',     color: 'terminal.ansiYellow' },
-  'idle':        { codicon: 'debug-pause',  color: 'terminal.ansiGreen' },
-  'pr-open':     { codicon: 'pass-filled',  color: 'terminal.ansiGreen' },
-  'merged':      { codicon: 'git-merge',    color: 'terminal.ansiMagenta' },
+  // ── Lifecycle ──────────────────────────────────────────────────────────────
+  'working':     { codicon: 'loading~spin',   color: 'terminal.ansiCyan' },
+  'needs-input': { codicon: 'bell-dot',       color: 'terminal.ansiYellow' },
+  'idle':        { codicon: 'debug-pause',    color: 'terminal.ansiGreen' },
+  // ── Blocking / error states ────────────────────────────────────────────────
+  'permission':  { codicon: 'shield',         color: 'terminal.ansiBlue' },
+  'error':       { codicon: 'error',          color: 'terminal.ansiRed' },
+  // ── Background / parallel work ─────────────────────────────────────────────
+  'compacting':  { codicon: 'archive',        color: 'terminal.ansiBlue' },
+  'subagent':    { codicon: 'symbol-array',   color: 'terminal.ansiMagenta' },
+  'bg-task':     { codicon: 'server-process', color: 'terminal.ansiBlue' },
+  'task-done':   { codicon: 'check-all',      color: 'terminal.ansiGreen' },
+  // ── Completion badges ──────────────────────────────────────────────────────
+  'pr-open':     { codicon: 'pass-filled',    color: 'terminal.ansiGreen' },
+  'merged':      { codicon: 'git-merge',      color: 'terminal.ansiMagenta' },
 };
 
 // ---------------------------------------------------------------------------

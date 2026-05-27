@@ -193,14 +193,20 @@ Renames a tracked terminal tab and optionally updates its icon and color. Suppor
 
 #### Status values
 
-| `status=` | Codicon | Color |
-| --------- | ------- | ----- |
-| `working` | `$(loading~spin)` | `terminal.ansiCyan` |
-| `needs-input` | `$(bell-dot)` | `terminal.ansiYellow` |
-| `idle` | `$(debug-pause)` | `terminal.ansiGreen` |
-| `pr-open` | `$(pass-filled)` | `terminal.ansiGreen` |
-| `merged` | `$(git-merge)` | `terminal.ansiMagenta` |
-| `none` | *(strip prefix)* | *(unchanged)* |
+| `status=` | Codicon | Color | When to use |
+| --------- | ------- | ----- | ----------- |
+| `working` | `$(loading~spin)` | cyan | `PreToolUse` — agent is actively running a tool |
+| `needs-input` | `$(bell-dot)` | yellow | `Notification` — agent needs a content decision |
+| `idle` | `$(debug-pause)` | green | `Stop` — agent turn complete |
+| `permission` | `$(shield)` | blue | `PermissionRequest` — tool needs explicit approval |
+| `error` | `$(error)` | red | `PostToolUseFailure` / `StopFailure` — needs human eyes |
+| `compacting` | `$(archive)` | blue | `PreCompact` — auto-compaction running |
+| `subagent` | `$(symbol-array)` | magenta | `SubagentStart` — parallel sub-agent active |
+| `bg-task` | `$(server-process)` | blue | `TaskCreated` — background task queued/running |
+| `task-done` | `$(check-all)` | green | `TaskCompleted` — sticky "go look at this" badge |
+| `pr-open` | `$(pass-filled)` | green | After `gh pr create` |
+| `merged` | `$(git-merge)` | magenta | After merge |
+| `none` | *(strip prefix)* | *(unchanged)* | Manual reset |
 
 ```bash
 PORT=$(cat "$PWD/.vscode-bridge-port" 2>/dev/null || echo 31415)
@@ -364,11 +370,17 @@ curl -s "http://127.0.0.1:${PORT}/rename-terminal?name=$N&status=working" \
 
 Use `status=` for all lifecycle hooks — the bridge owns the codicon + color mapping so every caller automatically gets a consistent look:
 
-| `status=` | Tab shows | Color |
-| --------- | --------- | ----- |
-| `working` | `$(loading~spin) SOL-42` | Cyan |
-| `needs-input` | `$(bell-dot) SOL-42` | Yellow |
-| `idle` | `$(debug-pause) SOL-42` | Green |
+| Hook / event | `status=` | Tab shows | Color |
+| ------------ | --------- | --------- | ----- |
+| `PreToolUse` | `working` | `$(loading~spin) SOL-42` | Cyan |
+| `Notification` | `needs-input` | `$(bell-dot) SOL-42` | Yellow |
+| `Stop` | `idle` | `$(debug-pause) SOL-42` | Green |
+| `PermissionRequest` | `permission` | `$(shield) SOL-42` | Blue |
+| `PostToolUseFailure` / `StopFailure` | `error` | `$(error) SOL-42` | Red |
+| `PreCompact` | `compacting` | `$(archive) SOL-42` | Blue |
+| `SubagentStart` | `subagent` | `$(symbol-array) SOL-42` | Magenta |
+| `TaskCreated` | `bg-task` | `$(server-process) SOL-42` | Blue |
+| `TaskCompleted` | `task-done` | `$(check-all) SOL-42` | Green |
 
 The `hubot` icon set at creation persists as the Claude-session identity marker throughout — `status=` never touches `iconPath`.
 

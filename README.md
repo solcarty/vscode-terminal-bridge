@@ -174,49 +174,79 @@ Response:
 
 ### `GET /rename-terminal`
 
-Renames a tracked terminal tab and optionally updates its icon and color.
+Renames a tracked terminal tab and optionally updates its icon and color. Supports three modes.
 
 | Parameter | Required | Description |
 | --------- | -------- | ----------- |
 | `name` | Yes | Registry name (as passed to `/open-terminal`) |
-| `label` | Yes* | New display label for the tab (*not required when `quiet=1`) |
-| `icon` | No | VS Code ThemeIcon ID (e.g. `sync~spin`, `bell`, `check`) |
-| `color` | No | VS Code ThemeColor ID (e.g. `terminal.ansiCyan`, `terminal.ansiYellow`, `terminal.ansiGreen`) |
-| `quiet` | No | Set `quiet=1` to update only `icon`/`color` without activating the terminal panel (no flicker, no focus interaction). `label` is ignored in quiet mode. |
+| `status` | No* | Canonical lifecycle state. The bridge applies the matching codicon label prefix and color automatically. See [status values](#status-values) below. |
+| `label` | No* | Full display label override. When combined with `status=`, updates the base label and re-applies the status prefix on top. *Required if neither `status=` nor `quiet=1` is provided.* |
+| `color` | No | VS Code ThemeColor ID override. Takes precedence over the status default color. |
+| `icon` | No | VS Code ThemeIcon ID. Updates `iconPath` only (does not affect the label codicon). |
+| `quiet` | No | `quiet=1` — update only `icon`/`color` (+ status color) without activating the terminal panel. No label change, no flicker. |
 
-**Two modes:**
+**Three modes:**
 
-- **Normal mode** (default) — updates the tab label via VS Code's rename command. This briefly activates the target terminal then restores the previously active one. Keyboard focus is always preserved, but the panel may visually shift (unavoidable for a label change). Use for intentional, infrequent renames.
-- **Quiet mode** (`quiet=1`) — updates only `iconPath` and `color` via direct property assignment. Zero panel activation. Use for high-frequency lifecycle hooks (e.g. `PreToolUse`, `Notification`, `Stop`) where you want silent tab-color state changes.
+- **Status mode** (`status=<key>`) — the bridge looks up the canonical codicon + color for the given state, prefixes the label as `$(codicon) baseLabel`, and sets the color. `iconPath` is **never** touched — the identity icon (e.g. `hubot`) stays put. Idempotent: repeated calls with the same status value are no-ops if the label and color are already correct.
+- **Quiet mode** (`quiet=1`) — updates `iconPath` and/or color (including the status color when `status=` is combined) via direct property assignment. Zero terminal activation, zero panel flicker. Label is not changed.
+- **Legacy mode** (`label=<text>`) — sets the full display label directly. Use for intentional, infrequent renames (e.g. a skill marking a tab `✅ Done`). This briefly activates the target terminal then restores the previously active one; keyboard focus is always preserved.
 
-**Recommended label format** (normal mode): put status first so it's always visible regardless of tab width:
+#### Status values
 
-```text
-🤖 ⚙️ SOL-69    ← working
-🤖 🛎 SOL-69    ← needs input
-🤖 ⏸ SOL-69    ← idle
-```
+| `status=` | Codicon | Color |
+| --------- | ------- | ----- |
+| `working` | `$(loading~spin)` | `terminal.ansiCyan` |
+| `needs-input` | `$(bell-dot)` | `terminal.ansiYellow` |
+| `idle` | `$(debug-pause)` | `terminal.ansiGreen` |
+| `pr-open` | `$(pass-filled)` | `terminal.ansiGreen` |
+| `merged` | `$(git-merge)` | `terminal.ansiMagenta` |
+| `none` | *(strip prefix)* | *(unchanged)* |
 
 ```bash
 PORT=$(cat "$PWD/.vscode-bridge-port" 2>/dev/null || echo 31415)
 
-# Working (normal rename — updates label)
-curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&label=%F0%9F%A4%96%20%E2%9A%99%EF%B8%8F%20SOL-69&color=terminal.ansiCyan"
+# Status mode — bridge handles codicon + color (idempotent)
+curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&status=working"
+curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&status=needs-input"
+curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&status=idle"
 
-# Needs input
-curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&label=%F0%9F%A4%96%20%F0%9F%9B%8E%20SOL-69&color=terminal.ansiYellow"
+# Quiet + status — silent color update, no label change, no panel flicker
+curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&quiet=1&status=working"
 
-# Idle
-curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&label=%F0%9F%A4%96%20%E2%8F%B8%20SOL-69&color=terminal.ansiGreen"
+# Legacy label override
+curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&label=%E2%9C%85%20SOL-69%20done&color=terminal.ansiGreen"
 
-# Silent color-only update (no panel flicker) — good for hooks
-curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&quiet=1&color=terminal.ansiYellow"
+# Update base label while keeping the current status prefix
+curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&status=working&label=SOL-69%20v2"
 ```
 
-Response:
+Response (status mode):
 
 ```json
-{ "ok": true, "name": "SOL-69", "label": "🤖 ⚙️ SOL-69", "icon": null, "color": "terminal.ansiCyan" }
+{
+  "ok": true,
+  "name": "SOL-69",
+  "label": "$(loading~spin) SOL-69",
+  "baseLabel": "SOL-69",
+  "icon": null,
+  "color": "terminal.ansiCyan",
+  "status": "working"
+}
+```
+
+Response (idempotent no-op):
+
+```json
+{
+  "ok": true,
+  "name": "SOL-69",
+  "label": "$(loading~spin) SOL-69",
+  "baseLabel": "SOL-69",
+  "icon": null,
+  "color": "terminal.ansiCyan",
+  "status": "working",
+  "noOp": true
+}
 ```
 
 Returns `404` if the terminal is not in the registry (e.g. opened before the last reload).
@@ -318,33 +348,35 @@ curl ".../rename-terminal?name=SOL-42&quiet=1&color=terminal.ansiCyan"
 ```bash
 PORT=$(cat "$PWD/.vscode-bridge-port" 2>/dev/null || echo 31415)
 N="${CLAUDE_TAB_NAME:-$(basename "$PWD")}"   # falls back to basename if not set
-curl -s "http://127.0.0.1:${PORT}/rename-terminal?name=$N&quiet=1&color=terminal.ansiCyan" \
+curl -s "http://127.0.0.1:${PORT}/rename-terminal?name=$N&status=working" \
   > /dev/null 2>&1 || true
 ```
 
 ### Hook events and what they mean
 
-| Hook | When it fires | Good for |
-| ---- | ------------- | -------- |
-| `PreToolUse` | Before every tool call | Show "working" color |
-| `Notification` | Claude needs input (permission prompt, question) | Show "waiting" color |
-| `Stop` | Claude's turn is complete | Show "idle / done" color |
+| Hook | When it fires | Recommended `status=` |
+| ---- | ------------- | --------------------- |
+| `PreToolUse` | Before every tool call | `working` |
+| `Notification` | Claude needs input (permission prompt, question) | `needs-input` |
+| `Stop` | Claude's turn is complete | `idle` |
 
 ### Recommended state scheme
 
-Use `quiet=1` for all lifecycle hooks — silent color change, zero panel flicker:
+Use `status=` for all lifecycle hooks — the bridge owns the codicon + color mapping so every caller automatically gets a consistent look:
 
-| State | Color | Tab color |
-| ----- | ----- | --------- |
-| Working | `terminal.ansiCyan` | Cyan |
-| Waiting on you | `terminal.ansiYellow` | Yellow |
-| Idle / done | `terminal.ansiGreen` | Green |
+| `status=` | Tab shows | Color |
+| --------- | --------- | ----- |
+| `working` | `$(loading~spin) SOL-42` | Cyan |
+| `needs-input` | `$(bell-dot) SOL-42` | Yellow |
+| `idle` | `$(debug-pause) SOL-42` | Green |
 
-The `hubot` icon set at creation persists as the Claude-session identity marker throughout. Color alone communicates state.
+The `hubot` icon set at creation persists as the Claude-session identity marker throughout — `status=` never touches `iconPath`.
+
+`status=` is also **idempotent**: if `PreToolUse` fires twice in a row while already in `working` state, the second call detects that the label and color are unchanged and returns `noOp: true` without activating the terminal panel. This makes it safe to fire on every hook event without accumulating flicker.
 
 ### Full settings.json snippet
 
-Copy this into `~/.claude/settings.json` (or merge into your existing `hooks` key). Adjust colors to suit your workflow:
+Copy this into `~/.claude/settings.json` (or merge into your existing `hooks` key):
 
 ```json
 {
@@ -355,7 +387,7 @@ Copy this into `~/.claude/settings.json` (or merge into your existing `hooks` ke
         "hooks": [
           {
             "type": "command",
-            "command": "PORT=$(cat \"$PWD/.vscode-bridge-port\" 2>/dev/null || echo 31415); N=\"${CLAUDE_TAB_NAME:-$(basename \"$PWD\")}\"; curl -s \"http://127.0.0.1:${PORT}/rename-terminal?name=$N&quiet=1&color=terminal.ansiCyan\" > /dev/null 2>&1 || true",
+            "command": "PORT=$(cat \"$PWD/.vscode-bridge-port\" 2>/dev/null || echo 31415); N=\"${CLAUDE_TAB_NAME:-$(basename \"$PWD\")}\"; curl -s \"http://127.0.0.1:${PORT}/rename-terminal?name=$N&status=working\" > /dev/null 2>&1 || true",
             "async": true,
             "timeout": 2
           }
@@ -368,7 +400,7 @@ Copy this into `~/.claude/settings.json` (or merge into your existing `hooks` ke
         "hooks": [
           {
             "type": "command",
-            "command": "PORT=$(cat \"$PWD/.vscode-bridge-port\" 2>/dev/null || echo 31415); N=\"${CLAUDE_TAB_NAME:-$(basename \"$PWD\")}\"; curl -s \"http://127.0.0.1:${PORT}/rename-terminal?name=$N&quiet=1&color=terminal.ansiYellow\" > /dev/null 2>&1 || true",
+            "command": "PORT=$(cat \"$PWD/.vscode-bridge-port\" 2>/dev/null || echo 31415); N=\"${CLAUDE_TAB_NAME:-$(basename \"$PWD\")}\"; curl -s \"http://127.0.0.1:${PORT}/rename-terminal?name=$N&status=needs-input\" > /dev/null 2>&1 || true",
             "async": true,
             "timeout": 2
           }
@@ -381,7 +413,7 @@ Copy this into `~/.claude/settings.json` (or merge into your existing `hooks` ke
         "hooks": [
           {
             "type": "command",
-            "command": "PORT=$(cat \"$PWD/.vscode-bridge-port\" 2>/dev/null || echo 31415); N=\"${CLAUDE_TAB_NAME:-$(basename \"$PWD\")}\"; curl -s \"http://127.0.0.1:${PORT}/rename-terminal?name=$N&quiet=1&color=terminal.ansiGreen\" > /dev/null 2>&1 || true",
+            "command": "PORT=$(cat \"$PWD/.vscode-bridge-port\" 2>/dev/null || echo 31415); N=\"${CLAUDE_TAB_NAME:-$(basename \"$PWD\")}\"; curl -s \"http://127.0.0.1:${PORT}/rename-terminal?name=$N&status=idle\" > /dev/null 2>&1 || true",
             "async": true,
             "timeout": 2
           }
@@ -396,18 +428,17 @@ Copy this into `~/.claude/settings.json` (or merge into your existing `hooks` ke
 >
 > **Why not OSC escape sequences?** Claude Code hooks run as detached subprocesses without a controlling TTY, so writing `\033]0;...\007` to `/dev/tty` fails silently. Calling this extension's HTTP API is the reliable alternative.
 >
-> **Why `quiet=1`?** Without it, `/rename-terminal` must briefly activate the target terminal to run `renameWithArg`, causing the terminal panel to visibly shift. With `quiet=1`, only `color` is updated in-place — zero visual disruption, safe to fire on every `PreToolUse`.
+> **Why `status=` instead of `quiet=1&color=`?** `status=` is idempotent (no-op on repeat) and self-documenting — callers say *what* the state is, not *how* to render it. If you add new terminals or change the color scheme, update `STATUS_MAP` in the extension once and every caller benefits automatically.
 
 ### Extending to other hook types
 
 Claude Code supports additional hook events you can wire the same way:
 
 ```bash
-# Template — swap in any hook name and color
+# Template — swap in any hook name and status
 PORT=$(cat "$PWD/.vscode-bridge-port" 2>/dev/null || echo 31415)
 N="${CLAUDE_TAB_NAME:-$(basename "$PWD")}"
-COLOR="terminal.ansi<Color>"
-curl -s "http://127.0.0.1:${PORT}/rename-terminal?name=$N&quiet=1&color=${COLOR}" \
+curl -s "http://127.0.0.1:${PORT}/rename-terminal?name=$N&status=working" \
   > /dev/null 2>&1 || true
 ```
 
@@ -421,7 +452,7 @@ Use `matcher` to scope a hook to a specific tool name (e.g. `"matcher": "Bash"` 
       "hooks": [
         {
           "type": "command",
-          "command": "PORT=$(cat \"$PWD/.vscode-bridge-port\" 2>/dev/null || echo 31415); N=\"${CLAUDE_TAB_NAME:-$(basename \"$PWD\")}\"; curl -s \"http://127.0.0.1:${PORT}/rename-terminal?name=$N&quiet=1&color=terminal.ansiMagenta\" > /dev/null 2>&1 || true",
+          "command": "PORT=$(cat \"$PWD/.vscode-bridge-port\" 2>/dev/null || echo 31415); N=\"${CLAUDE_TAB_NAME:-$(basename \"$PWD\")}\"; curl -s \"http://127.0.0.1:${PORT}/rename-terminal?name=$N&status=working\" > /dev/null 2>&1 || true",
           "async": true,
           "timeout": 2
         }

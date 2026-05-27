@@ -17,8 +17,26 @@ const terminals = new Map();
 const METADATA_KEY = 'terminalBridgeMetadata';
 
 // ---------------------------------------------------------------------------
+// Canonical lifecycle status → codicon + color mapping.
+// Lives here so every caller (hooks, skills, ad-hoc curls) gets a consistent
+// look without copy-pasting the mapping.
+// ---------------------------------------------------------------------------
+
+const STATUS_MAP = {
+  'working':     { codicon: 'loading~spin', color: 'terminal.ansiCyan' },
+  'needs-input': { codicon: 'bell-dot',     color: 'terminal.ansiYellow' },
+  'idle':        { codicon: 'debug-pause',  color: 'terminal.ansiGreen' },
+  'pr-open':     { codicon: 'pass-filled',  color: 'terminal.ansiGreen' },
+  'merged':      { codicon: 'git-merge',    color: 'terminal.ansiMagenta' },
+};
+
+// ---------------------------------------------------------------------------
 // Metadata helpers — keep workspaceState in sync with the in-memory map.
-// Stored shape: { [name]: { cwd?, label?, color? } }
+// Stored shape: { [name]: { cwd?, label?, baseLabel?, status?, color?, effectiveLabel? } }
+//   label         — full display label (the effective label with codicon prefix if any)
+//   baseLabel     — the clean base label without a status codicon prefix
+//   status        — last known status= value (null if none)
+//   effectiveLabel — what was last passed to renameWithArg (for idempotency checks)
 // ---------------------------------------------------------------------------
 
 function loadMetadata(context) {
@@ -62,7 +80,7 @@ async function parseWorktrees() {
 // ---------------------------------------------------------------------------
 
 async function reindexTerminals(context) {
-  const metadata  = loadMetadata(context);       // name → { cwd, label, color }
+  const metadata  = loadMetadata(context);       // name → { cwd, label, color, … }
   const worktrees = await parseWorktrees();       // path → name
 
   // Build reverse map: cwd → name (from persisted metadata — takes precedence)
@@ -185,7 +203,7 @@ function activate(context) {
 
       if (name) {
         terminals.set(name, terminal);
-        await persistMetadata(context, name, { cwd, label: name, color: colorId });
+        await persistMetadata(context, name, { cwd, label: name, baseLabel: name, color: colorId });
       }
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -194,17 +212,26 @@ function activate(context) {
     } else if (url.pathname === '/rename-terminal') {
       // Rename a terminal tab via VS Code API — no OSC sequences needed.
       //
-      // quiet=1 mode: silently updates only iconPath and color without activating
-      // the terminal panel. Use this for high-frequency lifecycle hooks (PreToolUse,
-      // Notification, Stop) to avoid panel flicker and focus stealing.
-      //
-      // Normal mode: updates label via renameWithArg (requires briefly activating
-      // the target terminal), then restores the previously active terminal.
+      // Modes:
+      //   status=<key>  — Bridge looks up the canonical codicon + color for the
+      //                   given status, prefixes the label, and sets the color.
+      //                   iconPath is NEVER touched (identity icon stays).
+      //                   Idempotent: repeated calls with the same status are
+      //                   no-ops if the label and color are already correct.
+      //   quiet=1       — Silently updates only iconPath and/or color (+ status
+      //                   color when status= is combined). No terminal activation,
+      //                   no panel flicker. label is not changed.
+      //   label=        — Full label override (legacy). Required unless quiet=1
+      //                   or status= is provided.
       const name    = url.searchParams.get('name');
       const label   = url.searchParams.get('label') || undefined;
       const colorId = url.searchParams.get('color') || undefined;
       const iconId  = url.searchParams.get('icon')  || undefined;
       const quiet   = url.searchParams.get('quiet') === '1';
+      // status= is present in the query string but may be empty string → treat as undefined
+      const statusRaw = url.searchParams.has('status') ? url.searchParams.get('status') : undefined;
+      const status  = statusRaw || undefined;  // coerce empty string to undefined
+
       const terminal = name && terminals.get(name);
 
       if (!terminal) {
@@ -213,43 +240,107 @@ function activate(context) {
         return;
       }
 
-      if (!quiet && !label) {
+      // Validation: need at least one of label, quiet, or status
+      if (!quiet && status === undefined && !label) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: 'label param required (or pass quiet=1)' }));
+        res.end(JSON.stringify({ ok: false, error: 'Provide label=, status=, or quiet=1' }));
         return;
       }
 
+      // Resolve status config (null for status='none' or unknown status values)
+      const statusCfg = (status && status !== 'none') ? (STATUS_MAP[status] ?? null) : null;
+      // Resolved color: explicit param wins over status default
+      const resolvedColor = colorId ?? statusCfg?.color ?? undefined;
+
+      // ── Quiet mode ──────────────────────────────────────────────────────────
+      // Silent update — no terminal activation, no panel flicker.
+      // status= in quiet mode applies the canonical color but does NOT rename
+      // the label (label changes require terminal activation).
       if (quiet) {
-        // Silent update — no terminal activation, no panel flicker.
-        // Only iconPath and color are changed; the label remains as-is.
-        if (iconId)  terminal.iconPath = new vscode.ThemeIcon(iconId);
-        if (colorId) terminal.color    = new vscode.ThemeColor(colorId);
-        if (colorId) await persistMetadata(context, name, { color: colorId });
+        if (iconId)        terminal.iconPath = new vscode.ThemeIcon(iconId);
+        if (resolvedColor) terminal.color    = new vscode.ThemeColor(resolvedColor);
+
+        const metaUpdate = {};
+        if (resolvedColor) metaUpdate.color = resolvedColor;
+        if (status !== undefined) metaUpdate.status = status === 'none' ? null : status;
+        if (Object.keys(metaUpdate).length) await persistMetadata(context, name, metaUpdate);
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, name, label: null, icon: iconId, color: colorId, quiet: true }));
+        res.end(JSON.stringify({
+          ok: true, name, label: null, icon: iconId,
+          color: resolvedColor, status: status ?? null, quiet: true,
+        }));
         return;
       }
 
-      // Only switch the active terminal if needed.
-      // Use show(true) = preserveFocus so keyboard focus is NEVER stolen.
-      const prev = vscode.window.activeTerminal;
-      const needsSwitch = prev !== terminal;
-      if (needsSwitch) terminal.show(true);
-      await vscode.commands.executeCommand(
-        'workbench.action.terminal.renameWithArg',
-        { name: label }
-      );
-      if (needsSwitch && prev) prev.show(true);
+      // ── Normal (label-updating) mode ────────────────────────────────────────
+      const meta = loadMetadata(context);
+      const termMeta = meta[name] ?? {};
 
-      if (iconId)  terminal.iconPath = new vscode.ThemeIcon(iconId);
-      if (colorId) terminal.color    = new vscode.ThemeColor(colorId);
+      let effectiveLabel, baseLabel;
 
-      // Persist updated label + color so they survive a reload.
-      await persistMetadata(context, name, { label, color: colorId });
+      if (status !== undefined) {
+        // status= mode: derive baseLabel from explicit label param or persisted state.
+        baseLabel = label ?? termMeta.baseLabel ?? termMeta.label ?? name;
+        effectiveLabel = statusCfg
+          ? `$(${statusCfg.codicon}) ${baseLabel}`
+          : baseLabel;  // status='none' or unknown → strip prefix
+      } else {
+        // Legacy mode: label= is the full effective label.
+        baseLabel     = label;
+        effectiveLabel = label;
+      }
+
+      // Idempotency: skip the rename round-trip if nothing actually changed.
+      const prevEffLabel = termMeta.effectiveLabel;
+      const prevColor    = termMeta.color;
+      const labelChanged = effectiveLabel !== prevEffLabel;
+      const colorChanged = resolvedColor !== prevColor;
+
+      if (!labelChanged && !colorChanged && !iconId) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: true, name, label: effectiveLabel, baseLabel,
+          icon: iconId, color: resolvedColor, status: status ?? null, noOp: true,
+        }));
+        return;
+      }
+
+      // Perform the rename only when the label actually changed.
+      if (labelChanged) {
+        // Only switch the active terminal if needed.
+        // Use show(true) = preserveFocus so keyboard focus is NEVER stolen.
+        const prev = vscode.window.activeTerminal;
+        const needsSwitch = prev !== terminal;
+        if (needsSwitch) terminal.show(true);
+        await vscode.commands.executeCommand(
+          'workbench.action.terminal.renameWithArg',
+          { name: effectiveLabel }
+        );
+        if (needsSwitch && prev) prev.show(true);
+      }
+
+      if (iconId)        terminal.iconPath = new vscode.ThemeIcon(iconId);
+      if (resolvedColor) terminal.color    = new vscode.ThemeColor(resolvedColor);
+
+      // Preserve the status field if no new status was provided.
+      const persistedStatus = status !== undefined
+        ? (status === 'none' ? null : status)
+        : termMeta.status;
+
+      await persistMetadata(context, name, {
+        label: effectiveLabel,
+        baseLabel,
+        status: persistedStatus,
+        effectiveLabel,
+        color: resolvedColor,
+      });
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, name, label, icon: iconId, color: colorId }));
+      res.end(JSON.stringify({
+        ok: true, name, label: effectiveLabel, baseLabel,
+        icon: iconId, color: resolvedColor, status: status ?? null,
+      }));
 
     } else if (url.pathname === '/close-terminal') {
       const name = url.searchParams.get('name');

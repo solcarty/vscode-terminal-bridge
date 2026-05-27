@@ -73,7 +73,7 @@ Then reload VS Code.
 
 The `.vscode-bridge-port` file is written to each **workspace folder** — a path that VS Code has open as a root in the Explorer. If you open a loose file or a folder that isn't part of a workspace, the port file won't be written and port discovery will fall back to `31415`.
 
-For the port file to work correctly, your repo root must be open as a workspace folder (the normal case when you open a folder with `code .` or `code-insiders .`). When you add worktrees with `code --add <path>`, the extension writes the port file there too, so hooks and scripts running inside a worktree terminal always find the right port.
+For the port file to work correctly, your repo root must be open as a workspace folder (the normal case when you open a folder with `code .` or `code-insiders .`). When you add worktrees with `/add-folder`, the extension writes the port file there too, so hooks and scripts running inside a worktree terminal always find the right port.
 
 ## VS Code title format (recommended)
 
@@ -149,7 +149,12 @@ Opens a named terminal tab and optionally runs a command in it.
 | `cwd` | No | Working directory (URL-encoded path) |
 | `cmd` | No | Shell command to run on open (URL-encoded) |
 | `color` | No | Tab color — VS Code ThemeColor ID (e.g. `terminal.ansiGreen`) |
-| `icon` | No | Tab icon — VS Code ThemeIcon ID (e.g. `check`, `error`, `sync~spin`) |
+| `icon` | No | Tab icon — VS Code ThemeIcon ID (e.g. `hubot`, `check`, `error`). Set once at creation to mark the terminal's identity. |
+| `focus` | No | Set `focus=1` to steal keyboard focus. Default: focus is **preserved** (the editor keeps focus). |
+
+**Focus behaviour:** by default, spawning a terminal never yanks focus from the editor. Pass `focus=1` only when you explicitly want the user to land in the new terminal.
+
+**`CLAUDE_TAB_NAME` injection:** when `name` is provided, the extension automatically runs `export CLAUDE_TAB_NAME=<name>` in the shell before executing `cmd`. Hook scripts can then read `$CLAUDE_TAB_NAME` instead of inferring the tab name from `basename "$PWD"` — which doesn't hold for non-worktree terminals.
 
 ```bash
 PORT=$(cat "$PWD/.vscode-bridge-port" 2>/dev/null || echo 31415)
@@ -169,16 +174,22 @@ Response:
 
 ### `GET /rename-terminal`
 
-Renames a tracked terminal tab and optionally updates its icon and color. Uses VS Code's `workbench.action.terminal.renameWithArg` command with `preserveFocus: true` — **keyboard focus is never stolen** from the editor or active terminal.
+Renames a tracked terminal tab and optionally updates its icon and color.
 
 | Parameter | Required | Description |
 | --------- | -------- | ----------- |
 | `name` | Yes | Registry name (as passed to `/open-terminal`) |
-| `label` | Yes | New display label for the tab |
+| `label` | Yes* | New display label for the tab (*not required when `quiet=1`) |
 | `icon` | No | VS Code ThemeIcon ID (e.g. `sync~spin`, `bell`, `check`) |
 | `color` | No | VS Code ThemeColor ID (e.g. `terminal.ansiCyan`, `terminal.ansiYellow`, `terminal.ansiGreen`) |
+| `quiet` | No | Set `quiet=1` to update only `icon`/`color` without activating the terminal panel (no flicker, no focus interaction). `label` is ignored in quiet mode. |
 
-**Recommended label format:** put status first so it's always visible regardless of tab width:
+**Two modes:**
+
+- **Normal mode** (default) — updates the tab label via VS Code's rename command. This briefly activates the target terminal then restores the previously active one. Keyboard focus is always preserved, but the panel may visually shift (unavoidable for a label change). Use for intentional, infrequent renames.
+- **Quiet mode** (`quiet=1`) — updates only `iconPath` and `color` via direct property assignment. Zero panel activation. Use for high-frequency lifecycle hooks (e.g. `PreToolUse`, `Notification`, `Stop`) where you want silent tab-color state changes.
+
+**Recommended label format** (normal mode): put status first so it's always visible regardless of tab width:
 
 ```text
 🤖 ⚙️ SOL-69    ← working
@@ -189,20 +200,23 @@ Renames a tracked terminal tab and optionally updates its icon and color. Uses V
 ```bash
 PORT=$(cat "$PWD/.vscode-bridge-port" 2>/dev/null || echo 31415)
 
-# Working
-curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&label=%F0%9F%A4%96%20%E2%9A%99%EF%B8%8F%20SOL-69&icon=sync~spin&color=terminal.ansiCyan"
+# Working (normal rename — updates label)
+curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&label=%F0%9F%A4%96%20%E2%9A%99%EF%B8%8F%20SOL-69&color=terminal.ansiCyan"
 
 # Needs input
-curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&label=%F0%9F%A4%96%20%F0%9F%9B%8E%20SOL-69&icon=bell&color=terminal.ansiYellow"
+curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&label=%F0%9F%A4%96%20%F0%9F%9B%8E%20SOL-69&color=terminal.ansiYellow"
 
 # Idle
-curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&label=%F0%9F%A4%96%20%E2%8F%B8%20SOL-69&icon=check&color=terminal.ansiGreen"
+curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&label=%F0%9F%A4%96%20%E2%8F%B8%20SOL-69&color=terminal.ansiGreen"
+
+# Silent color-only update (no panel flicker) — good for hooks
+curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&quiet=1&color=terminal.ansiYellow"
 ```
 
 Response:
 
 ```json
-{ "ok": true, "name": "SOL-69", "label": "🤖 ⚙️ SOL-69", "icon": "sync~spin", "color": "terminal.ansiCyan" }
+{ "ok": true, "name": "SOL-69", "label": "🤖 ⚙️ SOL-69", "icon": null, "color": "terminal.ansiCyan" }
 ```
 
 Returns `404` if the terminal is not in the registry (e.g. opened before the last reload).
@@ -230,48 +244,107 @@ Response:
 
 ---
 
+### `GET /add-folder`
+
+Attaches a path to the current VS Code workspace — the HTTP equivalent of `code --add <path>`. Works from any process without requiring the `code` CLI on `$PATH`. Idempotent: if the path is already a workspace folder, returns `alreadyAttached: true` without error.
+
+After the folder is added, the extension writes `.vscode-bridge-port` into it automatically (via `onDidChangeWorkspaceFolders`), so hook scripts running inside the new folder immediately discover the correct port.
+
+| Parameter | Required | Description |
+| --------- | -------- | ----------- |
+| `path` | Yes | Absolute path to attach (URL-encoded) |
+| `index` | No | Insertion position. Default: append at end. |
+| `name` | No | Display name override for the workspace folder. |
+
+```bash
+PORT=$(cat "$PWD/.vscode-bridge-port" 2>/dev/null || echo 31415)
+WORKTREE=$(python3 -c "import urllib.parse; print(urllib.parse.quote('/path/to/worktree'))")
+
+curl "http://127.0.0.1:${PORT}/add-folder?path=${WORKTREE}"
+```
+
+Response:
+
+```json
+{ "ok": true, "path": "/path/to/worktree", "added": true, "alreadyAttached": false }
+```
+
+---
+
+### `GET /remove-folder`
+
+Detaches a workspace folder by path. Idempotent: returns `wasAttached: false` if the folder wasn't in the workspace.
+
+| Parameter | Required | Description |
+| --------- | -------- | ----------- |
+| `path` | Yes | Absolute path to detach (URL-encoded) |
+
+```bash
+PORT=$(cat "$PWD/.vscode-bridge-port" 2>/dev/null || echo 31415)
+WORKTREE=$(python3 -c "import urllib.parse; print(urllib.parse.quote('/path/to/worktree'))")
+
+curl "http://127.0.0.1:${PORT}/remove-folder?path=${WORKTREE}"
+```
+
+Response:
+
+```json
+{ "ok": true, "path": "/path/to/worktree", "removed": true, "wasAttached": true }
+```
+
+---
+
 ## Claude Code hooks
 
 ### The pattern
 
-Claude Code fires hook events at key lifecycle points. Each hook runs a shell command; by calling `/rename-terminal` from that command you get live tab-label updates with zero polling.
+Claude Code fires hook events at key lifecycle points. Each hook runs a shell command; by calling `/rename-terminal` from that command you get live tab updates with zero polling.
 
-The core pattern is always the same — read the port, get the terminal name from `$PWD`, fire the curl:
+**Key principle — icon is identity, color is state:**
+
+- Set `icon=` **once** at `/open-terminal` time to mark what kind of session this tab is (e.g. `icon=hubot` for a Claude sub-agent). This icon persists for the lifetime of the tab.
+- Use `color=` in hook calls to communicate the current state. Do **not** pass `icon=` in hook curls — it would overwrite your identity marker on every tool call.
+
+```bash
+# Good: icon set at creation, hooks only change color
+curl ".../open-terminal?name=SOL-42&icon=hubot&color=terminal.ansiCyan&cmd=..."
+
+# Hook (PreToolUse) — silent color update, no flicker
+curl ".../rename-terminal?name=SOL-42&quiet=1&color=terminal.ansiCyan"
+```
+
+**Tab-name resolution:** the extension exports `CLAUDE_TAB_NAME=<name>` into the shell when a named terminal is opened. Hook scripts can read `$CLAUDE_TAB_NAME` directly rather than relying on `basename "$PWD"`, which only works when the working directory name matches the tab name.
 
 ```bash
 PORT=$(cat "$PWD/.vscode-bridge-port" 2>/dev/null || echo 31415)
-N=$(basename "$PWD")
-curl -s "http://127.0.0.1:${PORT}/rename-terminal?name=$N&label=<LABEL>&icon=<ICON>&color=<COLOR>" \
+N="${CLAUDE_TAB_NAME:-$(basename "$PWD")}"   # falls back to basename if not set
+curl -s "http://127.0.0.1:${PORT}/rename-terminal?name=$N&quiet=1&color=terminal.ansiCyan" \
   > /dev/null 2>&1 || true
 ```
-
-`basename "$PWD"` works because worktree directories are named after the issue ID (e.g. `SOL-42`), which matches the `name` passed to `/open-terminal` when the terminal was created.
-
-To extend this to your own use case, change the `label`, `icon`, and `color` values. The full list of valid ThemeIcon IDs is in the [VS Code icon listing](https://code.visualstudio.com/api/references/icons-in-labels); ThemeColor IDs for terminals are `terminal.ansi{Color}`.
 
 ### Hook events and what they mean
 
 | Hook | When it fires | Good for |
 | ---- | ------------- | -------- |
-| `PreToolUse` | Before every tool call | Show "working" spinner |
-| `Notification` | Claude needs input (permission prompt, question) | Show "waiting" indicator |
-| `Stop` | Claude's turn is complete | Show "idle / done" state |
+| `PreToolUse` | Before every tool call | Show "working" color |
+| `Notification` | Claude needs input (permission prompt, question) | Show "waiting" color |
+| `Stop` | Claude's turn is complete | Show "idle / done" color |
 
-### Recommended label scheme
+### Recommended state scheme
 
-Put status **first** so it's readable even when tabs are narrow:
+Use `quiet=1` for all lifecycle hooks — silent color change, zero panel flicker:
 
-| State | Label | Icon | Color |
-| ----- | ----- | ---- | ----- |
-| Working | `🤖 ⚙️ SOL-42` | `sync~spin` | `terminal.ansiCyan` |
-| Waiting on you | `🤖 🛎 SOL-42` | `bell` | `terminal.ansiYellow` |
-| Idle / done | `🤖 ⏸ SOL-42` | `check` | `terminal.ansiGreen` |
+| State | Color | Tab color |
+| ----- | ----- | --------- |
+| Working | `terminal.ansiCyan` | Cyan |
+| Waiting on you | `terminal.ansiYellow` | Yellow |
+| Idle / done | `terminal.ansiGreen` | Green |
 
-The `🤖` prefix marks the tab as a Claude sub-agent at a glance. `Notification` is the load-bearing hook for multi-session orchestration — it's how you tell "finished" from "blocked on you" without switching to each tab.
+The `hubot` icon set at creation persists as the Claude-session identity marker throughout. Color alone communicates state.
 
 ### Full settings.json snippet
 
-Copy this into `~/.claude/settings.json` (or merge into your existing `hooks` key). Adjust labels, icons, and colors to suit your workflow:
+Copy this into `~/.claude/settings.json` (or merge into your existing `hooks` key). Adjust colors to suit your workflow:
 
 ```json
 {
@@ -282,7 +355,7 @@ Copy this into `~/.claude/settings.json` (or merge into your existing `hooks` ke
         "hooks": [
           {
             "type": "command",
-            "command": "PORT=$(cat \"$PWD/.vscode-bridge-port\" 2>/dev/null || echo 31415); N=$(basename \"$PWD\"); curl -s \"http://127.0.0.1:${PORT}/rename-terminal?name=$N&label=%F0%9F%A4%96%20%E2%9A%99%EF%B8%8F%20$N&icon=sync~spin&color=terminal.ansiCyan\" > /dev/null 2>&1 || true",
+            "command": "PORT=$(cat \"$PWD/.vscode-bridge-port\" 2>/dev/null || echo 31415); N=\"${CLAUDE_TAB_NAME:-$(basename \"$PWD\")}\"; curl -s \"http://127.0.0.1:${PORT}/rename-terminal?name=$N&quiet=1&color=terminal.ansiCyan\" > /dev/null 2>&1 || true",
             "async": true,
             "timeout": 2
           }
@@ -295,7 +368,7 @@ Copy this into `~/.claude/settings.json` (or merge into your existing `hooks` ke
         "hooks": [
           {
             "type": "command",
-            "command": "PORT=$(cat \"$PWD/.vscode-bridge-port\" 2>/dev/null || echo 31415); N=$(basename \"$PWD\"); curl -s \"http://127.0.0.1:${PORT}/rename-terminal?name=$N&label=%F0%9F%A4%96%20%F0%9F%9B%8E%20$N&icon=bell&color=terminal.ansiYellow\" > /dev/null 2>&1 || true",
+            "command": "PORT=$(cat \"$PWD/.vscode-bridge-port\" 2>/dev/null || echo 31415); N=\"${CLAUDE_TAB_NAME:-$(basename \"$PWD\")}\"; curl -s \"http://127.0.0.1:${PORT}/rename-terminal?name=$N&quiet=1&color=terminal.ansiYellow\" > /dev/null 2>&1 || true",
             "async": true,
             "timeout": 2
           }
@@ -308,7 +381,7 @@ Copy this into `~/.claude/settings.json` (or merge into your existing `hooks` ke
         "hooks": [
           {
             "type": "command",
-            "command": "PORT=$(cat \"$PWD/.vscode-bridge-port\" 2>/dev/null || echo 31415); N=$(basename \"$PWD\"); curl -s \"http://127.0.0.1:${PORT}/rename-terminal?name=$N&label=%F0%9F%A4%96%20%E2%8F%B8%20$N&icon=check&color=terminal.ansiGreen\" > /dev/null 2>&1 || true",
+            "command": "PORT=$(cat \"$PWD/.vscode-bridge-port\" 2>/dev/null || echo 31415); N=\"${CLAUDE_TAB_NAME:-$(basename \"$PWD\")}\"; curl -s \"http://127.0.0.1:${PORT}/rename-terminal?name=$N&quiet=1&color=terminal.ansiGreen\" > /dev/null 2>&1 || true",
             "async": true,
             "timeout": 2
           }
@@ -322,19 +395,19 @@ Copy this into `~/.claude/settings.json` (or merge into your existing `hooks` ke
 > **Why `async: true`?** Hook commands run synchronously by default and block Claude's response. `async: true` fires the curl in the background so it adds no latency.
 >
 > **Why not OSC escape sequences?** Claude Code hooks run as detached subprocesses without a controlling TTY, so writing `\033]0;...\007` to `/dev/tty` fails silently. Calling this extension's HTTP API is the reliable alternative.
+>
+> **Why `quiet=1`?** Without it, `/rename-terminal` must briefly activate the target terminal to run `renameWithArg`, causing the terminal panel to visibly shift. With `quiet=1`, only `color` is updated in-place — zero visual disruption, safe to fire on every `PreToolUse`.
 
 ### Extending to other hook types
 
 Claude Code supports additional hook events you can wire the same way:
 
 ```bash
-# Template — swap in any hook name and label
+# Template — swap in any hook name and color
 PORT=$(cat "$PWD/.vscode-bridge-port" 2>/dev/null || echo 31415)
-N=$(basename "$PWD")
-LABEL="<your label here>"
-ICON="<themeicon-id>"
+N="${CLAUDE_TAB_NAME:-$(basename "$PWD")}"
 COLOR="terminal.ansi<Color>"
-curl -s "http://127.0.0.1:${PORT}/rename-terminal?name=$N&label=${LABEL}&icon=${ICON}&color=${COLOR}" \
+curl -s "http://127.0.0.1:${PORT}/rename-terminal?name=$N&quiet=1&color=${COLOR}" \
   > /dev/null 2>&1 || true
 ```
 
@@ -348,7 +421,7 @@ Use `matcher` to scope a hook to a specific tool name (e.g. `"matcher": "Bash"` 
       "hooks": [
         {
           "type": "command",
-          "command": "PORT=$(cat \"$PWD/.vscode-bridge-port\" 2>/dev/null || echo 31415); N=$(basename \"$PWD\"); curl -s \"http://127.0.0.1:${PORT}/rename-terminal?name=$N&label=%F0%9F%90%9A%20$N&icon=terminal&color=terminal.ansiMagenta\" > /dev/null 2>&1 || true",
+          "command": "PORT=$(cat \"$PWD/.vscode-bridge-port\" 2>/dev/null || echo 31415); N=\"${CLAUDE_TAB_NAME:-$(basename \"$PWD\")}\"; curl -s \"http://127.0.0.1:${PORT}/rename-terminal?name=$N&quiet=1&color=terminal.ansiMagenta\" > /dev/null 2>&1 || true",
           "async": true,
           "timeout": 2
         }
@@ -362,7 +435,7 @@ Use `matcher` to scope a hook to a specific tool name (e.g. `"matcher": "Bash"` 
 
 ## Automated worktree setup
 
-Open a named terminal for a git worktree and start Claude automatically. The port is read from `.vscode-bridge-port` in the repo root so the terminal always opens in the correct VS Code window:
+Open a named terminal for a git worktree, attach the worktree to the VS Code workspace, and start Claude automatically — all via the HTTP bridge, no `code` CLI required:
 
 ```bash
 ISSUE="SOL-42"
@@ -374,10 +447,14 @@ PORT=$(cat "$PWD/.vscode-bridge-port" 2>/dev/null || echo 31415)
 CWD=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$WORKTREE'))")
 CMD=$(python3 -c "import urllib.parse; print(urllib.parse.quote(\"claude '/linear-process $ISSUE'\"))")
 
+# Attach the worktree folder to the VS Code workspace (writes .vscode-bridge-port there too)
+curl -s "http://127.0.0.1:${PORT}/add-folder?path=${CWD}"
+
+# Open the terminal (focus is preserved in the editor by default)
 curl -s "http://127.0.0.1:${PORT}/open-terminal?name=${ISSUE}&cwd=${CWD}&cmd=${CMD}&icon=hubot&color=terminal.ansiCyan"
 ```
 
-The terminal is registered under `SOL-42`, so the Claude Code hooks above rename it automatically, and `/close-terminal?name=SOL-42` closes it when the work is done.
+The terminal is registered under `SOL-42`, so the Claude Code hooks above rename it automatically, and `/close-terminal?name=SOL-42` closes it when the work is done. When the worktree is cleaned up, call `/remove-folder` to detach it from the workspace.
 
 ---
 

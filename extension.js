@@ -188,6 +188,37 @@ function activate(context) {
   server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
 
+    if (req.method === 'POST' && url.pathname === '/api/status') {
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', () => {
+        let payload;
+        try {
+          payload = JSON.parse(body);
+        } catch {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Invalid JSON' }));
+          return;
+        }
+
+        const entry = JSON.stringify({ ...payload, ts: new Date().toISOString() });
+        const folders = vscode.workspace.workspaceFolders || [];
+        const written = [];
+        for (const folder of folders) {
+          try {
+            const sdoDir = path.join(folder.uri.fsPath, '.sdo');
+            if (!fs.existsSync(sdoDir)) fs.mkdirSync(sdoDir, { recursive: true });
+            fs.appendFileSync(path.join(sdoDir, 'pipeline-state.json'), entry + '\n', 'utf8');
+            written.push(folder.uri.fsPath);
+          } catch { /* ignore read-only folders */ }
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, written }));
+      });
+      return;
+    }
+
     if (url.pathname === '/open-terminal') {
       const cwd     = url.searchParams.get('cwd')   || undefined;
       const name    = url.searchParams.get('name')  || undefined;
@@ -206,10 +237,30 @@ function activate(context) {
       // cursor out of the editor. Pass focus=1 to explicitly steal focus.
       terminal.show(!stealFocus);
 
-      // Inject CLAUDE_TAB_NAME so hook scripts can resolve the tab name
-      // without relying on basename($PWD) convention.
-      if (name) terminal.sendText(`export CLAUDE_TAB_NAME=${JSON.stringify(name)}`);
-      if (cmd) terminal.sendText(cmd);
+      // Send CLAUDE_TAB_NAME + cmd only after the shell is ready so .zshrc
+      // has sourced PATH entries (e.g. claude). Use shell integration event
+      // when available; fall back to a 1500ms timeout.
+      const sendDeferred = () => {
+        if (name) terminal.sendText(`export CLAUDE_TAB_NAME=${JSON.stringify(name)}`);
+        // Inject orchestrator env vars so status hooks work inside the terminal.
+        terminal.sendText(`export HH_ORCHESTRATOR_ID=${JSON.stringify(name || '')}`);
+        terminal.sendText(`export HH_BRIDGE_STATUS_URL="http://127.0.0.1:${activePort}/api/status"`);
+        if (cmd) terminal.sendText(cmd);
+      };
+      if ((name || cmd) && typeof vscode.window.onDidChangeTerminalShellIntegration === 'function') {
+        let sent = false;
+        const fallback = setTimeout(() => { if (!sent) { sent = true; sendDeferred(); } }, 1500);
+        const sub = vscode.window.onDidChangeTerminalShellIntegration(e => {
+          if (e.terminal === terminal && !sent) {
+            sent = true;
+            clearTimeout(fallback);
+            sub.dispose();
+            sendDeferred();
+          }
+        });
+      } else if (name || cmd) {
+        setTimeout(sendDeferred, 1500);
+      }
 
       if (name) {
         terminals.set(name, terminal);

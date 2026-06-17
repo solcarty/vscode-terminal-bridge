@@ -261,7 +261,11 @@ Returns `404` if the terminal is not in the registry (e.g. opened before the las
 
 ### `GET /close-terminal`
 
-Closes a tracked terminal tab and removes it from the registry.
+Closes a tracked terminal tab and removes it from the registry. If the
+in-memory registry has desynced from reality (extension host restart,
+multi-window scenarios), it falls back to a live-window name search and
+finally to killing the persisted PID directly — so cleanup succeeds even
+when the registry's own bookkeeping is wrong.
 
 | Parameter | Required | Description |
 | --------- | -------- | ----------- |
@@ -275,7 +279,32 @@ curl "http://127.0.0.1:${PORT}/close-terminal?name=my-tab"
 Response:
 
 ```json
-{ "ok": true, "name": "my-tab" }
+{ "ok": true, "name": "my-tab", "method": "dispose" }
+```
+
+`method` is `"dispose"` when a live terminal object was found and disposed,
+or `"pid-kill"` when the registry had no object reference and the persisted
+shell PID was killed directly instead.
+
+---
+
+### `GET /sweep`
+
+Cross-references all persisted terminals against ground truth
+(`git worktree list`) and disposes any whose `cwd` no longer corresponds to
+an existing worktree — falling back to a PID kill when no live terminal
+object can be found. Runs automatically a few seconds after the extension
+activates (catches leaks left over from a crash/restart), and can also be
+called on demand.
+
+```bash
+curl "http://127.0.0.1:${PORT}/sweep"
+```
+
+Response:
+
+```json
+{ "ok": true, "closed": ["SOL-234", "SOL-235"] }
 ```
 
 ---

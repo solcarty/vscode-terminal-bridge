@@ -147,6 +147,70 @@ async function reindexTerminals(context) {
 }
 
 // ---------------------------------------------------------------------------
+// Sweep: dispose terminals whose persisted cwd no longer maps to a live
+// worktree (ground truth = `git worktree list`), falling back to a PID kill
+// when the VS Code terminal object itself can't be found (registry desync).
+// ---------------------------------------------------------------------------
+
+async function sweepTerminals(context) {
+  const worktrees = await parseWorktrees();   // path → name
+  const metadata  = loadMetadata(context);
+  const closed = [];
+
+  for (const [name, meta] of Object.entries(metadata)) {
+    if (!meta.cwd || worktrees.has(meta.cwd)) continue;
+
+    const terminal = terminals.get(name) ?? vscode.window.terminals.find(t => t.name === name);
+    if (terminal) {
+      terminal.dispose();
+    } else if (meta.pid) {
+      try { process.kill(meta.pid, 'SIGTERM'); } catch { /* already dead */ }
+    }
+    terminals.delete(name);
+    await persistMetadata(context, name, null);
+    closed.push(name);
+  }
+
+  if (closed.length > 0) {
+    console.log(`[terminal-bridge] swept ${closed.length} stale terminal(s): ${closed.join(', ')}`);
+  }
+  return closed;
+}
+
+// ---------------------------------------------------------------------------
+// Close a terminal by name, falling back to a live-window name search and
+// then a PID kill when the in-memory registry has desynced from reality.
+// ---------------------------------------------------------------------------
+
+async function closeTerminalByName(context, name) {
+  let terminal = terminals.get(name);
+  if (!terminal) {
+    await reindexTerminals(context);
+    terminal = terminals.get(name) ?? vscode.window.terminals.find(t => t.name === name);
+  }
+
+  if (terminal) {
+    terminal.dispose();
+    terminals.delete(name);
+    await persistMetadata(context, name, null);
+    return { found: true, method: 'dispose' };
+  }
+
+  // Registry has no live terminal object — fall back to killing by persisted PID.
+  const meta = loadMetadata(context)[name];
+  if (meta && meta.pid) {
+    try {
+      process.kill(meta.pid, 'SIGTERM');
+      terminals.delete(name);
+      await persistMetadata(context, name, null);
+      return { found: true, method: 'pid-kill' };
+    } catch { /* already dead — fall through to not-found */ }
+  }
+
+  return { found: false, method: null };
+}
+
+// ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
 
@@ -183,6 +247,10 @@ function activate(context) {
   reindexTerminals(context);
   const deferred = setTimeout(() => reindexTerminals(context), 2000);
   context.subscriptions.push({ dispose: () => clearTimeout(deferred) });
+
+  // ── Sweep stale terminals left over from a crash/restart before anyone ───
+  // ── notices (e.g. extension host restart under resource pressure). ───────
+  setTimeout(() => sweepTerminals(context), 2500);
 
   // ── HTTP server ───────────────────────────────────────────────────────────
   server = http.createServer(async (req, res) => {
@@ -265,6 +333,11 @@ function activate(context) {
       if (name) {
         terminals.set(name, terminal);
         await persistMetadata(context, name, { cwd, label: name, baseLabel: name, color: colorId });
+        // Persist the real shell PID as an OS-level fallback for cleanup —
+        // independent of VS Code's own (sometimes-stale) terminal bookkeeping.
+        terminal.processId.then(pid => {
+          if (pid) persistMetadata(context, name, { pid });
+        });
       }
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -405,20 +478,31 @@ function activate(context) {
 
     } else if (url.pathname === '/close-terminal') {
       const name = url.searchParams.get('name');
-      const terminal = name && terminals.get(name);
+      if (!name) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'name param required' }));
+        return;
+      }
 
-      if (!terminal) {
+      const { found, method } = await closeTerminalByName(context, name);
+
+      if (!found) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: 'Terminal not found', name }));
         return;
       }
 
-      terminal.dispose();
-      terminals.delete(name);
-      await persistMetadata(context, name, null);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, name, method }));
+
+    } else if (url.pathname === '/sweep') {
+      // Cross-reference persisted terminals against ground-truth git worktrees
+      // and dispose anything whose worktree no longer exists. Self-healing
+      // cleanup for when the in-memory registry has desynced from reality.
+      const closed = await sweepTerminals(context);
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, name }));
+      res.end(JSON.stringify({ ok: true, closed }));
 
     } else if (url.pathname === '/add-folder') {
       // Attach a path to the current VS Code workspace without needing the

@@ -67,15 +67,27 @@ async function persistMetadata(context, name, update) {
 // Git worktree discovery
 // ---------------------------------------------------------------------------
 
+function normalizePath(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
 async function parseWorktrees() {
   // Returns Map<absolutePath, name> where name is the last path segment.
   // e.g. '/Users/…/worktrees/vscode-terminal-bridge/issue-11' → 'issue-11'
+  // Resolved relative to the first workspace folder, since the extension
+  // host's process.cwd() isn't guaranteed to be inside any repo at all.
+  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (!cwd) return new Map();
   try {
-    const { stdout } = await execAsync('git worktree list --porcelain');
+    const { stdout } = await execAsync('git worktree list --porcelain', { cwd });
     const worktrees = new Map();
     for (const line of stdout.split('\n')) {
       if (line.startsWith('worktree ')) {
-        const p = line.slice(9).trim();
+        const p = normalizePath(line.slice(9).trim());
         worktrees.set(p, p.split('/').pop());
       }
     }
@@ -120,7 +132,7 @@ async function reindexTerminals(context) {
       const cwd = terminal.shellIntegration?.cwd?.fsPath;
       if (cwd) {
         // Persisted metadata first (most precise), then git worktree basename.
-        const name = cwdToName[cwd] ?? worktrees.get(cwd);
+        const name = cwdToName[cwd] ?? worktrees.get(normalizePath(cwd));
         if (name) {
           terminals.set(name, terminal);
           matched = true;
@@ -157,8 +169,17 @@ async function sweepTerminals(context) {
   const metadata  = loadMetadata(context);
   const closed = [];
 
+  // Fail closed: an empty worktree map almost always means we couldn't
+  // determine ground truth (no workspace folder, git not found, etc.),
+  // not that zero worktrees exist. Sweeping on that basis would dispose
+  // every tracked terminal, including live ones (see issue #22).
+  if (worktrees.size === 0) {
+    console.log('[terminal-bridge] sweep skipped: could not determine live worktrees');
+    return closed;
+  }
+
   for (const [name, meta] of Object.entries(metadata)) {
-    if (!meta.cwd || worktrees.has(meta.cwd)) continue;
+    if (!meta.cwd || worktrees.has(normalizePath(meta.cwd))) continue;
 
     const terminal = terminals.get(name) ?? vscode.window.terminals.find(t => t.name === name);
     if (terminal) {

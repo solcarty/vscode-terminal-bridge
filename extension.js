@@ -21,7 +21,7 @@ const CLI_INSTALL_DIR = path.join(require('os').homedir(), '.vscode-terminal-bri
 function writeBundledCli(context) {
   try {
     fs.mkdirSync(CLI_INSTALL_DIR, { recursive: true });
-    for (const name of ['vscode-bridge.sh', 'bridgectl.sh']) {
+    for (const name of ['vscode-bridge.sh', 'bridgectl.sh', 'bridge-tail.sh']) {
       const src = path.join(context.extensionPath, 'bin', name);
       const dest = path.join(CLI_INSTALL_DIR, name);
       fs.copyFileSync(src, dest);
@@ -84,6 +84,118 @@ async function persistMetadata(context, name, update) {
     meta[name] = { ...meta[name], ...update };
   }
   await context.workspaceState.update(METADATA_KEY, meta);
+}
+
+// ---------------------------------------------------------------------------
+// Remote node registry — laptop-side config for offloading jobs to workers
+// (bin/worker.js, running headless on e.g. a Mac Mini). Lives outside any
+// workspace folder since it's a per-machine, not per-repo, credential store.
+// ---------------------------------------------------------------------------
+
+const NODES_REGISTRY_PATH = path.join(require('os').homedir(), '.vscode-terminal-bridge', 'nodes.json');
+
+function loadNodeRegistry() {
+  try {
+    return JSON.parse(fs.readFileSync(NODES_REGISTRY_PATH, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function postJson(host, port, urlPath, token, body) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(body);
+    const req = http.request({
+      host, port, path: urlPath, method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(data),
+        'Authorization': `Bearer ${token}`,
+      },
+    }, res => {
+      let resBody = '';
+      res.on('data', chunk => { resBody += chunk; });
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, json: JSON.parse(resBody) }); }
+        catch { resolve({ status: res.statusCode, json: null }); }
+      });
+    });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+
+function getJson(host, port, urlPath, token) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host, port, path: urlPath, method: 'GET',
+      headers: { 'Authorization': `Bearer ${token}` },
+    }, res => {
+      let body = '';
+      res.on('data', chunk => { body += chunk; });
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, json: JSON.parse(body) }); }
+        catch { resolve({ status: res.statusCode, json: null }); }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Reattach proxy tabs for remote jobs still running on a worker node after a
+// window reload — the remote analog of reindexTerminals()/sweepTerminals()
+// above, since a remote job's ground truth lives on the worker, not in
+// vscode.window.terminals.
+// ---------------------------------------------------------------------------
+
+async function reattachRemoteJobs(context) {
+  const metadata = loadMetadata(context);
+  const registry = loadNodeRegistry();
+  let reattached = 0;
+
+  for (const [name, meta] of Object.entries(metadata)) {
+    if (!meta.node || !meta.jobId) continue;
+    if (terminals.has(name)) continue; // already tracked this session
+
+    const nodeCfg = registry[meta.node];
+    if (!nodeCfg) continue; // node no longer configured — nothing we can do
+
+    let stillRunning;
+    try {
+      const { json } = await getJson(
+        nodeCfg.host, nodeCfg.port,
+        `/job-status?id=${encodeURIComponent(meta.jobId)}&offset=0`,
+        nodeCfg.token
+      );
+      stillRunning = !!(json && !json.done);
+    } catch {
+      // Worker unreachable right now — don't assume it's done; recreate the
+      // tab so bridge-tail.sh's own polling can resolve the real state once
+      // the worker is reachable again.
+      stillRunning = true;
+    }
+
+    if (!stillRunning) {
+      await persistMetadata(context, name, null);
+      continue;
+    }
+
+    const options = { name };
+    if (meta.color) options.color = new vscode.ThemeColor(meta.color);
+    const terminal = vscode.window.createTerminal(options);
+    terminal.show(true);
+    terminal.sendText(`bash ${CLI_INSTALL_DIR}/bridge-tail.sh ${meta.node} ${meta.jobId}`);
+    terminals.set(name, terminal);
+    reattached++;
+  }
+
+  if (reattached > 0) {
+    console.log(`[terminal-bridge] reattached ${reattached} remote job(s)`);
+  }
+  return reattached;
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +412,11 @@ function activate(context) {
   // ── notices (e.g. extension host restart under resource pressure). ───────
   setTimeout(() => sweepTerminals(context), 2500);
 
+  // ── Reattach proxy tabs for remote jobs still running on a worker node ───
+  // ── (ground truth lives on the worker, so this can't run as part of the ──
+  // ── local reindex above). ─────────────────────────────────────────────────
+  setTimeout(() => reattachRemoteJobs(context), 2500);
+
   // ── HTTP server ───────────────────────────────────────────────────────────
   server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
@@ -343,6 +460,46 @@ function activate(context) {
       const iconId  = url.searchParams.get('icon')  || undefined;
       // focus=1 steals keyboard focus (old default); omit or focus=0 to preserve focus.
       const stealFocus = url.searchParams.get('focus') === '1';
+      // node= offloads cmd to a worker (bin/worker.js) registered in
+      // ~/.vscode-terminal-bridge/nodes.json instead of running it locally.
+      const node    = url.searchParams.get('node') || undefined;
+      const ref     = url.searchParams.get('ref')  || undefined;
+
+      // effectiveCmd is what actually runs in the local terminal tab — either
+      // cmd itself (local job) or a tail script proxying a remote job's
+      // status/log back into this tab (remote job).
+      let effectiveCmd = cmd;
+      let jobId;
+
+      if (node) {
+        const nodeCfg = loadNodeRegistry()[node];
+        if (!nodeCfg) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `Unknown node "${node}" — check ~/.vscode-terminal-bridge/nodes.json` }));
+          return;
+        }
+        if (!cmd) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'cmd is required when node= is set' }));
+          return;
+        }
+
+        jobId = `${name || 'job'}-${Date.now()}`;
+        try {
+          const { status, json } = await postJson(nodeCfg.host, nodeCfg.port, '/run-job', nodeCfg.token, { jobId, cmd, ref });
+          if (status !== 200 || !json || !json.ok) {
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: `Failed to start job on node "${node}"`, detail: json }));
+            return;
+          }
+        } catch (err) {
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `Could not reach node "${node}": ${err.message}` }));
+          return;
+        }
+
+        effectiveCmd = `bash ${CLI_INSTALL_DIR}/bridge-tail.sh ${node} ${jobId}`;
+      }
 
       const options = { cwd, name };
       if (colorId) options.color    = new vscode.ThemeColor(colorId);
@@ -361,9 +518,9 @@ function activate(context) {
         // Inject orchestrator env vars so status hooks work inside the terminal.
         terminal.sendText(`export HH_ORCHESTRATOR_ID=${JSON.stringify(name || '')}`);
         terminal.sendText(`export HH_BRIDGE_STATUS_URL="http://127.0.0.1:${activePort}/api/status"`);
-        if (cmd) terminal.sendText(cmd);
+        if (effectiveCmd) terminal.sendText(effectiveCmd);
       };
-      if ((name || cmd) && typeof vscode.window.onDidChangeTerminalShellIntegration === 'function') {
+      if ((name || effectiveCmd) && typeof vscode.window.onDidChangeTerminalShellIntegration === 'function') {
         let sent = false;
         const fallback = setTimeout(() => { if (!sent) { sent = true; sendDeferred(); } }, 1500);
         const sub = vscode.window.onDidChangeTerminalShellIntegration(e => {
@@ -374,13 +531,16 @@ function activate(context) {
             sendDeferred();
           }
         });
-      } else if (name || cmd) {
+      } else if (name || effectiveCmd) {
         setTimeout(sendDeferred, 1500);
       }
 
       if (name) {
         terminals.set(name, terminal);
-        await persistMetadata(context, name, { cwd, label: name, baseLabel: name, color: colorId });
+        await persistMetadata(context, name, {
+          cwd, label: name, baseLabel: name, color: colorId,
+          ...(node ? { node, jobId } : {}),
+        });
         // Persist the real shell PID as an OS-level fallback for cleanup —
         // independent of VS Code's own (sometimes-stale) terminal bookkeeping.
         terminal.processId.then(pid => {
@@ -389,7 +549,7 @@ function activate(context) {
       }
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, name, cwd, cmd, color: colorId, icon: iconId }));
+      res.end(JSON.stringify({ ok: true, name, cwd, cmd, color: colorId, icon: iconId, node, jobId }));
 
     } else if (url.pathname === '/rename-terminal') {
       // Rename a terminal tab via VS Code API — no OSC sequences needed.

@@ -174,6 +174,8 @@ Opens a named terminal tab and optionally runs a command in it.
 | `color` | No | Tab color — VS Code ThemeColor ID (e.g. `terminal.ansiGreen`) |
 | `icon` | No | Tab icon — VS Code ThemeIcon ID (e.g. `hubot`, `check`, `error`). Set once at creation to mark the terminal's identity. |
 | `focus` | No | Set `focus=1` to steal keyboard focus. Default: focus is **preserved** (the editor keeps focus). |
+| `node` | No | Offload `cmd` to a worker node registered in `~/.vscode-terminal-bridge/nodes.json` instead of running it in this window. See [Remote jobs](#remote-jobs). |
+| `ref` | No | Git ref the remote job's worktree is cut from. Only used with `node=`. Default: `main`. |
 
 **Focus behaviour:** by default, spawning a terminal never yanks focus from the editor. Pass `focus=1` only when you explicitly want the user to land in the new terminal.
 
@@ -622,9 +624,67 @@ curl "http://127.0.0.1:${PORT}/close-terminal?name=TASK-1"
 
 The extension re-indexes automatically. When the window is focused after a reload it scans all open terminals against persisted metadata and active git worktrees, re-linking any match. You can also call `/reindex` explicitly from a script to force a scan without waiting for window focus.
 
+## Remote jobs
+
+A long-running job (e.g. a multi-hour local LLM generation) can run on a separate machine on your network — a Mac Mini, a homelab VM, anything reachable over the LAN — instead of blocking your laptop, while still showing up as a normal terminal tab with a live status icon.
+
+This works without VS Code running on the worker machine: `bin/worker.js` is a standalone, dependency-free Node daemon (no `vscode` import) that runs headless under launchd. The laptop's `/open-terminal` gains a `node=` param — when set, instead of running `cmd` in this window, it POSTs the job to the named worker, which:
+
+1. Fetches the configured ref (`ref=`, default `main`) and resolves it to a SHA.
+2. Cuts a fresh `git worktree` at that SHA under `<repo>-worktrees/<jobId>` — every job starts from current main, and concurrent jobs never collide with each other.
+3. Runs the command inside an [rmux](https://rmux.io/) session (a tmux-compatible, scriptable multiplexer), so the job survives the laptop sleeping or VS Code closing.
+
+The laptop still opens a local terminal tab for the job. That tab doesn't run the job — it runs `bridge-tail.sh <node> <jobId>` (bundled the same way as `bridgectl.sh`), which polls the worker's `/job-status` and drives the tab's icon via the existing `/rename-terminal?status=` mechanism. The job looks and feels local even though it isn't. After a window reload, any tracked terminal with a `node`/`jobId` in its persisted metadata is reattached automatically if the remote job is still running.
+
+### Setting up a worker node
+
+1. Clone this repo onto the worker machine — this becomes its canonical `WORKER_REPO_DIR`.
+2. Generate a token: `openssl rand -hex 32`.
+3. Run the daemon with env vars set:
+
+   ```bash
+   WORKER_TOKEN=<token> WORKER_REPO_DIR=/path/to/clone node bin/worker.js
+   ```
+
+   Put this under launchd (`KeepAlive: true`, `RunAtLoad: true`) so it survives crashes/reboots. `WORKER_PORT` defaults to `31416` — deliberately different from the local bridge's `31415`.
+
+4. On the laptop, add the node to `~/.vscode-terminal-bridge/nodes.json` (`chmod 600` it — it holds a bearer token):
+
+   ```json
+   { "m1": { "host": "192.168.1.50", "port": 31416, "token": "<same token>" } }
+   ```
+
+5. Sanity check before trusting it: `bash ~/.vscode-terminal-bridge/bin/bridgectl.sh ping --node m1`.
+
+### Running a job on a node
+
+```bash
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open llm-gen /any/local/path \
+  "run-the-long-job.sh" --node=m1
+```
+
+### Worker endpoints (`bin/worker.js`)
+
+Unlike the local bridge, every worker endpoint requires `Authorization: Bearer <token>` and binds `0.0.0.0` — this is the only part of the system exposed beyond `127.0.0.1`, so treat the token like an SSH credential.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /run-job` | Body `{ jobId, cmd, ref? }`. Cuts a worktree at the resolved ref and starts `cmd` in an `rmux` session. |
+| `GET /job-status` | `?id=&offset=` — returns `{ done, exitCode, running, logChunk, nextOffset }`. `offset`/`nextOffset` let callers tail the log incrementally instead of re-fetching it whole. |
+| `POST /sweep-job` | `?id=` — removes a job's worktree. Runs automatically on successful (`exitCode === 0`) completion; call manually for a failed job once you're done inspecting it. |
+| `GET /ping` | Health check — returns `{ ok, port, hostname }`. |
+
+### Job lifecycle / cleanup
+
+- A job's worktree is **auto-removed** on successful completion.
+- A **failed** job's worktree is left in place for manual inspection — `git worktree remove` it yourself, or hit `/sweep-job` once you're done.
+- To inspect a stuck or running job directly: SSH into the worker and run `rmux attach -t <jobId>`.
+
 ## Security
 
-The server binds to `127.0.0.1` only — it is **not** accessible from other machines on the network. It has no authentication because it controls only your local VS Code instance.
+The local bridge (`extension.js`) binds to `127.0.0.1` only — it is **not** accessible from other machines on the network, and has no authentication because it controls only your local VS Code instance.
+
+The worker daemon (`bin/worker.js`, see [Remote jobs](#remote-jobs)) is different: it binds `0.0.0.0` so a laptop on the LAN can reach it, and **does** require a bearer token on every request. Anyone with that token can run arbitrary shell commands on the worker machine — store it like an SSH key (`chmod 600` on `nodes.json`, never commit it).
 
 ## License
 

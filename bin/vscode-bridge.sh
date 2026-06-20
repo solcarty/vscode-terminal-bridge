@@ -94,19 +94,56 @@ bridge_ping() {
   curl -fsS -m 1 "http://127.0.0.1:${port}/ping" >/dev/null 2>&1
 }
 
-# bridge_open <name> <cwd> [cmd] [icon] [color]
+# bridge_ping_node <node-name> — checks a worker registered in
+# ~/.vscode-terminal-bridge/nodes.json directly (bypasses the local bridge
+# entirely). Returns 0 if reachable, 1 otherwise. Use this once after adding
+# a node to nodes.json, before trusting it with real jobs.
+bridge_ping_node() {
+  local node_name="$1"
+  local nodes_file="$HOME/.vscode-terminal-bridge/nodes.json"
+  local line
+  line=$(node -e '
+    const fs = require("fs");
+    const reg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const cfg = reg[process.argv[2]];
+    if (!cfg) process.exit(1);
+    console.log(`${cfg.host} ${cfg.port} ${cfg.token}`);
+  ' "$nodes_file" "$node_name") || return 1
+  local host port token
+  read -r host port token <<< "$line"
+  curl -fsS -m 2 -H "Authorization: Bearer $token" "http://$host:$port/ping" >/dev/null 2>&1
+}
+
+# bridge_open <name> <cwd> [cmd] [icon] [color] [--node=<name>] [--ref=<ref>]
 #
 # Bridge v0.7.0+ exports CLAUDE_TAB_NAME automatically and preserves focus by
 # default on open. No prefix or focus-handling needed here.
+#
+# --node=<name> offloads <cmd> to a worker (bin/worker.js) registered in
+# ~/.vscode-terminal-bridge/nodes.json instead of running it in this window.
+# The local tab becomes a live proxy onto the remote job — see bridge-tail.sh.
 bridge_open() {
   _bridge_active || return 0
-  local name="$1" cwd="$2" cmd="${3:-}" icon="${4:-}" color="${5:-}"
+  local name="$1" cwd="$2"; shift 2
+  local cmd="" icon="" color="" node="" ref=""
+  local positional=()
+  for arg in "$@"; do
+    case "$arg" in
+      --node=*) node="${arg#--node=}" ;;
+      --ref=*)  ref="${arg#--ref=}"   ;;
+      *)        positional+=("$arg")  ;;
+    esac
+  done
+  cmd="${positional[0]:-}"; icon="${positional[1]:-}"; color="${positional[2]:-}"
+
   local port
   port=$(_bridge_port "$cwd")
   set -- --data-urlencode "name=$name" --data-urlencode "cwd=$cwd"
   [ -n "$cmd" ]   && set -- "$@" --data-urlencode "cmd=$cmd"
   [ -n "$icon" ]  && set -- "$@" --data-urlencode "icon=$icon"
   [ -n "$color" ] && set -- "$@" --data-urlencode "color=$color"
+  [ -n "$node" ]  && set -- "$@" --data-urlencode "node=$node"
+  [ -n "$ref" ]   && set -- "$@" --data-urlencode "ref=$ref"
   curl -fsS -m 2 --get "$@" "http://127.0.0.1:${port}/open-terminal" >/dev/null 2>&1 || true
 }
 

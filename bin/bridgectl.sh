@@ -35,9 +35,17 @@ case "$sub" in
   status) bridge_status "$@" ;;
   rename) bridge_rename "$@" ;;
   sweep)  bridge_sweep  "$@" ;;
-  ping)   bridge_ping   "$@" && echo "reachable" || { echo "unreachable"; exit 1; } ;;
+  ping)
+    if [ "${1:-}" = "--node" ]; then
+      bridge_ping_node "$2" && echo "reachable" || { echo "unreachable"; exit 1; }
+    else
+      bridge_ping "$@" && echo "reachable" || { echo "unreachable"; exit 1; }
+    fi
+    ;;
   *)
     echo "usage: bridgectl.sh {open|close|status|rename|sweep|ping} [args...]" >&2
+    echo "       bridgectl.sh open <name> <cwd> [cmd] [icon] [color] [--node=<name>] [--ref=<ref>]" >&2
+    echo "       bridgectl.sh ping --node <name>" >&2
     exit 2
     ;;
 esac

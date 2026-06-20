@@ -9,6 +9,29 @@ const execAsync = promisify(exec);
 
 let server;
 
+// ---------------------------------------------------------------------------
+// Bundled CLI distribution — write the version-matched bin/*.sh scripts to a
+// fixed, repo-independent path on every activation so consuming repos call
+// one canonical copy instead of vendoring their own. Bumping the extension
+// version re-syncs every repo automatically; no per-repo copy-paste.
+// ---------------------------------------------------------------------------
+
+const CLI_INSTALL_DIR = path.join(require('os').homedir(), '.vscode-terminal-bridge', 'bin');
+
+function writeBundledCli(context) {
+  try {
+    fs.mkdirSync(CLI_INSTALL_DIR, { recursive: true });
+    for (const name of ['vscode-bridge.sh', 'bridgectl.sh']) {
+      const src = path.join(context.extensionPath, 'bin', name);
+      const dest = path.join(CLI_INSTALL_DIR, name);
+      fs.copyFileSync(src, dest);
+      fs.chmodSync(dest, 0o755);
+    }
+  } catch (err) {
+    console.error('[terminal-bridge] failed to write bundled CLI:', err.message);
+  }
+}
+
 // Stable registry: creation key → terminal instance.
 // Survives display name changes within a session.
 const terminals = new Map();
@@ -236,6 +259,10 @@ async function closeTerminalByName(context, name) {
 // ---------------------------------------------------------------------------
 
 function activate(context) {
+  // ── Sync the bundled CLI scripts to a fixed, version-matched path so every ──
+  // ── consuming repo calls one canonical copy instead of vendoring its own. ───
+  writeBundledCli(context);
+
   // ── Keep registry clean when the user closes a terminal manually ──────────
   context.subscriptions.push(
     vscode.window.onDidCloseTerminal(async closed => {

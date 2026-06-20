@@ -100,7 +100,7 @@ For the port file to work correctly, your repo root must be open as a workspace 
 
 ## VS Code title format (recommended)
 
-For the best experience, set your terminal tab title format to show both the dynamic status and the folder name.
+This setting only matters for terminals **not** managed by the bridge — any tab opened or renamed via `/open-terminal` / `/rename-terminal` gets a static label (with the `$(codicon)` status prefix baked in, see [status values](#status-values)) that overrides whatever title format VS Code would otherwise compute. For everything else — terminals you open manually, or before this extension renames them — this format gives you a useful default: the live shell title on the left, the workspace folder name on the right.
 
 **Settings → Terminal › Integrated › Tabs: Title** (or edit `settings.json`):
 
@@ -110,9 +110,9 @@ For the best experience, set your terminal tab title format to show both the dyn
 
 This gives you:
 
-- `${rootWorkspaceFolderName}` — always shows the workspace folder (e.g. `SOL-60`) on the right
+- `${rootWorkspaceFolderName}` — always shows the workspace folder name on the right
 - `${sequence}` — shows any OSC title sequences emitted by the shell on the left
-- When a terminal is renamed via `/rename-terminal`, the static label overrides this format entirely
+- Once a terminal is renamed via `/rename-terminal` (e.g. with `status=working`), its static label replaces this computed format entirely — that's how bridge-managed status icons actually show up in the tab
 
 ## API
 
@@ -140,7 +140,7 @@ curl http://127.0.0.1:$PORT/ping
   "pid": 1563,
   "workspaceFolders": [
     "/Users/you/Workspace/my-repo",
-    "/Users/you/worktrees/my-repo/SOL-42"
+    "/Users/you/worktrees/my-repo/my-task"
   ]
 }
 ```
@@ -235,18 +235,18 @@ Renames a tracked terminal tab and optionally updates its icon and color. Suppor
 PORT=$(cat "$PWD/.vscode-bridge-port" 2>/dev/null || echo 31415)
 
 # Status mode — bridge handles codicon + color (idempotent)
-curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&status=working"
-curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&status=needs-input"
-curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&status=idle"
+curl "http://127.0.0.1:${PORT}/rename-terminal?name=my-task&status=working"
+curl "http://127.0.0.1:${PORT}/rename-terminal?name=my-task&status=needs-input"
+curl "http://127.0.0.1:${PORT}/rename-terminal?name=my-task&status=idle"
 
 # Quiet + status — silent color update, no label change, no panel flicker
-curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&quiet=1&status=working"
+curl "http://127.0.0.1:${PORT}/rename-terminal?name=my-task&quiet=1&status=working"
 
 # Legacy label override
-curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&label=%E2%9C%85%20SOL-69%20done&color=terminal.ansiGreen"
+curl "http://127.0.0.1:${PORT}/rename-terminal?name=my-task&label=%E2%9C%85%20my-task%20done&color=terminal.ansiGreen"
 
 # Update base label while keeping the current status prefix
-curl "http://127.0.0.1:${PORT}/rename-terminal?name=SOL-69&status=working&label=SOL-69%20v2"
+curl "http://127.0.0.1:${PORT}/rename-terminal?name=my-task&status=working&label=my-task%20v2"
 ```
 
 Response (status mode):
@@ -254,9 +254,9 @@ Response (status mode):
 ```json
 {
   "ok": true,
-  "name": "SOL-69",
-  "label": "$(loading~spin) SOL-69",
-  "baseLabel": "SOL-69",
+  "name": "my-task",
+  "label": "$(loading~spin) my-task",
+  "baseLabel": "my-task",
   "icon": null,
   "color": "terminal.ansiCyan",
   "status": "working"
@@ -268,9 +268,9 @@ Response (idempotent no-op):
 ```json
 {
   "ok": true,
-  "name": "SOL-69",
-  "label": "$(loading~spin) SOL-69",
-  "baseLabel": "SOL-69",
+  "name": "my-task",
+  "label": "$(loading~spin) my-task",
+  "baseLabel": "my-task",
   "icon": null,
   "color": "terminal.ansiCyan",
   "status": "working",
@@ -327,7 +327,7 @@ curl "http://127.0.0.1:${PORT}/sweep"
 Response:
 
 ```json
-{ "ok": true, "closed": ["SOL-234", "SOL-235"] }
+{ "ok": true, "closed": ["task-a", "task-b"] }
 ```
 
 ---
@@ -395,10 +395,10 @@ Claude Code fires hook events at key lifecycle points. Each hook runs a shell co
 
 ```bash
 # Good: icon set at creation, hooks only change color
-curl ".../open-terminal?name=SOL-42&icon=hubot&color=terminal.ansiCyan&cmd=..."
+curl ".../open-terminal?name=my-task&icon=hubot&color=terminal.ansiCyan&cmd=..."
 
 # Hook (PreToolUse) — silent color update, no flicker
-curl ".../rename-terminal?name=SOL-42&quiet=1&color=terminal.ansiCyan"
+curl ".../rename-terminal?name=my-task&quiet=1&color=terminal.ansiCyan"
 ```
 
 **Tab-name resolution:** the extension exports `CLAUDE_TAB_NAME=<name>` into the shell when a named terminal is opened. Hook scripts can read `$CLAUDE_TAB_NAME` directly rather than relying on `basename "$PWD"`, which only works when the working directory name matches the tab name.
@@ -424,15 +424,15 @@ Use `status=` for all lifecycle hooks — the bridge owns the codicon + color ma
 
 | Hook / event | `status=` | Tab shows | Color |
 | ------------ | --------- | --------- | ----- |
-| `PreToolUse` | `working` | `$(loading~spin) SOL-42` | Cyan |
-| `Notification` | `needs-input` | `$(bell-dot) SOL-42` | Yellow |
-| `Stop` | `idle` | `$(debug-pause) SOL-42` | Green |
-| `PermissionRequest` | `permission` | `$(shield) SOL-42` | Blue |
-| `PostToolUseFailure` / `StopFailure` | `error` | `$(error) SOL-42` | Red |
-| `PreCompact` | `compacting` | `$(archive) SOL-42` | Blue |
-| `SubagentStart` | `subagent` | `$(symbol-array) SOL-42` | Magenta |
-| `TaskCreated` | `bg-task` | `$(server-process) SOL-42` | Blue |
-| `TaskCompleted` | `task-done` | `$(check-all) SOL-42` | Green |
+| `PreToolUse` | `working` | `$(loading~spin) my-task` | Cyan |
+| `Notification` | `needs-input` | `$(bell-dot) my-task` | Yellow |
+| `Stop` | `idle` | `$(debug-pause) my-task` | Green |
+| `PermissionRequest` | `permission` | `$(shield) my-task` | Blue |
+| `PostToolUseFailure` / `StopFailure` | `error` | `$(error) my-task` | Red |
+| `PreCompact` | `compacting` | `$(archive) my-task` | Blue |
+| `SubagentStart` | `subagent` | `$(symbol-array) my-task` | Magenta |
+| `TaskCreated` | `bg-task` | `$(server-process) my-task` | Blue |
+| `TaskCompleted` | `task-done` | `$(check-all) my-task` | Green |
 
 The `hubot` icon set at creation persists as the Claude-session identity marker throughout — `status=` never touches `iconPath`.
 
@@ -533,7 +533,7 @@ Use `matcher` to scope a hook to a specific tool name (e.g. `"matcher": "Bash"` 
 Open a named terminal for a git worktree, attach the worktree to the VS Code workspace, and start Claude automatically — all via the HTTP bridge, no `code` CLI required:
 
 ```bash
-ISSUE="SOL-42"
+ISSUE="my-task"
 WORKTREE="$HOME/worktrees/my-repo/$ISSUE"
 
 git worktree add "$WORKTREE" -b "$ISSUE"
@@ -549,7 +549,7 @@ curl -s "http://127.0.0.1:${PORT}/add-folder?path=${CWD}"
 curl -s "http://127.0.0.1:${PORT}/open-terminal?name=${ISSUE}&cwd=${CWD}&cmd=${CMD}&icon=hubot&color=terminal.ansiCyan"
 ```
 
-The terminal is registered under `SOL-42`, so the Claude Code hooks above rename it automatically, and `/close-terminal?name=SOL-42` closes it when the work is done. When the worktree is cleaned up, call `/remove-folder` to detach it from the workspace.
+The terminal is registered under `my-task`, so the Claude Code hooks above rename it automatically, and `/close-terminal?name=my-task` closes it when the work is done. When the worktree is cleaned up, call `/remove-folder` to detach it from the workspace.
 
 ---
 

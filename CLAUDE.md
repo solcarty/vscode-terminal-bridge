@@ -4,7 +4,7 @@
 
 A VS Code extension that exposes a local HTTP API for managing terminal tabs programmatically. Lets external scripts, Claude agents, and shell tools open, rename, close, and set status on named terminals without AppleScript or keystrokes.
 
-Used as the orchestration layer for spawning instrument agent terminals in DirJ-Ex.
+Application-agnostic — any repo or process can call it via HTTP. Not coupled to any specific consuming project.
 
 ## How it works
 
@@ -49,12 +49,12 @@ Source of these scripts is `bin/` in this repo — edit there, not the installed
 | `subagent` | array symbol | magenta |
 | `task-done` | checkmark | green |
 
-## Spawning an instrument agent terminal
+## Spawning a named terminal
 
 ```bash
-bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open acid-agent \
-  /Users/solcarty/Workspace/DirJ-Ex \
-  "AGENT_ID=acid MIDI_PORT=TB-03 SKILL_FILE=skills/acid/breakbeat.md node dist/agent/agent-runner.js" \
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open my-task \
+  /path/to/worktree-or-repo \
+  "some-command --with-args" \
   "" terminal.ansiMagenta
 ```
 

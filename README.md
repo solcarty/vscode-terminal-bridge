@@ -69,6 +69,29 @@ cd ~/.vscode-insiders/extensions/sdo.terminal-bridge && git pull
 
 Then reload VS Code.
 
+## Bash client (recommended over raw curl)
+
+The extension bundles a small bash client (`bin/vscode-bridge.sh` + `bin/bridgectl.sh`) and writes it to `~/.vscode-terminal-bridge/bin/` on every activation — a fixed, repo-independent path that stays version-matched to whatever extension version is installed. Point your scripts/skills there instead of vendoring a copy per repo; bumping the extension re-syncs every consumer automatically.
+
+```bash
+# one command per action — easy to cover with a single permission allow-rule
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open   <name> <cwd> [cmd] [icon] [color]
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh status <name> <state>   # working|idle|needs-input|pr-open|merged|...
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh close  <name>
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh sweep
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh ping
+```
+
+Or source the functions directly:
+
+```bash
+. ~/.vscode-terminal-bridge/bin/vscode-bridge.sh
+bridge_open "$NAME" "$CWD" "$CMD"
+bridge_status "$NAME" working
+```
+
+Both handle port discovery (walking up for `.vscode-bridge-port`) and no-op silently when the bridge isn't reachable. Source: `bin/` in this repo.
+
 ## Workspace requirement
 
 The `.vscode-bridge-port` file is written to each **workspace folder** — a path that VS Code has open as a root in the Explorer. If you open a loose file or a folder that isn't part of a workspace, the port file won't be written and port discovery will fall back to `31415`.

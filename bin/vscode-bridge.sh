@@ -40,6 +40,16 @@
 # calling shell has a stripped PATH missing /bin or /usr/bin (agent-spawned
 # subshells in Claude Code's Bash tool sometimes do).
 _bridge_port() {
+  # Prefer the port pinned by the window that spawned this terminal (set by
+  # the extension on every bridge_open). This is the only reliable signal
+  # when the same multi-root workspace is open in more than one VS Code
+  # window — each window overwrites the same shared .vscode-bridge-port file
+  # in the folders it sees, so that file can point at a *different* window's
+  # server than the one that actually owns this shell.
+  if [ -n "${VSCODE_BRIDGE_PORT:-}" ]; then
+    echo "$VSCODE_BRIDGE_PORT"
+    return
+  fi
   local dir="${1:-$PWD}"
   # If $1 is relative, resolve it via cd; on failure fall back to PWD rather
   # than aborting, so the helper still works in a stripped-PATH shell.
@@ -66,6 +76,9 @@ _bridge_port() {
 _bridge_active() {
   # Interactive VS Code terminal: $TERM_PROGRAM tells us directly.
   [ "${TERM_PROGRAM:-}" = "vscode" ] && return 0
+  # A bridge-spawned terminal (or a subshell descended from one) always has
+  # this pinned by the extension — see the VSCODE_BRIDGE_PORT note above.
+  [ -n "${VSCODE_BRIDGE_PORT:-}" ] && return 0
   # Agent-spawned shells (Claude Code hooks, sub-agents) don't inherit
   # $TERM_PROGRAM, but the bridge writes .vscode-bridge-port into each
   # workspace folder while it's running. If we can find one walking up
@@ -114,7 +127,7 @@ bridge_ping_node() {
   curl -fsS -m 2 -H "Authorization: Bearer $token" "http://$host:$port/ping" >/dev/null 2>&1
 }
 
-# bridge_open <name> <cwd> [cmd] [icon] [color] [--node=<name>] [--ref=<ref>]
+# bridge_open <name> <cwd> [cmd] [icon] [color] [--node=<name>] [--ref=<ref>] [--cmd-file=<path>]
 #
 # Bridge v0.7.0+ exports CLAUDE_TAB_NAME automatically and preserves focus by
 # default on open. No prefix or focus-handling needed here.
@@ -122,16 +135,23 @@ bridge_ping_node() {
 # --node=<name> offloads <cmd> to a worker (bin/worker.js) registered in
 # ~/.vscode-terminal-bridge/nodes.json instead of running it in this window.
 # The local tab becomes a live proxy onto the remote job — see bridge-tail.sh.
+#
+# --cmd-file=<path> — for long or quote-heavy commands (e.g. a multi-hundred
+# character agent kickoff prompt) that don't reliably survive shell-quoting +
+# URL-encoding + re-parsing by the terminal's shell as one inline string.
+# Write the command to <path> and pass this instead of a positional cmd; the
+# bridge runs `bash <path>` in the terminal instead.
 bridge_open() {
   _bridge_active || return 0
   local name="$1" cwd="$2"; shift 2
-  local cmd="" icon="" color="" node="" ref=""
+  local cmd="" icon="" color="" node="" ref="" cmdFile=""
   local positional=()
   for arg in "$@"; do
     case "$arg" in
-      --node=*) node="${arg#--node=}" ;;
-      --ref=*)  ref="${arg#--ref=}"   ;;
-      *)        positional+=("$arg")  ;;
+      --node=*)     node="${arg#--node=}" ;;
+      --ref=*)      ref="${arg#--ref=}"   ;;
+      --cmd-file=*) cmdFile="${arg#--cmd-file=}" ;;
+      *)            positional+=("$arg")  ;;
     esac
   done
   cmd="${positional[0]:-}"; icon="${positional[1]:-}"; color="${positional[2]:-}"
@@ -139,12 +159,31 @@ bridge_open() {
   local port
   port=$(_bridge_port "$cwd")
   set -- --data-urlencode "name=$name" --data-urlencode "cwd=$cwd"
-  [ -n "$cmd" ]   && set -- "$@" --data-urlencode "cmd=$cmd"
+  [ -n "$cmd" ]     && set -- "$@" --data-urlencode "cmd=$cmd"
+  [ -n "$cmdFile" ] && set -- "$@" --data-urlencode "cmdFile=$cmdFile"
   [ -n "$icon" ]  && set -- "$@" --data-urlencode "icon=$icon"
   [ -n "$color" ] && set -- "$@" --data-urlencode "color=$color"
   [ -n "$node" ]  && set -- "$@" --data-urlencode "node=$node"
   [ -n "$ref" ]   && set -- "$@" --data-urlencode "ref=$ref"
-  curl -fsS -m 2 --get "$@" "http://127.0.0.1:${port}/open-terminal" >/dev/null 2>&1 || true
+  local response
+  if ! response=$(curl -fsS -m 2 --get "$@" "http://127.0.0.1:${port}/open-terminal" 2>&1); then
+    echo "bridge_open: failed to reach bridge on port $port: $response" >&2
+    return 1
+  fi
+  case "$response" in
+    *'"ok":true'*) : ;;
+    *) echo "bridge_open: bridge reported failure: $response" >&2; return 1 ;;
+  esac
+}
+
+# bridge_list — query all bridge-tracked terminals as JSON:
+# {ok, terminals:[{name, cwd, label, status, node, jobId, pid, live}]}.
+# Bridge v0.15.0+; older bridges 404 and this prints nothing / returns 1.
+bridge_list() {
+  _bridge_active || return 0
+  local port
+  port=$(_bridge_port)
+  curl -fsS -m 2 "http://127.0.0.1:${port}/list" 2>/dev/null
 }
 
 # bridge_close <name>
@@ -197,6 +236,10 @@ bridge_rename() {
 #   none          — strip prefix and reset color (manual reset)
 bridge_status() {
   _bridge_active || return 0
+  if [ "$#" -lt 2 ]; then
+    echo "usage: bridgectl.sh status <name> <state>" >&2
+    return 2
+  fi
   local name="$1" state="$2"
   local port
   port=$(_bridge_port)

@@ -22,7 +22,7 @@ Terminals opened via `/open-terminal` are registered in an internal Map (`name �
 
 ## Multi-window setup
 
-When two VS Code windows are open, each gets its own bridge on a different port:
+When two VS Code windows are open on **different** folders, each gets its own bridge on a different port:
 
 | Window | Port | `.vscode-bridge-port` |
 | ------ | ---- | --------------------- |
@@ -30,6 +30,8 @@ When two VS Code windows are open, each gets its own bridge on a different port:
 | Second window | `31416` | `31416` |
 
 Scripts running inside a VS Code terminal read `.vscode-bridge-port` from their working directory, so they always talk to the bridge in **their own window** — no configuration needed.
+
+**Caveat — same workspace open in multiple windows:** if the *same* multi-root workspace (e.g. one `.code-workspace` file listing several worktree folders) is opened in more than one window, every window's extension instance writes `.vscode-bridge-port` into the *same* folders — whichever window (re)activates last wins, for every folder, in every other window too. A terminal opened via `/open-terminal` isn't affected: the extension also exports `VSCODE_BRIDGE_PORT` (pinned to the exact port of the window that spawned it) into every terminal it creates, and `bridgectl.sh`/`vscode-bridge.sh` prefer that env var — inherited by any subshells/hooks running inside that tab — over the shared, racy port file. A plain terminal you open by hand (not via `/open-terminal`) still falls back to the port file, so it can end up talking to a different window's bridge in this setup.
 
 ## Installation
 
@@ -171,6 +173,7 @@ Opens a named terminal tab and optionally runs a command in it.
 | `name` | No | Terminal tab label and registry key |
 | `cwd` | No | Working directory (URL-encoded path) |
 | `cmd` | No | Shell command to run on open (URL-encoded) |
+| `cmdFile` | No | Path to a file containing the command to run instead of `cmd`. Use this for long or quote-heavy commands (e.g. a multi-hundred-character agent kickoff prompt) — threading them through argv risks breaking across shell-quoting at the call site, URL-encoding, and re-parsing by the terminal's shell. Ignored if `cmd` is also set. |
 | `color` | No | Tab color — VS Code ThemeColor ID (e.g. `terminal.ansiGreen`) |
 | `icon` | No | Tab icon — VS Code ThemeIcon ID (e.g. `hubot`, `check`, `error`). Set once at creation to mark the terminal's identity. |
 | `focus` | No | Set `focus=1` to steal keyboard focus. Default: focus is **preserved** (the editor keeps focus). |
@@ -194,6 +197,36 @@ Response:
 ```json
 { "ok": true, "name": "my-tab", "cwd": "/path/to/dir", "cmd": "echo hello", "color": null, "icon": null }
 ```
+
+The bundled `bridgectl.sh open` client checks this response and returns a non-zero exit code (printing the error to stderr) if the bridge couldn't be reached or reported failure — it no longer swallows every error with a blind `|| true`.
+
+**Large or quote-heavy commands:** write the command to a file and pass `--cmd-file` instead of a positional `cmd`:
+
+```bash
+echo 'claude "…a very long, quote-heavy kickoff prompt…"' > /tmp/kickoff.sh
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open my-task /path/to/worktree --cmd-file=/tmp/kickoff.sh
+```
+
+---
+
+### `GET /list`
+
+Read-path companion to `/open-terminal`, `/close-terminal`, and `/rename-terminal` (all write-only) — lets a caller check whether a spawn actually landed and what state it's tracked in, instead of guessing from silence.
+
+```bash
+curl "http://127.0.0.1:${PORT}/list"
+```
+
+```json
+{
+  "ok": true,
+  "terminals": [
+    { "name": "my-task", "cwd": "/path/to/dir", "label": "my-task", "status": "working", "node": null, "jobId": null, "pid": 12345, "live": true }
+  ]
+}
+```
+
+Or via the bundled client: `bash ~/.vscode-terminal-bridge/bin/bridgectl.sh list`.
 
 ---
 
@@ -526,6 +559,55 @@ Use `matcher` to scope a hook to a specific tool name (e.g. `"matcher": "Bash"` 
     }
   ]
 }
+```
+
+---
+
+## Using the Cline CLI as an alternate backend
+
+[Cline CLI](https://www.npmjs.com/package/cline) (`npm i -g cline` — a separate tool from the Cline VS Code extension) can drive a bridge terminal the same way Claude Code does. It has its own project-level instruction system, deliberately similar to Claude Code's but not identical:
+
+| Cline convention | Location | Claude Code equivalent |
+| ---------------- | -------- | ----------------------- |
+| Rules (always loaded into context) | `.cline/rules/*.md` (also `.clinerules/`) | `CLAUDE.md` |
+| Workflows (invoked as `/<name>`, e.g. `cline "/pre-pr"`) | `.cline/workflows/<name>.md` | `~/.claude/commands/<name>.md` |
+| Hooks | `.cline/hooks/<EventName>.{sh,js,py,...}` — filename (case-insensitive, extension stripped) matched directly against the event name, no registration step | `settings.json` `hooks` key |
+
+Cline hook event names were deliberately chosen to mirror Claude Code's:
+
+| Cline file name | Cline internal event | Claude Code equivalent |
+| ---------------- | --------------------- | ----------------------- |
+| `TaskStart` | `agent_start` | closest: `PreToolUse` on the first tool call |
+| `TaskResume` | `agent_resume` | — |
+| `TaskCancel` | `agent_abort` | — |
+| `TaskComplete` | `agent_end` | `Stop` |
+| `TaskError` | `agent_error` | `StopFailure` |
+| `PreToolUse` | `tool_call` | `PreToolUse` (identical name) |
+| `PostToolUse` | `tool_result` | `PostToolUse` (identical name) |
+| `UserPromptSubmit` | `prompt_submit` | `UserPromptSubmit` (identical name) |
+| `SessionShutdown` | `session_shutdown` | — |
+
+**Key difference from Claude Code hooks:** each Cline hook script receives its JSON payload on **stdin** (not argv, not env) — `{ hookName, workspaceInfo: { rootPath }, taskId, ... }`. Claude Code hooks, by contrast, get context via env vars (`$CLAUDE_TAB_NAME`, `$PWD`) and the command template is inlined into `settings.json`.
+
+A minimal `.cline/hooks/TaskStart.sh` that reuses this bridge's port-discovery pattern:
+
+```bash
+#!/usr/bin/env bash
+# Cline passes the payload on stdin — read it even if unused, so the pipe doesn't block.
+cat >/dev/null
+PORT=$(cat "$PWD/.vscode-bridge-port" 2>/dev/null || echo 31415)
+N="${CLAUDE_TAB_NAME:-$(basename "$PWD")}"
+curl -s "http://127.0.0.1:${PORT}/rename-terminal?name=$N&status=working" >/dev/null 2>&1 || true
+```
+
+Map the remaining lifecycle events the same way `TaskComplete` → `status=idle`, `TaskError` → `status=error`, `TaskCancel` → `status=idle`. Since Cline's headless `--auto-approve` mode has no permission-prompt or subagent-spawn events, a 3-state model (`working` / `idle` / `error`) covers it — there's no Cline equivalent of `needs-input` or `subagent`.
+
+**Provider gotcha:** Cline's `ollama` provider id does not accept a custom base URL (`cline auth ollama -b <url>` errors with "base URL is only supported for OpenAI and OpenAI-compatible providers"). To point Cline at a remote/non-default Ollama host, use the `openai-compatible` provider id instead: `cline auth openai -b http://<host>:11434/v1 -m <model> -k <dummy>`.
+
+To launch a bridge terminal running Cline instead of Claude Code, just change the `cmd`:
+
+```bash
+curl "http://127.0.0.1:${PORT}/open-terminal?name=my-task&cwd=${CWD}&cmd=$(python3 -c "import urllib.parse; print(urllib.parse.quote('cline -P openai-compatible -m my-model --auto-approve true \"do the thing\"'))")"
 ```
 
 ---

@@ -32,6 +32,11 @@ function writeBundledCli(context) {
   }
 }
 
+// POSIX single-quote a string for safe use as one shell argument.
+function shQuote(str) {
+  return `'${String(str).replace(/'/g, `'\\''`)}'`;
+}
+
 // Stable registry: creation key → terminal instance.
 // Survives display name changes within a session.
 const terminals = new Map();
@@ -455,7 +460,7 @@ function activate(context) {
     if (url.pathname === '/open-terminal') {
       const cwd     = url.searchParams.get('cwd')   || undefined;
       const name    = url.searchParams.get('name')  || undefined;
-      const cmd     = url.searchParams.get('cmd')   || undefined;
+      let cmd       = url.searchParams.get('cmd')   || undefined;
       const colorId = url.searchParams.get('color') || undefined;
       const iconId  = url.searchParams.get('icon')  || undefined;
       // focus=1 steals keyboard focus (old default); omit or focus=0 to preserve focus.
@@ -464,6 +469,14 @@ function activate(context) {
       // ~/.vscode-terminal-bridge/nodes.json instead of running it locally.
       const node    = url.searchParams.get('node') || undefined;
       const ref     = url.searchParams.get('ref')  || undefined;
+      // cmdFile= carries a long/quote-heavy command out of band: the caller
+      // writes it to disk and we `bash` the file directly, instead of the
+      // command surviving shell-quoting at the call site, URL-encoding, AND
+      // re-parsing by the terminal's shell as a single inline string.
+      const cmdFile = url.searchParams.get('cmdFile') || undefined;
+      if (cmdFile && !cmd) {
+        cmd = `bash ${shQuote(cmdFile)}`;
+      }
 
       // effectiveCmd is what actually runs in the local terminal tab — either
       // cmd itself (local job) or a tail script proxying a remote job's
@@ -518,6 +531,12 @@ function activate(context) {
         // Inject orchestrator env vars so status hooks work inside the terminal.
         terminal.sendText(`export HH_ORCHESTRATOR_ID=${JSON.stringify(name || '')}`);
         terminal.sendText(`export HH_BRIDGE_STATUS_URL="http://127.0.0.1:${activePort}/api/status"`);
+        // Pin this terminal (and any subshells it spawns) to the exact port of
+        // the window that created it. When the same multi-root workspace is
+        // open in several windows, .vscode-bridge-port gets overwritten by
+        // whichever window activated last — this env var, inherited down the
+        // process tree, lets bridge scripts skip that shared, racy file.
+        terminal.sendText(`export VSCODE_BRIDGE_PORT=${activePort}`);
         if (effectiveCmd) terminal.sendText(effectiveCmd);
       };
       if ((name || effectiveCmd) && typeof vscode.window.onDidChangeTerminalShellIntegration === 'function') {
@@ -771,6 +790,25 @@ function activate(context) {
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, reindexed: count }));
+
+    } else if (url.pathname === '/list') {
+      // Read path companion to /open-terminal, /close-terminal, /rename-terminal
+      // (all write-only): lets a caller check whether a spawn actually landed
+      // and what state it's tracked in, instead of guessing from silence.
+      const metadata = loadMetadata(context);
+      const liveNames = new Set(vscode.window.terminals.map(t => t.name));
+      const list = Object.entries(metadata).map(([name, meta]) => ({
+        name,
+        cwd: meta.cwd ?? null,
+        label: meta.label ?? name,
+        status: meta.status ?? null,
+        node: meta.node ?? null,
+        jobId: meta.jobId ?? null,
+        pid: meta.pid ?? null,
+        live: terminals.has(name) || liveNames.has(name),
+      }));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, terminals: list }));
 
     } else if (url.pathname === '/ping') {
       const folders = (vscode.workspace.workspaceFolders || []).map(f => f.uri.fsPath);

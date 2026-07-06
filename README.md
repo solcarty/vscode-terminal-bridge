@@ -77,9 +77,10 @@ The extension bundles a small bash client (`bin/vscode-bridge.sh` + `bin/bridgec
 
 ```bash
 # one command per action — easy to cover with a single permission allow-rule
-bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open   <name> <cwd> [cmd] [icon] [color]
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open   <name> <cwd> [cmd] [icon] [color] [--cmd-file=<path>] [--node=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh status <name> <state>   # working|idle|needs-input|pr-open|merged|...
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh close  <name>
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh list
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh sweep
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh ping
 ```
@@ -92,7 +93,7 @@ bridge_open "$NAME" "$CWD" "$CMD"
 bridge_status "$NAME" working
 ```
 
-Both handle port discovery (walking up for `.vscode-bridge-port`) and no-op silently when the bridge isn't reachable. Source: `bin/` in this repo.
+Both handle port discovery (walking up for `.vscode-bridge-port`, preferring `$VSCODE_BRIDGE_PORT` when set — see [Multi-window setup](#multi-window-setup)) and no-op silently when the bridge isn't reachable. `bridge_open` and `bridge_status` return a non-zero exit code and print an error to stderr on real failures (bridge unreachable, malformed args, bridge-reported error) rather than swallowing them. Source: `bin/` in this repo.
 
 ## Workspace requirement
 

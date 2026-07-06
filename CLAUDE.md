@@ -18,9 +18,10 @@ All endpoints are GET with query-string params (not POST/JSON — see `extension
 
 | Endpoint | Purpose |
 |----------|---------|
-| `/open-terminal` | Open a named terminal in a given cwd |
+| `/open-terminal` | Open a named terminal in a given cwd (`cmd=` inline, or `cmdFile=` to run a command from a file) |
 | `/close-terminal` | Close a named terminal (falls back to PID kill if registry desynced) |
 | `/rename-terminal` | Rename / set status icon via `status=` (or `label=`, or `quiet=1`) |
+| `/list` | Query tracked terminals (name, cwd, status, pid, live) |
 | `/sweep` | Dispose terminals whose cwd no longer maps to a live `git worktree` |
 | `/add-folder` / `/remove-folder` | Attach/detach a workspace folder |
 | `/reindex` | Re-link open terminals to persisted metadata |

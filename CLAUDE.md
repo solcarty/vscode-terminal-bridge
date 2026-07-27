@@ -9,8 +9,14 @@ Application-agnostic — any repo or process can call it via HTTP. Not coupled t
 ## How it works
 
 - On activation: starts an HTTP server on `127.0.0.1:31415` (increments port if taken)
-- Writes the active port to `.vscode-bridge-port` in every workspace folder
+- Writes the active port to `.vscode-bridge-port` in every workspace folder, and to `~/.vscode-terminal-bridge/port` as a cwd-independent fallback (v0.16.0+)
 - Scripts discover their window's port: `PORT=$(cat "$PWD/.vscode-bridge-port")`
+
+## `list` is a query — it fails loudly (v0.16.0+)
+
+`open`/`close`/`status`/`rename`/`sweep` no-op silently when the bridge is unreachable, because hooks call them outside VS Code and shouldn't fail under `set -e`. **`list` does not.** It prints `{"ok":false,"reason":"bridge-unreachable"}` and exits non-zero.
+
+The reason: an empty stdout with exit 0 is indistinguishable from "bridge is up, tracking zero terminals". Anything polling `list` to decide whether an agent terminal is still alive reads that silence as fact, so a dead terminal looks exactly like a healthy empty list. If you consume `list`, **check the exit code** — don't treat empty output as "no terminals".
 
 ## Key endpoints
 

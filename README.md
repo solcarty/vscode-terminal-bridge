@@ -93,11 +93,15 @@ bridge_open "$NAME" "$CWD" "$CMD"
 bridge_status "$NAME" working
 ```
 
-Both handle port discovery (walking up for `.vscode-bridge-port`, preferring `$VSCODE_BRIDGE_PORT` when set — see [Multi-window setup](#multi-window-setup)) and no-op silently when the bridge isn't reachable. `bridge_open` and `bridge_status` return a non-zero exit code and print an error to stderr on real failures (bridge unreachable, malformed args, bridge-reported error) rather than swallowing them. Source: `bin/` in this repo.
+Both handle port discovery (walking up for `.vscode-bridge-port`, preferring `$VSCODE_BRIDGE_PORT` when set — see [Multi-window setup](#multi-window-setup)), falling back to `~/.vscode-terminal-bridge/port` when the caller's cwd sits outside every workspace folder. `bridge_open` and `bridge_status` return a non-zero exit code and print an error to stderr on real failures (bridge unreachable, malformed args, bridge-reported error) rather than swallowing them. Source: `bin/` in this repo.
+
+**Mutating vs. query commands (v0.16.0+).** `open`/`close`/`status`/`rename`/`sweep` no-op silently when the bridge isn't reachable — hooks call them outside VS Code and shouldn't fail under `set -e`. **`list` is different:** it prints `{"ok":false,"reason":"bridge-unreachable"}` and exits non-zero, because an empty result with exit 0 is indistinguishable from "bridge is up, tracking zero terminals". Anything polling `list` to decide whether a terminal is still alive would read that silence as fact and conclude a dead tab was simply an empty list. **If you consume `list`, check the exit code** rather than treating empty output as "no terminals".
 
 ## Workspace requirement
 
-The `.vscode-bridge-port` file is written to each **workspace folder** — a path that VS Code has open as a root in the Explorer. If you open a loose file or a folder that isn't part of a workspace, the port file won't be written and port discovery will fall back to `31415`.
+The `.vscode-bridge-port` file is written to each **workspace folder** — a path that VS Code has open as a root in the Explorer. If you open a loose file or a folder that isn't part of a workspace, no per-folder port file is written there.
+
+Since v0.16.0 the extension also writes the active port to `~/.vscode-terminal-bridge/port`, which the shell helpers consult when walking up from `$PWD` finds nothing. This matters for **agent-spawned shells**: they inherit neither `$TERM_PROGRAM` nor `$VSCODE_BRIDGE_PORT`, so the walk-up was previously their only discovery path — and a shell that had `cd`'d to `/tmp` or a scratch directory would conclude "no bridge" while the server was running perfectly well. A caller's working directory is not evidence about whether a local HTTP server exists. Port discovery still falls back to `31415` if neither file is present.
 
 For the port file to work correctly, your repo root must be open as a workspace folder (the normal case when you open a folder with `code .` or `code-insiders .`). When you add worktrees with `/add-folder`, the extension writes the port file there too, so hooks and scripts running inside a worktree terminal always find the right port.
 

@@ -70,6 +70,20 @@ _bridge_port() {
       *)   dir="" ;;
     esac
   done
+  # User-level fallback written by the extension on every activation (v0.16.0+),
+  # for callers whose $PWD is outside any workspace folder. Consulted only after
+  # the walk-up fails, so a window-local port file still wins where one exists —
+  # this file carries the same multi-window ambiguity as the shared workspace
+  # one, and is a better guess than the hardcoded default below, not a
+  # replacement for VSCODE_BRIDGE_PORT.
+  if [ -f "$HOME/.vscode-terminal-bridge/port" ]; then
+    local fallback_port
+    IFS= read -r fallback_port < "$HOME/.vscode-terminal-bridge/port"
+    if [ -n "$fallback_port" ]; then
+      echo "$fallback_port"
+      return
+    fi
+  fi
   echo 31415
 }
 
@@ -91,6 +105,13 @@ _bridge_active() {
       *)   dir="" ;;
     esac
   done
+  # Last resort: the user-level port file the extension writes on every
+  # activation (v0.16.0+). The walk-up above only succeeds when $PWD happens to
+  # sit under a workspace folder — an agent shell that cd'd to /tmp, a scratch
+  # dir, or anywhere else outside the tree would otherwise conclude "no bridge"
+  # while the server is running perfectly well. cwd is not evidence about
+  # whether a local HTTP server exists.
+  [ -f "$HOME/.vscode-terminal-bridge/port" ] && return 0
   return 1
 }
 
@@ -179,11 +200,27 @@ bridge_open() {
 # bridge_list — query all bridge-tracked terminals as JSON:
 # {ok, terminals:[{name, cwd, label, status, node, jobId, pid, live}]}.
 # Bridge v0.15.0+; older bridges 404 and this prints nothing / returns 1.
+# bridge_list — unlike the mutating commands, this is a *query*, so it must not
+# no-op silently. An empty stdout with exit 0 is indistinguishable from "the
+# bridge is up and tracking zero terminals", which makes a dead or unregistered
+# terminal look identical to a healthy empty list. Callers that poll this to
+# decide whether an agent terminal is still alive read that silence as fact.
+# So: emit a structured error and exit non-zero when we can't reach the bridge.
+# The mutating commands (open/close/status/rename/sweep) keep the silent no-op —
+# hooks call those outside VS Code and shouldn't fail under `set -e`.
 bridge_list() {
-  _bridge_active || return 0
+  if ! _bridge_active; then
+    echo '{"ok":false,"reason":"bridge-unreachable"}'
+    return 1
+  fi
   local port
   port=$(_bridge_port)
-  curl -fsS -m 2 "http://127.0.0.1:${port}/list" 2>/dev/null
+  local out
+  if ! out=$(curl -fsS -m 2 "http://127.0.0.1:${port}/list" 2>/dev/null); then
+    echo '{"ok":false,"reason":"bridge-unreachable"}'
+    return 1
+  fi
+  echo "$out"
 }
 
 # bridge_close <name>

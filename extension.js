@@ -18,6 +18,11 @@ let server;
 
 const CLI_INSTALL_DIR = path.join(require('os').homedir(), '.vscode-terminal-bridge', 'bin');
 
+// User-level port file — the cwd-independent discovery path for callers that
+// can't find a workspace `.vscode-bridge-port` by walking up from $PWD.
+const PORT_FALLBACK_DIR = path.join(require('os').homedir(), '.vscode-terminal-bridge');
+const PORT_FALLBACK_PATH = path.join(PORT_FALLBACK_DIR, 'port');
+
 function writeBundledCli(context) {
   try {
     fs.mkdirSync(CLI_INSTALL_DIR, { recursive: true });
@@ -837,6 +842,16 @@ function activate(context) {
         fs.writeFileSync(path.join(folder.uri.fsPath, '.vscode-bridge-port'), String(port), 'utf8');
       } catch { /* ignore read-only folders */ }
     }
+    // User-level fallback, so callers whose cwd sits outside every workspace
+    // folder (agent shells that cd'd to /tmp or a scratch dir, hooks with a
+    // stripped environment) can still discover the port. Without this, the
+    // shell helper's walk-up from $PWD is the only discovery path and it
+    // concludes "no bridge" purely because of where the caller happens to
+    // stand — see bin/vscode-bridge.sh's _bridge_active.
+    try {
+      fs.mkdirSync(PORT_FALLBACK_DIR, { recursive: true });
+      fs.writeFileSync(PORT_FALLBACK_PATH, String(port), 'utf8');
+    } catch { /* non-fatal — workspace port files remain the primary path */ }
   }
 
   function removePortFiles() {
@@ -847,6 +862,9 @@ function activate(context) {
         if (fs.existsSync(p)) fs.unlinkSync(p);
       } catch { /* ignore */ }
     }
+    try {
+      if (fs.existsSync(PORT_FALLBACK_PATH)) fs.unlinkSync(PORT_FALLBACK_PATH);
+    } catch { /* ignore */ }
   }
 
   // Re-write port files when the workspace changes (e.g. /add-folder adds a worktree folder)

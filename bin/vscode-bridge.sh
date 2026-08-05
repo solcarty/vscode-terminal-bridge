@@ -223,6 +223,91 @@ bridge_list() {
   echo "$out"
 }
 
+# bridge_send <name> [text] [--text-file=<path>] [--no-submit] [--force] [--mode=auto|paste|literal|join]
+#
+# Deliver text into an ALREADY-RUNNING tracked terminal (bridge v0.17.0+) —
+# the nudge/unblock path that doesn't restart the session the way a
+# close + re-open does.
+#
+# Loud, not silent: like bridge_list, this is a delivery with a caller-visible
+# outcome, so an unreachable bridge, an unknown name, or a dead terminal all
+# exit non-zero with a reason on stdout. Orchestrators branch on that.
+#
+# --text-file=<path> injects the file's CONTENTS. This is NOT bridge_open's
+# --cmd-file (which runs `bash <file>`) — use it for multi-line, quote-heavy,
+# or long prose, which is also the only reliable path for payloads big enough
+# to strain an inline GET.
+#
+# Newlines: multi-line payloads go over as one bracketed paste and are
+# submitted once, so a three-paragraph message arrives as a single prompt
+# rather than three truncated ones. --mode=join collapses newlines to spaces
+# instead, for a target that doesn't honour bracketed paste.
+#
+# Exit 0 means "written to the terminal", NOT "read and acted on" — the text
+# queues in the buffer if the target is mid-execution. To confirm receipt,
+# watch for a status transition via bridge_list.
+bridge_send() {
+  if [ "$#" -lt 1 ]; then
+    echo '{"ok":false,"reason":"usage: bridgectl.sh send <name> <text>|--text-file=<path> [--no-submit] [--force] [--mode=auto|paste|literal|join]"}' >&2
+    return 2
+  fi
+  local name="$1"; shift
+  local text="" textFile="" submit=1 force=0 mode=""
+  for arg in "$@"; do
+    case "$arg" in
+      --text-file=*) textFile="${arg#--text-file=}" ;;
+      --mode=*)      mode="${arg#--mode=}" ;;
+      --no-submit)   submit=0 ;;
+      --force)       force=1 ;;
+      *)             text="$arg" ;;
+    esac
+  done
+
+  if [ -z "$text" ] && [ -z "$textFile" ]; then
+    echo '{"ok":false,"reason":"no-text"}'
+    return 2
+  fi
+  # The extension reads --text-file itself, so the path must be absolute and
+  # readable from the extension host, not just from this shell's cwd.
+  if [ -n "$textFile" ]; then
+    case "$textFile" in
+      /*) : ;;
+      *)  textFile="$PWD/$textFile" ;;
+    esac
+    if [ ! -r "$textFile" ]; then
+      echo '{"ok":false,"reason":"text-file-unreadable"}'
+      return 2
+    fi
+  fi
+
+  if ! _bridge_active; then
+    echo '{"ok":false,"reason":"bridge-unreachable"}'
+    return 1
+  fi
+  local port
+  port=$(_bridge_port)
+  set -- --data-urlencode "name=$name"
+  [ -n "$textFile" ] && set -- "$@" --data-urlencode "textFile=$textFile"
+  [ -z "$textFile" ] && set -- "$@" --data-urlencode "text=$text"
+  [ -n "$mode" ]     && set -- "$@" --data-urlencode "mode=$mode"
+  [ "$submit" = "0" ] && set -- "$@" --data-urlencode "submit=0"
+  [ "$force" = "1" ]  && set -- "$@" --data-urlencode "force=1"
+
+  local out
+  # -sS (not -fsS) so the bridge's own 404/409 JSON body reaches the caller
+  # instead of curl swallowing it — the reason a send was refused is the whole
+  # point of the response.
+  if ! out=$(curl -sS -m 5 --get "$@" "http://127.0.0.1:${port}/send-text" 2>/dev/null); then
+    echo '{"ok":false,"reason":"bridge-unreachable"}'
+    return 1
+  fi
+  echo "$out"
+  case "$out" in
+    *'"ok":true'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # bridge_close <name>
 bridge_close() {
   _bridge_active || return 0
@@ -284,4 +369,138 @@ bridge_status() {
     --data-urlencode "name=$name" \
     --data-urlencode "status=$state" \
     "http://127.0.0.1:${port}/rename-terminal" >/dev/null 2>&1 || true
+}
+
+# bridge_hook_status <status> [--name=<name>]
+# bridge_hook_status <name> <status>
+#
+# Backend-agnostic hook entry point (v0.17.0+). Every agent CLI hands its hooks
+# context differently — Claude Code via env vars and an inlined settings.json
+# command, Cline via a JSON payload on stdin — so a per-backend hook script
+# ends up re-deriving port discovery and name resolution five times over. This
+# absorbs both conventions so each hook script can be a single line.
+#
+# Name resolution, in order:
+#   1. --name=<name>, or the two-positional-arg form
+#   2. $CLAUDE_TAB_NAME — exported into every bridge-opened terminal, so it's
+#      set regardless of which agent CLI is running inside it
+#   3. "rootPath" from a JSON payload on stdin (Cline's workspaceInfo)
+#   4. basename of $PWD
+#
+# Always drains stdin when it isn't a tty, so a hook runner writing a payload
+# into the pipe never blocks on a reader that isn't there.
+bridge_hook_status() {
+  local name="" state="" payload=""
+  local positional=()
+  for arg in "$@"; do
+    case "$arg" in
+      --name=*) name="${arg#--name=}" ;;
+      *)        positional+=("$arg") ;;
+    esac
+  done
+  if [ "${#positional[@]}" -ge 2 ]; then
+    name="${name:-${positional[0]}}"; state="${positional[1]}"
+  else
+    state="${positional[0]:-}"
+  fi
+  if [ -z "$state" ]; then
+    echo "usage: bridgectl.sh hook-status <status> [--name=<name>]" >&2
+    return 2
+  fi
+
+  if [ ! -t 0 ]; then
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+      payload="$payload$line"
+    done
+  fi
+
+  if [ -z "$name" ]; then name="${CLAUDE_TAB_NAME:-}"; fi
+  if [ -z "$name" ] && [ -n "$payload" ]; then
+    local root
+    root=$(printf '%s' "$payload" \
+      | sed -n 's/.*"rootPath"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    [ -n "$root" ] && name="${root##*/}"
+  fi
+  if [ -z "$name" ]; then name="${PWD##*/}"; fi
+
+  bridge_status "$name" "$state"
+}
+
+# bridge_scaffold --backend cline [--dir=<repo>] [--force]
+#
+# Write the per-backend hook scripts that drive a bridge terminal's status icon
+# (v0.17.0+). Each generated script is a one-line call into bridge_hook_status,
+# so the port-discovery walk-up and name resolution live here, in the
+# version-matched copy, instead of being frozen into five scripts per repo at
+# whatever the conventions were on the day they were written.
+#
+# Cline's hooks are matched by filename against its event names (no
+# registration step), which is what makes this scaffoldable at all. Claude Code
+# hooks live in settings.json under a `hooks` key, so --backend claude prints
+# the snippet to stdout for you to merge rather than editing that file.
+bridge_scaffold() {
+  local backend="" dir="$PWD" force=0
+  for arg in "$@"; do
+    case "$arg" in
+      --backend=*) backend="${arg#--backend=}" ;;
+      --backend)   : ;;   # tolerate `--backend cline` (space form), handled below
+      --dir=*)     dir="${arg#--dir=}" ;;
+      --force)     force=1 ;;
+      cline|claude) [ -z "$backend" ] && backend="$arg" ;;
+      *)           : ;;
+    esac
+  done
+
+  local ctl="$HOME/.vscode-terminal-bridge/bin/bridgectl.sh"
+
+  case "$backend" in
+    cline)
+      local hooks_dir="$dir/.cline/hooks"
+      mkdir -p "$hooks_dir" || return 1
+      # Cline's headless --auto-approve mode emits no permission-prompt or
+      # subagent events, so a 3-state model is the whole of what it can report.
+      local specs="TaskStart:working TaskResume:working PreToolUse:working TaskComplete:idle TaskError:error TaskCancel:idle"
+      local spec event state target written=0 skipped=0
+      for spec in $specs; do
+        event="${spec%%:*}"; state="${spec##*:}"
+        target="$hooks_dir/$event.sh"
+        if [ -e "$target" ] && [ "$force" != "1" ]; then
+          skipped=$((skipped + 1))
+          continue
+        fi
+        cat > "$target" <<EOF
+#!/usr/bin/env bash
+# Cline $event hook — generated by \`bridgectl scaffold --backend cline\`.
+# Cline passes its JSON payload on stdin; hook-status drains it and resolves
+# the terminal name from \$CLAUDE_TAB_NAME (exported by the bridge on open),
+# falling back to the payload's rootPath. No-ops outside VS Code.
+exec bash "$ctl" hook-status $state
+EOF
+        chmod +x "$target"
+        written=$((written + 1))
+      done
+      echo "scaffold: wrote $written hook(s) to $hooks_dir (skipped $skipped existing; --force to overwrite)"
+      ;;
+    claude)
+      cat <<EOF
+# Claude Code hooks live in settings.json, so merge this into
+# $dir/.claude/settings.json (or ~/.claude/settings.json) by hand:
+
+{
+  "hooks": {
+    "PreToolUse":        [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status working" }] }],
+    "Notification":      [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status needs-input" }] }],
+    "Stop":              [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status idle" }] }],
+    "SubagentStart":     [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status subagent" }] }],
+    "SubagentStop":      [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status working" }] }]
+  }
+}
+EOF
+      ;;
+    *)
+      echo "usage: bridgectl.sh scaffold --backend {cline|claude} [--dir=<repo>] [--force]" >&2
+      return 2
+      ;;
+  esac
 }

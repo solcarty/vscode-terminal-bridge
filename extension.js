@@ -377,6 +377,89 @@ async function closeTerminalByName(context, name) {
 }
 
 // ---------------------------------------------------------------------------
+// Send: inject text into a running tracked terminal.
+//
+// The counterpart to /open-terminal's startup `cmd`, for a session that's
+// already running: deliver a message to the agent at its prompt without a
+// close+reopen (which restarts the session and loses its context).
+//
+// Two things make this more than a bare sendText() call:
+//
+//   1. Newlines. sendText writes text as though typed, so in a TUI every
+//      embedded \n acts as Enter — a three-paragraph message would submit
+//      paragraph 1 as a complete turn and the rest as separate ones. We wrap
+//      multi-line payloads in bracketed paste (ESC[200~ … ESC[201~) so the
+//      receiving app takes them as one paste, then submit once. This is the
+//      same mechanism that makes pasting multi-line text by hand work today.
+//      Single-line payloads skip the wrapper entirely — nothing to protect
+//      against, and no escape sequences to leak if the target doesn't honour
+//      bracketed paste.
+//
+//   2. Prompt state. Text injected while the target is showing a permission
+//      dialog or a numbered question is consumed as an answer to that menu,
+//      not read as a message. We refuse when the last known status says the
+//      terminal is waiting on input, unless force=1.
+// ---------------------------------------------------------------------------
+
+// Statuses where injected text would be eaten by an interactive prompt rather
+// than read as a message. Refused without force=1.
+const PROMPT_STATES = new Set(['needs-input', 'permission']);
+
+const PASTE_START = '\x1b[200~';
+const PASTE_END   = '\x1b[201~';
+
+async function sendTextToTerminal(context, name, text, opts = {}) {
+  const { submit = true, force = false, mode = 'auto' } = opts;
+
+  let terminal = terminals.get(name);
+  if (!terminal || !vscode.window.terminals.includes(terminal)) {
+    await reindexTerminals(context);
+    terminal = terminals.get(name) ?? vscode.window.terminals.find(t => t.name === name);
+  }
+  // A terminal object that VS Code no longer lists has been disposed — the
+  // registry is stale, and sending into it would silently go nowhere.
+  if (!terminal || !vscode.window.terminals.includes(terminal)) {
+    return { ok: false, code: 404, error: 'Terminal not found or not live', name };
+  }
+
+  const status = loadMetadata(context)[name]?.status ?? null;
+  if (!force && PROMPT_STATES.has(status)) {
+    return {
+      ok: false, code: 409, name, status,
+      error: `Terminal is at an interactive prompt (status=${status}); text would be read as an answer to it. Re-send with force=1 if that's intended.`,
+    };
+  }
+
+  // Trailing newlines in the payload (every text file has one) would submit
+  // before we do, so strip them and let `submit` be the only thing that sends.
+  const payload = text.replace(/\n+$/, '');
+  const multiline = payload.includes('\n');
+  const usePaste = mode === 'paste' || (mode === 'auto' && multiline);
+
+  let delivered;
+  if (mode === 'join') {
+    delivered = payload.replace(/\s*\n\s*/g, ' ');
+    terminal.sendText(delivered, false);
+  } else if (usePaste) {
+    delivered = payload;
+    terminal.sendText(PASTE_START + payload + PASTE_END, false);
+  } else {
+    delivered = payload;
+    terminal.sendText(payload, false);
+  }
+
+  // Submit as a separate write so the newline lands outside the paste bracket —
+  // inside it, it's just pasted content and never submits.
+  if (submit) terminal.sendText('', true);
+
+  return {
+    ok: true, name, status, submitted: submit,
+    mode: mode === 'join' ? 'join' : (usePaste ? 'paste' : 'literal'),
+    bytes: Buffer.byteLength(delivered, 'utf8'),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
 
@@ -726,6 +809,61 @@ function activate(context) {
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, name, method }));
+
+    } else if (url.pathname === '/send-text') {
+      // Inject text into an already-running tracked terminal — see
+      // sendTextToTerminal() above for the newline / prompt-state handling.
+      //
+      //   text=      inline payload (fine for short nudges)
+      //   textFile=  path to a file whose CONTENTS are injected. Note this is
+      //              NOT /open-terminal's cmdFile=, which turns into
+      //              `bash <file>` — running a script is meaningless against a
+      //              live TUI. Use this for anything long, multi-line, or
+      //              quote-heavy, and for payloads that would blow the URL
+      //              length limit inline.
+      //   submit=0   stage the text without sending a newline
+      //   force=1    send even when the terminal is at an interactive prompt
+      //   mode=      auto (default) | paste | literal | join
+      const name     = url.searchParams.get('name');
+      const textFile = url.searchParams.get('textFile') || undefined;
+      let text       = url.searchParams.get('text');
+
+      if (!name) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'name param required' }));
+        return;
+      }
+      if (textFile) {
+        try {
+          text = fs.readFileSync(textFile, 'utf8');
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `Could not read textFile: ${err.message}`, textFile }));
+          return;
+        }
+      }
+      if (text === null || text === undefined || text === '') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Provide text= or textFile=' }));
+        return;
+      }
+
+      const modeParam = url.searchParams.get('mode') || 'auto';
+      if (!['auto', 'paste', 'literal', 'join'].includes(modeParam)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: `Unknown mode "${modeParam}" — use auto|paste|literal|join` }));
+        return;
+      }
+
+      const result = await sendTextToTerminal(context, name, text, {
+        submit: url.searchParams.get('submit') !== '0',
+        force:  url.searchParams.get('force') === '1',
+        mode:   modeParam,
+      });
+
+      const { code, ...body } = result;
+      res.writeHead(result.ok ? 200 : code, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
 
     } else if (url.pathname === '/sweep') {
       // Cross-reference persisted terminals against ground-truth git worktrees

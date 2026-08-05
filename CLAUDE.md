@@ -18,6 +18,16 @@ Application-agnostic — any repo or process can call it via HTTP. Not coupled t
 
 The reason: an empty stdout with exit 0 is indistinguishable from "bridge is up, tracking zero terminals". Anything polling `list` to decide whether an agent terminal is still alive reads that silence as fact, so a dead terminal looks exactly like a healthy empty list. If you consume `list`, **check the exit code** — don't treat empty output as "no terminals".
 
+## `send` talks to a session that's already running (v0.17.0+)
+
+`open`'s `cmd` only fires at spawn, so the only way to get a message into a live agent session used to be close + re-open — which restarts it and throws away its context. `send` delivers into the running session instead. Three things about it are load-bearing:
+
+- **`--text-file` injects file *contents*.** It is not `open --cmd-file`, which turns into `bash <file>` — running a script is meaningless against a live TUI.
+- **Multi-line payloads go over as one bracketed paste**, then a single submit. Otherwise every embedded `\n` acts as Enter and a three-paragraph message submits paragraph 1 as a truncated turn. `--mode=join` collapses newlines to one line if a target doesn't honour bracketed paste.
+- **It refuses when the tracked status is `needs-input` or `permission`** (409), because text injected at a menu is read as an answer to that menu. `--force` overrides.
+
+Exit 0 means *written to the terminal*, not *read and acted on* — `sendText` queues when the target is mid-execution. Confirm receipt by watching for a status transition via `list`, not by trusting the exit code. Reading a terminal's output back is a separate, unsolved problem (issue #32).
+
 ## Key endpoints
 
 All endpoints are GET with query-string params (not POST/JSON — see `extension.js`).
@@ -28,6 +38,7 @@ All endpoints are GET with query-string params (not POST/JSON — see `extension
 | `/close-terminal` | Close a named terminal (falls back to PID kill if registry desynced) |
 | `/rename-terminal` | Rename / set status icon via `status=` (or `label=`, or `quiet=1`) |
 | `/list` | Query tracked terminals (name, cwd, status, pid, live) |
+| `/send-text` | Inject text into an already-running tracked terminal (`text=` or `textFile=`) |
 | `/sweep` | Dispose terminals whose cwd no longer maps to a live `git worktree` |
 | `/add-folder` / `/remove-folder` | Attach/detach a workspace folder |
 | `/reindex` | Re-link open terminals to persisted metadata |
@@ -40,7 +51,10 @@ Don't hand-roll curl calls. The extension bundles `bin/vscode-bridge.sh` + `bin/
 ```bash
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open <name> <cwd> [cmd] [icon] [color]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh status <name> <state>
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh send <name> <text>|--text-file=<path>
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh close <name>
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status <status> [--name=<name>]
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend {cline|claude} [--dir=<repo>]
 ```
 
 Source of these scripts is `bin/` in this repo — edit there, not the installed copy under `~/.vscode-terminal-bridge/`.

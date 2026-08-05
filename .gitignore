@@ -1,2 +1,5 @@
 *.vsix
 node_modules/
+# Written by the extension into every workspace folder on activation — a
+# per-window runtime artifact, never a repo file.
+.vscode-bridge-port

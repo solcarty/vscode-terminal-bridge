@@ -80,9 +80,12 @@ The extension bundles a small bash client (`bin/vscode-bridge.sh` + `bin/bridgec
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open   <name> <cwd> [cmd] [icon] [color] [--cmd-file=<path>] [--node=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh status <name> <state>   # working|idle|needs-input|pr-open|merged|...
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh close  <name>
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh send   <name> <text>|--text-file=<path> [--no-submit] [--force] [--mode=...]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh list
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh sweep
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh ping
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status <status> [--name=<name>]
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend {cline|claude} [--dir=<repo>] [--force]
 ```
 
 Or source the functions directly:
@@ -96,6 +99,8 @@ bridge_status "$NAME" working
 Both handle port discovery (walking up for `.vscode-bridge-port`, preferring `$VSCODE_BRIDGE_PORT` when set — see [Multi-window setup](#multi-window-setup)), falling back to `~/.vscode-terminal-bridge/port` when the caller's cwd sits outside every workspace folder. `bridge_open` and `bridge_status` return a non-zero exit code and print an error to stderr on real failures (bridge unreachable, malformed args, bridge-reported error) rather than swallowing them. Source: `bin/` in this repo.
 
 **Mutating vs. query commands (v0.16.0+).** `open`/`close`/`status`/`rename`/`sweep` no-op silently when the bridge isn't reachable — hooks call them outside VS Code and shouldn't fail under `set -e`. **`list` is different:** it prints `{"ok":false,"reason":"bridge-unreachable"}` and exits non-zero, because an empty result with exit 0 is indistinguishable from "bridge is up, tracking zero terminals". Anything polling `list` to decide whether a terminal is still alive would read that silence as fact and conclude a dead tab was simply an empty list. **If you consume `list`, check the exit code** rather than treating empty output as "no terminals".
+
+`send` (v0.17.0+) follows `list`, not the mutating commands: a message you believe was delivered but wasn't is worse than a loud failure, so an unreachable bridge, an unknown name, or a dead terminal all exit non-zero with a JSON reason.
 
 ## Workspace requirement
 
@@ -232,6 +237,58 @@ curl "http://127.0.0.1:${PORT}/list"
 ```
 
 Or via the bundled client: `bash ~/.vscode-terminal-bridge/bin/bridgectl.sh list`.
+
+---
+
+### `GET /send-text`
+
+*v0.17.0+.* Injects text into an **already-running** tracked terminal. `/open-terminal`'s `cmd` only fires at spawn, so before this the only way to get a message into a live agent session was a close + re-open — which restarts it and loses its in-memory context. This delivers to the session that's already there.
+
+| Param | Default | Meaning |
+|-------|---------|---------|
+| `name` | — | Tracked terminal name (required) |
+| `text` | — | Inline payload |
+| `textFile` | — | Absolute path to a file whose **contents** are injected |
+| `submit` | `1` | `0` stages the text without sending a newline |
+| `force` | `0` | `1` sends even when the terminal is at an interactive prompt |
+| `mode` | `auto` | `auto` \| `paste` \| `literal` \| `join` |
+
+```bash
+# Short nudge
+curl -G "http://127.0.0.1:${PORT}/send-text" \
+  --data-urlencode "name=my-task" \
+  --data-urlencode "text=your branch was rebased, re-run /pre-pr"
+
+# Multi-paragraph message — write it to a file first
+curl -G "http://127.0.0.1:${PORT}/send-text" \
+  --data-urlencode "name=my-task" --data-urlencode "textFile=/tmp/msg.txt"
+```
+
+```json
+{ "ok": true, "name": "my-task", "status": "working", "submitted": true, "mode": "paste", "bytes": 412 }
+```
+
+**`textFile` is not `/open-terminal`'s `cmdFile`.** `cmdFile` turns into `bash <file>` — it *runs* the file, which is meaningful against a fresh shell prompt and meaningless against a live TUI. `textFile` reads the file and injects its contents as typed text. Use it for anything multi-line, quote-heavy, or long enough to strain an inline GET URL. Trailing newlines are stripped so the payload doesn't submit itself before `submit` does.
+
+**Newlines and `mode`.** VS Code's `sendText` writes text as though typed, so in a TUI every embedded `\n` acts as Enter — a three-paragraph message would submit paragraph 1 as a complete turn and the rest as separate, contextless ones. So multi-line payloads are wrapped in bracketed paste (`ESC[200~ … ESC[201~`) and submitted once, the same mechanism that makes pasting multi-line text by hand work. Single-line payloads skip the wrapper entirely, so there are no escape sequences to leak on a target that doesn't honour bracketed paste.
+
+- `auto` (default) — paste-wrap only when the payload has newlines
+- `paste` — always wrap
+- `literal` — never wrap (raw `sendText`)
+- `join` — collapse interior newlines to spaces, delivering one line. The fallback if a particular target turns out not to honour bracketed paste.
+
+**Prompt-state safety.** Text injected while the target sits at a permission dialog or a numbered question is consumed as *an answer to that menu*, not read as a message. `/send-text` returns **409** when the tracked status is `needs-input` or `permission`; pass `force=1` when answering the prompt is what you actually mean. Unknown or non-live terminal → **404**.
+
+**Exit 0 means delivered, not received.** `sendText` queues in the terminal buffer when the target is mid-execution, so a successful response says the text was written — not that the agent read it or acted on it. To confirm receipt, watch for a status transition (e.g. `needs-input` → `working`) via `/list`.
+
+Or via the bundled client:
+
+```bash
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh send my-task "rebase onto main and re-run /pre-pr"
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh send my-task --text-file=/tmp/msg.txt
+```
+
+Note this closes only the orchestrator→agent half of the loop. Reading a terminal's output back is a separate problem with no stable VS Code API — tracked in [#32](https://github.com/solcarty/vscode-terminal-bridge/issues/32).
 
 ---
 
@@ -546,6 +603,18 @@ curl -s "http://127.0.0.1:${PORT}/rename-terminal?name=$N&status=working" \
   > /dev/null 2>&1 || true
 ```
 
+### `hook-status` — one line instead of the template (v0.17.0+)
+
+Every hook script above re-derives the same two things: which port to talk to, and what this terminal is called. `bridgectl hook-status` absorbs both, so a hook becomes one line:
+
+```bash
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status working
+```
+
+It resolves the terminal name from, in order: `--name=<name>` (or a two-arg `<name> <status>` form), `$CLAUDE_TAB_NAME` (exported into every bridge-opened terminal), a `"rootPath"` in a JSON payload on stdin (how Cline passes context — see below), and finally the basename of `$PWD`. It always drains stdin when stdin isn't a tty, so a hook runner writing a payload never blocks on a reader that isn't there. Like `status`, it no-ops silently outside VS Code.
+
+Because it lives in the version-matched copy under `~/.vscode-terminal-bridge/bin/`, the conventions stay current instead of being frozen into each repo's hook scripts at whatever they were on the day those were written. `bridgectl scaffold --backend claude` prints a ready-to-merge `settings.json` snippet using it.
+
 Use `matcher` to scope a hook to a specific tool name (e.g. `"matcher": "Bash"` fires only when Claude calls Bash):
 
 ```json
@@ -594,7 +663,25 @@ Cline hook event names were deliberately chosen to mirror Claude Code's:
 
 **Key difference from Claude Code hooks:** each Cline hook script receives its JSON payload on **stdin** (not argv, not env) — `{ hookName, workspaceInfo: { rootPath }, taskId, ... }`. Claude Code hooks, by contrast, get context via env vars (`$CLAUDE_TAB_NAME`, `$PWD`) and the command template is inlined into `settings.json`.
 
-A minimal `.cline/hooks/TaskStart.sh` that reuses this bridge's port-discovery pattern:
+### Scaffolding the hooks (v0.17.0+)
+
+Because Cline matches hooks by **filename** against its event names, with no registration step, the whole set can be generated:
+
+```bash
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend cline --dir=/path/to/repo
+# scaffold: wrote 6 hook(s) to /path/to/repo/.cline/hooks (skipped 0 existing; --force to overwrite)
+```
+
+That writes `TaskStart`, `TaskResume`, `PreToolUse` → `working`; `TaskComplete`, `TaskCancel` → `idle`; `TaskError` → `error`. Existing files are left alone unless you pass `--force`. Each generated script is a single line:
+
+```bash
+#!/usr/bin/env bash
+exec bash "$HOME/.vscode-terminal-bridge/bin/bridgectl.sh" hook-status working
+```
+
+Since Cline's headless `--auto-approve` mode emits no permission-prompt or subagent-spawn events, that 3-state model (`working` / `idle` / `error`) is the whole of what it can report — there's no Cline equivalent of `needs-input` or `subagent`.
+
+Written by hand, the equivalent `.cline/hooks/TaskStart.sh` is:
 
 ```bash
 #!/usr/bin/env bash
@@ -605,7 +692,7 @@ N="${CLAUDE_TAB_NAME:-$(basename "$PWD")}"
 curl -s "http://127.0.0.1:${PORT}/rename-terminal?name=$N&status=working" >/dev/null 2>&1 || true
 ```
 
-Map the remaining lifecycle events the same way `TaskComplete` → `status=idle`, `TaskError` → `status=error`, `TaskCancel` → `status=idle`. Since Cline's headless `--auto-approve` mode has no permission-prompt or subagent-spawn events, a 3-state model (`working` / `idle` / `error`) covers it — there's no Cline equivalent of `needs-input` or `subagent`.
+which is exactly the duplication `hook-status` exists to remove — five copies of it per repo, per backend, each frozen at whatever the port-discovery rules were the day it was written.
 
 **Provider gotcha:** Cline's `ollama` provider id does not accept a custom base URL (`cline auth ollama -b <url>` errors with "base URL is only supported for OpenAI and OpenAI-compatible providers"). To point Cline at a remote/non-default Ollama host, use the `openai-compatible` provider id instead: `cline auth openai -b http://<host>:11434/v1 -m <model> -k <dummy>`.
 

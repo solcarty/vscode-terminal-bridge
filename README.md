@@ -230,11 +230,41 @@ curl "http://127.0.0.1:${PORT}/list"
 ```json
 {
   "ok": true,
+  "now": "2026-08-05T11:52:07.401Z",
   "terminals": [
-    { "name": "my-task", "cwd": "/path/to/dir", "label": "my-task", "status": "working", "node": null, "jobId": null, "pid": 12345, "live": true }
+    {
+      "name": "my-task", "cwd": "/path/to/dir", "label": "my-task",
+      "status": "working", "node": null, "jobId": null,
+      "pid": 12345, "live": true, "pidAlive": true,
+      "createdAt": "2026-08-05T09:14:02.881Z",
+      "updatedAt": "2026-08-05T11:52:04.019Z",
+      "statusChangedAt": "2026-08-05T09:14:11.226Z",
+      "lastHeartbeatAt": "2026-08-05T11:52:04.019Z"
+    }
   ]
 }
 ```
+
+#### Timestamps and liveness (v0.18.0+)
+
+Status alone answers "what state is this in". The question an orchestrator actually has is *does this need me right now* — and a terminal at `needs-input` for two minutes and one at `needs-input` for two hours are the same row without a clock.
+
+| Field | Moves when |
+|---|---|
+| `createdAt` | Terminal first tracked. Never advances afterwards. |
+| `updatedAt` | Any metadata write — status, rename, pid, color. |
+| `statusChangedAt` | The status **value** changes. A `PreToolUse` hook firing `status=working` every few seconds does *not* reset it, or "how long has this been working" becomes unanswerable. |
+| `lastHeartbeatAt` | **Any** `/rename-terminal` call lands, including the idempotent no-ops. |
+
+`now` is the bridge's clock at response time, so callers compute ages against it rather than their own.
+
+**Why `lastHeartbeatAt` is separate from `statusChangedAt`.** Status is *self-reported*: it says what the agent last announced, not what's true now. A subagent spinning on no-op calls and a subagent making real progress both report `working` indefinitely. `live` doesn't close the gap either — it only asserts the VS Code terminal object exists, which stays true around a crashed or hung process. The heartbeat is the independent signal: it advances on the repeat hook calls that sustained work generates, so `working` with a 40-minute-old heartbeat is a wedged agent, not a busy one.
+
+**The bridge never derives status from staleness.** No auto-flip to `error` after N minutes — a build legitimately runs quiet for 20. Only the caller knows where its threshold sits, so this reports facts and stops there.
+
+**`pidAlive` is narrower than it looks.** The tracked pid is the terminal's *shell*, not the agent inside it, and a crashed `claude` usually drops back to a live shell prompt — so `pidAlive` stays `true`. It catches the tab-is-gone case cheaply; `lastHeartbeatAt` is what distinguishes wedged from working. `null` means no pid was ever recorded.
+
+**Entries predating v0.18.0 report `null`** for all four timestamps rather than a fabricated value. Treat `null` as unknown, not as zero.
 
 Or via the bundled client: `bash ~/.vscode-terminal-bridge/bin/bridgectl.sh list`.
 

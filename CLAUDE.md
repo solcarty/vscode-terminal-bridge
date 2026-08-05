@@ -18,6 +18,16 @@ Application-agnostic — any repo or process can call it via HTTP. Not coupled t
 
 The reason: an empty stdout with exit 0 is indistinguishable from "bridge is up, tracking zero terminals". Anything polling `list` to decide whether an agent terminal is still alive reads that silence as fact, so a dead terminal looks exactly like a healthy empty list. If you consume `list`, **check the exit code** — don't treat empty output as "no terminals".
 
+## `list` reports age and liveness, never a verdict (v0.18.0+)
+
+Each row carries `createdAt`, `updatedAt`, `statusChangedAt`, `lastHeartbeatAt` and `pidAlive`, plus a top-level `now` to compute ages against.
+
+`statusChangedAt` moves only when the status **value** changes — repeat `status=working` calls from hooks don't reset it, so "how long has this been working" stays answerable. `lastHeartbeatAt` moves on *every* `/rename-terminal` call including idempotent no-ops, and that's the point: status is self-reported, so a wedged agent and a busy one both say `working` forever. `working` with a 40-minute-old heartbeat is wedged.
+
+Two things the bridge deliberately does not do: it never derives status from staleness (a build legitimately runs quiet for 20 minutes — pick your own threshold), and it never fabricates a timestamp for an entry that predates v0.18.0. `null` means unknown.
+
+`pidAlive` tracks the terminal's **shell**, not the agent inside it. A crashed `claude` usually leaves a live shell prompt behind, so `pidAlive` stays true — it catches the tab-is-gone case, nothing more.
+
 ## `send` talks to a session that's already running (v0.17.0+)
 
 `open`'s `cmd` only fires at spawn, so the only way to get a message into a live agent session used to be close + re-open — which restarts it and throws away its context. `send` delivers into the running session instead. Three things about it are load-bearing:

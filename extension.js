@@ -86,14 +86,79 @@ function loadMetadata(context) {
   return context.workspaceState.get(METADATA_KEY) || {};
 }
 
+// Every metadata write is stamped here rather than at the call sites, so a new
+// caller can't forget to and quietly produce an entry with no age.
+//
+// The distinction that matters: `updatedAt` moves on any write, but
+// `statusChangedAt` moves only when the status VALUE changes. A PreToolUse
+// hook firing `status=working` every few seconds must not keep resetting it,
+// or "how long has this been working" — the question the field exists to
+// answer — becomes unanswerable.
+//
+// `createdAt` is set only when the entry is genuinely new. An entry persisted
+// before v0.18.0 keeps a null createdAt forever instead of being stamped with
+// the time of its next write, which would be a fabrication: the terminal was
+// created earlier, and "unknown" is the honest answer.
 async function persistMetadata(context, name, update) {
   const meta = loadMetadata(context);
   if (update === null) {
     delete meta[name];
   } else {
-    meta[name] = { ...meta[name], ...update };
+    const prev  = meta[name];
+    const isNew = prev === undefined;
+    const now   = new Date().toISOString();
+    const next  = { ...prev, ...update, updatedAt: now };
+
+    if (isNew) next.createdAt = now;
+
+    if ('status' in update && update.status !== (prev?.status ?? null)) {
+      next.statusChangedAt = now;
+    }
+
+    meta[name] = next;
   }
   await context.workspaceState.update(METADATA_KEY, meta);
+}
+
+// Record that we heard from the agent inside this terminal, independent of
+// whether anything about its state changed.
+//
+// `status` is self-reported: it says what the agent last announced, not what's
+// true now. A subagent spinning on no-op calls and a subagent making progress
+// both report `working` forever, and there's no way to tell them apart from
+// the outside. `live` doesn't help — it only asserts the VS Code terminal
+// object exists, which stays true around a crashed or hung process.
+//
+// So this stamps on EVERY /rename-terminal call, including the idempotent
+// no-ops that the hook plumbing generates during sustained work. Those repeat
+// calls are precisely the liveness signal: a `working` terminal whose last
+// heartbeat is 40 minutes old is wedged, not busy. Only the caller can say
+// where that threshold sits, so the bridge reports the timestamp and never
+// derives status from it — a build legitimately runs quiet for 20 minutes.
+async function touchHeartbeat(context, name) {
+  const meta = loadMetadata(context);
+  if (!meta[name]) return;  // never conjure an entry for an untracked name
+  meta[name] = { ...meta[name], lastHeartbeatAt: new Date().toISOString() };
+  await context.workspaceState.update(METADATA_KEY, meta);
+}
+
+// Is the tracked process still there? `process.kill(pid, 0)` sends no signal —
+// it just tests for existence (and our permission to signal it).
+//
+// Read this for what it is: the pid is the terminal's SHELL, not the agent
+// running inside it. A crashed `claude` usually drops back to a live shell
+// prompt, so pidAlive stays true — which is the whole reason lastHeartbeatAt
+// exists. It's a cheap fact that catches the tab-is-gone case, not a
+// process-supervision answer.
+function isPidAlive(pid) {
+  if (!pid) return null;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM means the process exists but belongs to someone else — still alive.
+    return err.code === 'EPERM';
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +712,13 @@ function activate(context) {
         await persistMetadata(context, name, {
           cwd, label: name, baseLabel: name, color: colorId,
           ...(node ? { node, jobId } : {}),
+          // Reset the lifecycle stamps explicitly: this is a new terminal even
+          // when it reuses the name of one that was never cleanly closed, and
+          // inheriting the old entry's createdAt would date it to a session
+          // that's gone.
+          createdAt: new Date().toISOString(),
+          statusChangedAt: null,
+          lastHeartbeatAt: null,
         });
         // Persist the real shell PID as an OS-level fallback for cleanup —
         // independent of VS Code's own (sometimes-stale) terminal bookkeeping.
@@ -688,6 +760,11 @@ function activate(context) {
         res.end(JSON.stringify({ ok: false, error: 'Terminal not found', name }));
         return;
       }
+
+      // Stamp liveness before any of the paths below can return early — the
+      // idempotent no-op return is the most common one during sustained work,
+      // and skipping it there would leave a busy agent looking silent.
+      await touchHeartbeat(context, name);
 
       // Validation: need at least one of label, quiet, or status
       if (!quiet && status === undefined && !label) {
@@ -940,6 +1017,15 @@ function activate(context) {
       // and what state it's tracked in, instead of guessing from silence.
       const metadata = loadMetadata(context);
       const liveNames = new Set(vscode.window.terminals.map(t => t.name));
+      //
+      // Timestamps (v0.18.0+) answer the question status alone can't: not
+      // "what state is this in" but "does it need me right now". A terminal at
+      // needs-input for 2 minutes and one at needs-input for 2 hours are the
+      // same row without them. Entries persisted before v0.18.0 report null
+      // rather than a fabricated time — treat null as unknown.
+      //
+      // `now` is returned alongside so a caller computes ages against the
+      // bridge's clock rather than its own.
       const list = Object.entries(metadata).map(([name, meta]) => ({
         name,
         cwd: meta.cwd ?? null,
@@ -949,9 +1035,14 @@ function activate(context) {
         jobId: meta.jobId ?? null,
         pid: meta.pid ?? null,
         live: terminals.has(name) || liveNames.has(name),
+        pidAlive: isPidAlive(meta.pid),
+        createdAt: meta.createdAt ?? null,
+        updatedAt: meta.updatedAt ?? null,
+        statusChangedAt: meta.statusChangedAt ?? null,
+        lastHeartbeatAt: meta.lastHeartbeatAt ?? null,
       }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, terminals: list }));
+      res.end(JSON.stringify({ ok: true, now: new Date().toISOString(), terminals: list }));
 
     } else if (url.pathname === '/ping') {
       const folders = (vscode.workspace.workspaceFolders || []).map(f => f.uri.fsPath);

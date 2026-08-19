@@ -19,9 +19,24 @@ const state = new Map();
 const disposed = [];
 let terminalsInWindow = [];
 
+const renames = [];
+let activeTerminal = null;
+
 const vscodeMock = {
+  commands: {
+    // VS Code renames whichever terminal is active; applyPresentation() shows
+    // the target first, so record against activeTerminal to mirror that.
+    executeCommand: (cmd, arg) => {
+      if (cmd === 'workbench.action.terminal.renameWithArg') {
+        renames.push({ terminal: activeTerminal?.name ?? null, name: arg && arg.name });
+        if (activeTerminal) activeTerminal.displayName = arg && arg.name;
+      }
+      return Promise.resolve();
+    },
+  },
   window: {
     get terminals() { return terminalsInWindow; },
+    get activeTerminal() { return activeTerminal; },
     createTerminal: () => makeTerminal('x'),
     onDidCloseTerminal: () => ({ dispose() {} }),
     onDidChangeWindowState: () => ({ dispose() {} }),
@@ -43,7 +58,7 @@ function makeTerminal(name, pid) {
     name,
     processId: Promise.resolve(pid ?? 4242),
     sendText: (text, submit) => t.sent.push({ text, submit }),
-    show: () => {},
+    show: () => { activeTerminal = t; },
     dispose: () => { disposed.push(name); terminalsInWindow = terminalsInWindow.filter(x => x !== t); },
     sent: [],
   };
@@ -67,7 +82,7 @@ const context = {
   },
 };
 
-module.exports = { ext, context, state, vscodeMock, makeTerminal,
+module.exports = { ext, context, state, vscodeMock, makeTerminal, renames,
   addTerminal: t => { terminalsInWindow.push(t); return t; },
   get disposed() { return disposed; },
   portFile: path.join(process.env.HOME, '.vscode-terminal-bridge', 'port'),

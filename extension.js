@@ -339,6 +339,122 @@ async function parseWorktrees() {
 }
 
 // ---------------------------------------------------------------------------
+// Background work is a SECOND dimension, not a status value (issue #40).
+//
+// `status` is a last-writer-wins scalar, but the things written into it aren't
+// mutually exclusive. At least two independent dimensions were sharing it:
+//
+//   turn state           working / idle / needs-input   (PreToolUse, Notification, Stop)
+//   outstanding bg work  bg-task / subagent             (TaskCreated, SubagentStart)
+//
+// An agent that starts a background task and then ends its turn writes
+// `bg-task`, and `Notification`/`Stop` immediately overwrites it. Both writes
+// are correct about their own dimension; collapsing them means the later one
+// silently erases the earlier, and the tab reads `needs-input` — the one
+// status that asserts a human is required — for exactly the interval the work
+// is actually in flight.
+//
+// So the count lives in its own field. No precedence rules to get wrong, and
+// the both-at-once case (genuinely blocked on a human WHILE a task runs) is
+// representable, which no single scalar can express.
+async function setBgTask(context, name, op) {
+  const meta = loadMetadata(context);
+  if (!meta[name]) return null;  // never conjure an entry for an untracked name
+
+  const prev = Math.max(0, Number(meta[name].pendingTasks) || 0);
+  let next;
+  if (op === 'start')      next = prev + 1;
+  else if (op === 'end')   next = Math.max(0, prev - 1);
+  else if (op === 'clear') next = 0;
+  else return null;
+
+  const now = new Date().toISOString();
+  const entry = { ...meta[name], pendingTasks: next };
+
+  // bgTaskStartedAt marks when this terminal went from "nothing outstanding"
+  // to "something outstanding" — the age a caller wants is the age of the
+  // work, not of the most recent increment. Cleared when the count returns
+  // to zero so a stale start time can't outlive the work it described.
+  if (next > 0 && prev === 0) entry.bgTaskStartedAt = now;
+  if (next === 0)             entry.bgTaskStartedAt = null;
+  if (next !== prev)          entry.bgTaskChangedAt = now;
+
+  meta[name] = entry;
+  await context.workspaceState.update(METADATA_KEY, meta);
+  return { pendingTasks: next, previous: prev, bgTaskStartedAt: entry.bgTaskStartedAt ?? null };
+}
+
+// Which STATUS_MAP key the tab should *render*. The data stays orthogonal —
+// this is a display decision only, and /list reports both dimensions raw.
+//
+// A human being required outranks a machine being busy, so prompt and error
+// states keep the tab. Below that, outstanding background work outranks the
+// turn state, because "idle" on a terminal with a job in flight is the reading
+// that sent an orchestrator to a tab that needed nothing.
+const DISPLAY_PRIORITY_STATES = new Set(['needs-input', 'permission', 'error']);
+
+function displayStatusKey(meta = {}) {
+  const status = meta.status ?? null;
+  if (status && DISPLAY_PRIORITY_STATES.has(status)) return status;
+  if ((Number(meta.pendingTasks) || 0) > 0) return 'bg-task';
+  return status;
+}
+
+// Apply the tab's presentation (label prefix + color) from whatever the
+// registry currently says. Shared by /rename-terminal and /bg-task so both
+// dimensions render through one code path instead of two that drift.
+async function applyPresentation(context, name, terminal, opts = {}) {
+  const { baseLabelOverride, explicitColor, iconId, explicitLabel } = opts;
+  const meta     = loadMetadata(context)[name] ?? {};
+  const key      = displayStatusKey(meta);
+  const cfg      = (key && key !== 'none') ? (STATUS_MAP[key] ?? null) : null;
+
+  const baseLabel = explicitLabel
+    ?? baseLabelOverride
+    ?? meta.baseLabel
+    ?? meta.label
+    ?? name;
+
+  const effectiveLabel = explicitLabel
+    ? explicitLabel                                   // legacy label= mode: caller owns the whole string
+    : (cfg ? `$(${cfg.codicon}) ${baseLabel}` : baseLabel);
+
+  const resolvedColor = explicitColor ?? cfg?.color ?? undefined;
+
+  const labelChanged = effectiveLabel !== meta.effectiveLabel;
+  const colorChanged = resolvedColor  !== meta.color;
+
+  if (!labelChanged && !colorChanged && !iconId) {
+    return { effectiveLabel, baseLabel, color: resolvedColor, displayStatus: key, noOp: true };
+  }
+
+  if (labelChanged) {
+    // Only switch the active terminal if needed, and use show(true)
+    // (preserveFocus) so keyboard focus is NEVER stolen.
+    const prev = vscode.window.activeTerminal;
+    const needsSwitch = prev !== terminal;
+    if (needsSwitch) terminal.show(true);
+    await vscode.commands.executeCommand(
+      'workbench.action.terminal.renameWithArg',
+      { name: effectiveLabel }
+    );
+    if (needsSwitch && prev) prev.show(true);
+  }
+
+  if (iconId)        terminal.iconPath = new vscode.ThemeIcon(iconId);
+  if (resolvedColor) terminal.color    = new vscode.ThemeColor(resolvedColor);
+
+  await persistMetadata(context, name, {
+    label: effectiveLabel,
+    baseLabel,
+    effectiveLabel,
+    color: resolvedColor,
+  });
+
+  return { effectiveLabel, baseLabel, color: resolvedColor, displayStatus: key, noOp: false };
+}
+
+// ---------------------------------------------------------------------------
 // Re-index: match open VS Code terminals back into the `terminals` Map.
 // ---------------------------------------------------------------------------
 
@@ -852,23 +968,61 @@ function activate(context) {
         return;
       }
 
-      // Resolve status config (null for status='none' or unknown status values)
-      const statusCfg = (status && status !== 'none') ? (STATUS_MAP[status] ?? null) : null;
-      // Resolved color: explicit param wins over status default
-      const resolvedColor = colorId ?? statusCfg?.color ?? undefined;
+      // ── Route the background-work dimension out of `status` (issue #40) ────
+      // Existing hook wiring sends these as status values, and that wiring is
+      // in users' settings.json — so the routing happens here rather than
+      // demanding everyone rewrite their hooks. `bg-task` always counts up.
+      // `task-done` only counts down when something is actually outstanding:
+      // it doubles as a manual completion badge on a tab with no pending work,
+      // and silently swallowing that would be a regression.
+      const bgMetaBefore  = loadMetadata(context)[name] ?? {};
+      const pendingBefore = Math.max(0, Number(bgMetaBefore.pendingTasks) || 0);
+      const bgOp =
+        status === 'bg-task'                          ? 'start'
+        : (status === 'task-done' && pendingBefore > 0) ? 'end'
+        : null;
+
+      if (bgOp) {
+        const bg = await setBgTask(context, name, bgOp);
+        const shown = await applyPresentation(context, name, terminal, {
+          baseLabelOverride: label,
+          explicitColor: colorId,
+          iconId,
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: true, name,
+          label: shown.effectiveLabel, baseLabel: shown.baseLabel,
+          icon: iconId, color: shown.color,
+          // The turn state is deliberately untouched — this call carried
+          // information about a different dimension.
+          status: bgMetaBefore.status ?? null,
+          displayStatus: shown.displayStatus,
+          bgTask: (bg?.pendingTasks ?? 0) > 0,
+          pendingTasks: bg?.pendingTasks ?? pendingBefore,
+          noOp: shown.noOp,
+        }));
+        return;
+      }
 
       // ── Quiet mode ──────────────────────────────────────────────────────────
       // Silent update — no terminal activation, no panel flicker.
       // status= in quiet mode applies the canonical color but does NOT rename
       // the label (label changes require terminal activation).
       if (quiet) {
+        if (status !== undefined) {
+          await persistMetadata(context, name, { status: status === 'none' ? null : status });
+        }
+        const quietMeta = loadMetadata(context)[name] ?? {};
+        const quietCfg  = (() => {
+          const key = displayStatusKey(quietMeta);
+          return (key && key !== 'none') ? (STATUS_MAP[key] ?? null) : null;
+        })();
+        const resolvedColor = colorId ?? quietCfg?.color ?? undefined;
+
         if (iconId)        terminal.iconPath = new vscode.ThemeIcon(iconId);
         if (resolvedColor) terminal.color    = new vscode.ThemeColor(resolvedColor);
-
-        const metaUpdate = {};
-        if (resolvedColor) metaUpdate.color = resolvedColor;
-        if (status !== undefined) metaUpdate.status = status === 'none' ? null : status;
-        if (Object.keys(metaUpdate).length) await persistMetadata(context, name, metaUpdate);
+        if (resolvedColor) await persistMetadata(context, name, { color: resolvedColor });
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -879,72 +1033,86 @@ function activate(context) {
       }
 
       // ── Normal (label-updating) mode ────────────────────────────────────────
-      const meta = loadMetadata(context);
-      const termMeta = meta[name] ?? {};
-
-      let effectiveLabel, baseLabel;
-
+      // Persist the turn state first, then render from the registry — the tab
+      // shows a function of BOTH dimensions (see displayStatusKey), so the
+      // renderer has to read the stored state rather than just this call's.
       if (status !== undefined) {
-        // status= mode: derive baseLabel from explicit label param or persisted state.
-        baseLabel = label ?? termMeta.baseLabel ?? termMeta.label ?? name;
-        effectiveLabel = statusCfg
-          ? `$(${statusCfg.codicon}) ${baseLabel}`
-          : baseLabel;  // status='none' or unknown → strip prefix
-      } else {
-        // Legacy mode: label= is the full effective label.
-        baseLabel     = label;
-        effectiveLabel = label;
+        await persistMetadata(context, name, { status: status === 'none' ? null : status });
       }
 
-      // Idempotency: skip the rename round-trip if nothing actually changed.
-      const prevEffLabel = termMeta.effectiveLabel;
-      const prevColor    = termMeta.color;
-      const labelChanged = effectiveLabel !== prevEffLabel;
-      const colorChanged = resolvedColor !== prevColor;
-
-      if (!labelChanged && !colorChanged && !iconId) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          ok: true, name, label: effectiveLabel, baseLabel,
-          icon: iconId, color: resolvedColor, status: status ?? null, noOp: true,
-        }));
-        return;
-      }
-
-      // Perform the rename only when the label actually changed.
-      if (labelChanged) {
-        // Only switch the active terminal if needed.
-        // Use show(true) = preserveFocus so keyboard focus is NEVER stolen.
-        const prev = vscode.window.activeTerminal;
-        const needsSwitch = prev !== terminal;
-        if (needsSwitch) terminal.show(true);
-        await vscode.commands.executeCommand(
-          'workbench.action.terminal.renameWithArg',
-          { name: effectiveLabel }
-        );
-        if (needsSwitch && prev) prev.show(true);
-      }
-
-      if (iconId)        terminal.iconPath = new vscode.ThemeIcon(iconId);
-      if (resolvedColor) terminal.color    = new vscode.ThemeColor(resolvedColor);
-
-      // Preserve the status field if no new status was provided.
-      const persistedStatus = status !== undefined
-        ? (status === 'none' ? null : status)
-        : termMeta.status;
-
-      await persistMetadata(context, name, {
-        label: effectiveLabel,
-        baseLabel,
-        status: persistedStatus,
-        effectiveLabel,
-        color: resolvedColor,
+      const shown = await applyPresentation(context, name, terminal, {
+        // status= mode derives the base label from the param or persisted
+        // state; legacy label= mode (no status=) means the caller owns the
+        // whole string.
+        baseLabelOverride: status !== undefined ? label : undefined,
+        explicitLabel:     status === undefined ? label : undefined,
+        explicitColor:     colorId,
+        iconId,
       });
+
+      const after = loadMetadata(context)[name] ?? {};
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
-        ok: true, name, label: effectiveLabel, baseLabel,
-        icon: iconId, color: resolvedColor, status: status ?? null,
+        ok: true, name,
+        label: shown.effectiveLabel, baseLabel: shown.baseLabel,
+        icon: iconId, color: shown.color,
+        status: status ?? null,
+        displayStatus: shown.displayStatus,
+        bgTask: (Number(after.pendingTasks) || 0) > 0,
+        pendingTasks: Math.max(0, Number(after.pendingTasks) || 0),
+        ...(shown.noOp ? { noOp: true } : {}),
+      }));
+
+    } else if (url.pathname === '/bg-task') {
+      // The explicit write path for the background-work dimension, for hooks
+      // that can say what they mean rather than borrowing a status value.
+      //
+      //   op=start   something is now outstanding (TaskCreated, a spawned job)
+      //   op=end     one outstanding thing finished (TaskCompleted)
+      //   op=clear   reset the count to zero
+      //
+      // Never touches `status`. A terminal can be blocked on a human AND have
+      // work in flight; that pair is the reason these are separate fields.
+      const name = url.searchParams.get('name');
+      const op   = url.searchParams.get('op') || 'start';
+
+      if (!name) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'name param required' }));
+        return;
+      }
+      if (!['start', 'end', 'clear'].includes(op)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: `Unknown op "${op}" — use start|end|clear` }));
+        return;
+      }
+
+      const bg = await setBgTask(context, name, op);
+      if (!bg) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Terminal not found', name }));
+        return;
+      }
+
+      // Same liveness signal as /rename-terminal: this is the agent reporting
+      // in, so it counts as a heartbeat.
+      await touchHeartbeat(context, name);
+
+      const terminal = terminals.get(name);
+      let shown = null;
+      if (terminal) shown = await applyPresentation(context, name, terminal, {});
+
+      const meta = loadMetadata(context)[name] ?? {};
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true, name, op,
+        pendingTasks: bg.pendingTasks,
+        bgTask: bg.pendingTasks > 0,
+        bgTaskStartedAt: bg.bgTaskStartedAt,
+        status: meta.status ?? null,
+        displayStatus: shown ? shown.displayStatus : displayStatusKey(meta),
+        label: shown ? shown.effectiveLabel : null,
       }));
 
     } else if (url.pathname === '/close-terminal') {
@@ -1147,6 +1315,14 @@ function activate(context) {
         // lastHeartbeatAt to tell "delivered but not picked up" from
         // "picked up"; see touchLastSend().
         lastSendAt: meta.lastSendAt ?? null,
+        // v0.21.0+ — the background-work dimension, tracked separately from
+        // status so "waiting on a job I started" stops being reported as
+        // "waiting on a human" (issue #40). displayStatus is what the tab
+        // actually renders; status is still the raw turn state.
+        pendingTasks: Math.max(0, Number(meta.pendingTasks) || 0),
+        bgTask: (Number(meta.pendingTasks) || 0) > 0,
+        bgTaskStartedAt: meta.bgTaskStartedAt ?? null,
+        displayStatus: displayStatusKey(meta),
       }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, now: new Date().toISOString(), terminals: list }));

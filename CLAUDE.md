@@ -28,6 +28,14 @@ Two things the bridge deliberately does not do: it never derives status from sta
 
 `pidAlive` tracks the terminal's **shell**, not the agent inside it. A crashed `claude` usually leaves a live shell prompt behind, so `pidAlive` stays true — it catches the tab-is-gone case, nothing more.
 
+## `close` removes the row, not just the tab (v0.19.0+)
+
+`close` used to operate on the VS Code terminal object and treat "no such object" as nothing-to-do. A terminal whose process had already exited therefore left a registry row that no *targeted* verb could remove — `sweep` was the only escape, and `sweep` takes no target, so clearing one dead row meant risking every live worktree tab (#22). Rows accumulated permanently, and `list` — the orchestrator's only status query — accumulated permanent false entries.
+
+Now `close` reconciles the row in every case and reports which one it hit: `outcome: closed` (disposed something live, or killed its pid), `row-removed` (process was already gone, bookkeeping cleaned up), `not-tracked` (404, no such row). Exit status from the CLI stays 0 for all three — cleanup paths call `close` under `set -e`, and "the terminal you asked to be gone is gone" is not a failure. Silence with no output still means the bridge was unreachable.
+
+`forget <name>` is the registry-only verb: it drops the row and never signals a pid or disposes a terminal. Use it when you know the process is dead and only want the bookkeeping cleared; use `close` when you want the process gone too.
+
 ## `send` talks to a session that's already running (v0.17.0+)
 
 `open`'s `cmd` only fires at spawn, so the only way to get a message into a live agent session used to be close + re-open — which restarts it and throws away its context. `send` delivers into the running session instead. Three things about it are load-bearing:
@@ -45,7 +53,8 @@ All endpoints are GET with query-string params (not POST/JSON — see `extension
 | Endpoint | Purpose |
 |----------|---------|
 | `/open-terminal` | Open a named terminal in a given cwd (`cmd=` inline, or `cmdFile=` to run a command from a file) |
-| `/close-terminal` | Close a named terminal (falls back to PID kill if registry desynced) |
+| `/close-terminal` | Close a named terminal (falls back to PID kill if registry desynced; always reconciles the registry row) |
+| `/forget-terminal` | Drop a tracked registry row without touching any process |
 | `/rename-terminal` | Rename / set status icon via `status=` (or `label=`, or `quiet=1`) |
 | `/list` | Query tracked terminals (name, cwd, status, pid, live) |
 | `/send-text` | Inject text into an already-running tracked terminal (`text=` or `textFile=`) |
@@ -63,6 +72,7 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open <name> <cwd> [cmd] [icon] [
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh status <name> <state>
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh send <name> <text>|--text-file=<path>
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh close <name>
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh forget <name>
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status <status> [--name=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend {cline|claude} [--dir=<repo>]
 ```

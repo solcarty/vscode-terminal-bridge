@@ -411,8 +411,18 @@ async function sweepTerminals(context) {
 // ---------------------------------------------------------------------------
 // Close a terminal by name, falling back to a live-window name search and
 // then a PID kill when the in-memory registry has desynced from reality.
-// ---------------------------------------------------------------------------
-
+//
+// close is idempotent on the REGISTRY, not just on the terminal object
+// (issue #41). The caller named a specific terminal and asked for it to be
+// gone; if the VS Code object and the process have both already vanished, the
+// registry row is the only part still observable, and leaving it behind means
+// the row can never be removed by any targeted verb — `sweep` was the sole
+// escape, and sweep takes no target (issue #22).
+//
+// So a missing terminal object is not "nothing to do", it's "reconcile". The
+// outcome says which case we hit, because they mean different things to a
+// caller: `closed` disposed something live, `row-removed` cleaned up after
+// something that was already gone, `not-tracked` means there was never a row.
 async function closeTerminalByName(context, name) {
   let terminal = terminals.get(name);
   if (!terminal) {
@@ -424,21 +434,52 @@ async function closeTerminalByName(context, name) {
     terminal.dispose();
     terminals.delete(name);
     await persistMetadata(context, name, null);
-    return { found: true, method: 'dispose' };
+    return { outcome: 'closed', method: 'dispose' };
   }
 
-  // Registry has no live terminal object — fall back to killing by persisted PID.
+  // No live terminal object. Anything left is registry state — reconcile it.
   const meta = loadMetadata(context)[name];
-  if (meta && meta.pid) {
+  if (!meta) {
+    terminals.delete(name);
+    return { outcome: 'not-tracked', method: null };
+  }
+
+  // Fall back to killing by persisted PID when we still have one. A failure
+  // here means the process is already dead, which is the same end state we
+  // were asked for — so it drops through to the row removal below rather than
+  // aborting.
+  let method = 'registry';
+  if (meta.pid) {
     try {
       process.kill(meta.pid, 'SIGTERM');
-      terminals.delete(name);
-      await persistMetadata(context, name, null);
-      return { found: true, method: 'pid-kill' };
-    } catch { /* already dead — fall through to not-found */ }
+      method = 'pid-kill';
+    } catch { /* already dead */ }
   }
 
-  return { found: false, method: null };
+  terminals.delete(name);
+  await persistMetadata(context, name, null);
+  return {
+    outcome: method === 'pid-kill' ? 'closed' : 'row-removed',
+    method,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Forget: drop a registry row and nothing else.
+//
+// The companion to close for the case where you know the process is gone and
+// only want the bookkeeping cleared — never signals a PID, never disposes a
+// terminal object. Safe to hand to an orchestrator in a way `sweep` is not,
+// because it takes a target.
+// ---------------------------------------------------------------------------
+
+async function forgetTerminal(context, name) {
+  const meta = loadMetadata(context)[name];
+  const wasLive = terminals.has(name) || vscode.window.terminals.some(t => t.name === name);
+  terminals.delete(name);
+  if (!meta) return { outcome: 'not-tracked', wasLive };
+  await persistMetadata(context, name, null);
+  return { outcome: 'row-removed', wasLive };
 }
 
 // ---------------------------------------------------------------------------
@@ -876,16 +917,40 @@ function activate(context) {
         return;
       }
 
-      const { found, method } = await closeTerminalByName(context, name);
+      const { outcome, method } = await closeTerminalByName(context, name);
 
-      if (!found) {
+      // not-tracked is a 404 because there was nothing here to act on — but
+      // `row-removed` is a 200: the caller asked for the terminal to be gone
+      // and it is, even though the process had already exited (issue #41).
+      if (outcome === 'not-tracked') {
         res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: 'Terminal not found', name }));
+        res.end(JSON.stringify({ ok: false, error: 'Terminal not found', outcome, name }));
         return;
       }
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, name, method }));
+      res.end(JSON.stringify({ ok: true, name, outcome, method }));
+
+    } else if (url.pathname === '/forget-terminal') {
+      // Registry-only removal — see forgetTerminal(). Deliberately targeted,
+      // unlike /sweep, so clearing one stale row never risks live tabs.
+      const name = url.searchParams.get('name');
+      if (!name) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'name param required' }));
+        return;
+      }
+
+      const { outcome, wasLive } = await forgetTerminal(context, name);
+
+      if (outcome === 'not-tracked') {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Terminal not found', outcome, name }));
+        return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, name, outcome, wasLive }));
 
     } else if (url.pathname === '/send-text') {
       // Inject text into an already-running tracked terminal — see
@@ -1061,8 +1126,10 @@ function activate(context) {
     }
   });
 
-  // ── Dynamic port binding — try 31415, increment on EADDRINUSE ───────────
-  let activePort = 31415;
+  // ── Dynamic port binding — try the base port, increment on EADDRINUSE ────
+  // VSCODE_BRIDGE_BASE_PORT moves the whole search range (used by the test
+  // harness so a headless run never collides with real editor windows).
+  let activePort = Number(process.env.VSCODE_BRIDGE_BASE_PORT) || 31415;
 
   function writePortFiles(port) {
     const folders = vscode.workspace.workspaceFolders || [];
@@ -1101,23 +1168,45 @@ function activate(context) {
     vscode.workspace.onDidChangeWorkspaceFolders(() => writePortFiles(activePort))
   );
 
+  // The port we're currently trying to bind. Distinct from activePort, which
+  // is only assigned once a bind SUCCEEDS: retrying from activePort meant every
+  // EADDRINUSE re-tried the same port forever, so a third window (31415 and
+  // 31416 already taken) never bound at all and never wrote a port file.
+  let candidatePort = activePort;
+  const MAX_PORT_ATTEMPTS = 32;
+  let portAttempts = 0;
+
+  // One persistent 'listening' handler rather than a per-attempt callback:
+  // server.listen(port, cb) registers cb as a one-shot listener that never
+  // fires if that attempt hits EADDRINUSE, so a retry loop accumulates dead
+  // listeners which then ALL fire together on the eventual success — each
+  // logging and writing a port file for a port we aren't actually bound to.
+  server.on('listening', () => {
+    activePort = server.address().port;
+    console.log(`[terminal-bridge] listening on 127.0.0.1:${activePort}`);
+    writePortFiles(activePort);
+  });
+
   function startServer(port) {
-    server.listen(port, '127.0.0.1', () => {
-      activePort = port;
-      console.log(`[terminal-bridge] listening on 127.0.0.1:${port}`);
-      writePortFiles(port);
-    });
+    candidatePort = port;
+    server.listen(port, '127.0.0.1');
   }
 
   server.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
-      startServer(activePort + 1);
+      if (++portAttempts > MAX_PORT_ATTEMPTS) {
+        console.error(
+          `[terminal-bridge] no free port in ${activePort}–${candidatePort}; bridge not listening`
+        );
+        return;
+      }
+      startServer(candidatePort + 1);
     } else {
       console.error('[terminal-bridge] server error:', err.message);
     }
   });
 
-  startServer(activePort);
+  startServer(candidatePort);
 
   context.subscriptions.push({ dispose: () => { removePortFiles(); server && server.close(); } });
 }

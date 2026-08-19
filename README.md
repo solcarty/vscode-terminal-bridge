@@ -6,7 +6,8 @@ Built to solve a real problem: VS Code extensions and external scripts **cannot*
 
 ## How it works
 
-On activation, the extension starts an HTTP server on `127.0.0.1`. It tries port **31415** first; if that port is already taken (e.g. a second VS Code window is open), it increments until it finds a free port (`31416`, `31417`, …).
+On activation, the extension starts an HTTP server on `127.0.0.1`. It tries port **31415** first; if that port is already taken (e.g. a second VS Code window is open), it increments until it finds a free port (`31416`, `31417`, …), giving up after 32 attempts.
+(Before v0.19.0 the retry re-tried `31416` forever, so a **third** window never bound at all and never wrote a port file — its shells fell back to another window's bridge.)
 
 Once bound, the extension writes the active port to a `.vscode-bridge-port` file in **every workspace folder**. Scripts discover their window's port by reading this file from the repo root — no hardcoded port, no guessing which window is which.
 
@@ -79,7 +80,8 @@ The extension bundles a small bash client (`bin/vscode-bridge.sh` + `bin/bridgec
 # one command per action — easy to cover with a single permission allow-rule
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open   <name> <cwd> [cmd] [icon] [color] [--cmd-file=<path>] [--node=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh status <name> <state>   # working|idle|needs-input|pr-open|merged|...
-bash ~/.vscode-terminal-bridge/bin/bridgectl.sh close  <name>
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh close  <name>   # disposes the tab AND removes its tracked row
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh forget <name>   # removes the tracked row only, never touches a process
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh send   <name> <text>|--text-file=<path> [--no-submit] [--force] [--mode=...]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh list
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh sweep
@@ -429,12 +431,56 @@ curl "http://127.0.0.1:${PORT}/close-terminal?name=my-tab"
 Response:
 
 ```json
-{ "ok": true, "name": "my-tab", "method": "dispose" }
+{ "ok": true, "name": "my-tab", "outcome": "closed", "method": "dispose" }
 ```
 
-`method` is `"dispose"` when a live terminal object was found and disposed,
-or `"pid-kill"` when the registry had no object reference and the persisted
-shell PID was killed directly instead.
+`outcome` (v0.19.0+) is the field to branch on:
+
+| `outcome` | HTTP | Means |
+| --------- | ---- | ----- |
+| `closed` | 200 | A live terminal object was disposed, or its persisted PID was killed |
+| `row-removed` | 200 | The terminal and its process were already gone; the tracked row was removed |
+| `not-tracked` | 404 | No row under that name — nothing to remove |
+
+`method` refines the `closed` case: `"dispose"` when a live terminal object
+was found, `"pid-kill"` when the registry had no object reference and the
+persisted shell PID was signalled instead. `row-removed` reports
+`"method": "registry"`.
+
+**`close` reconciles the registry, not just the terminal object** (v0.19.0+).
+Before this, closing a name whose process had already exited returned success
+having done nothing, and left a row that no targeted verb could remove —
+`/sweep` was the only escape, and `/sweep` takes no target, so clearing one
+stale row meant risking every live worktree tab. A caller naming a specific
+terminal has already expressed the intent; there is no reading of
+`close my-tab` where leaving the row behind is the desired outcome.
+
+---
+
+### `GET /forget-terminal`
+
+Removes a tracked row and **nothing else** — never signals a PID, never
+disposes a terminal object. The targeted counterpart to `/sweep`, for a row
+you know is dead and want cleared without sweep's blast radius.
+
+| Parameter | Required | Description |
+| --------- | -------- | ----------- |
+| `name` | Yes | Registry name |
+
+```bash
+curl "http://127.0.0.1:${PORT}/forget-terminal?name=my-tab"
+```
+
+Response:
+
+```json
+{ "ok": true, "name": "my-tab", "outcome": "row-removed", "wasLive": false }
+```
+
+`wasLive` reports whether a terminal object under that name still existed
+when the row was dropped — `true` means you have just untracked a tab that is
+still open on screen, which is legal but rarely what you meant. Unknown names
+return `404` with `"outcome": "not-tracked"`.
 
 ---
 

@@ -245,7 +245,10 @@ bridge_list() {
 #
 # Exit 0 means "written to the terminal", NOT "read and acted on" — the text
 # queues in the buffer if the target is mid-execution. To confirm receipt,
-# watch for a status transition via bridge_list.
+# compare lastSendAt against lastHeartbeatAt in bridge_list (bridge v0.20.0+):
+# a heartbeat NEWER than the send means the agent has acted since your text
+# landed. A status transition is not a substitute — hooks fire on tool calls,
+# so status lags pickup, and a transition can't be attributed to your send.
 bridge_send() {
   if [ "$#" -lt 1 ]; then
     echo '{"ok":false,"reason":"usage: bridgectl.sh send <name> <text>|--text-file=<path> [--no-submit] [--force] [--mode=auto|paste|literal|join]"}' >&2

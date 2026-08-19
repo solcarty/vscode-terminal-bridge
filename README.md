@@ -241,7 +241,8 @@ curl "http://127.0.0.1:${PORT}/list"
       "createdAt": "2026-08-05T09:14:02.881Z",
       "updatedAt": "2026-08-05T11:52:04.019Z",
       "statusChangedAt": "2026-08-05T09:14:11.226Z",
-      "lastHeartbeatAt": "2026-08-05T11:52:04.019Z"
+      "lastHeartbeatAt": "2026-08-05T11:52:04.019Z",
+      "lastSendAt": "2026-08-05T11:51:58.004Z"
     }
   ]
 }
@@ -257,6 +258,7 @@ Status alone answers "what state is this in". The question an orchestrator actua
 | `updatedAt` | Any metadata write — status, rename, pid, color. |
 | `statusChangedAt` | The status **value** changes. A `PreToolUse` hook firing `status=working` every few seconds does *not* reset it, or "how long has this been working" becomes unanswerable. |
 | `lastHeartbeatAt` | **Any** `/rename-terminal` call lands, including the idempotent no-ops. |
+| `lastSendAt` | A `/send-text` call **submits** text into this terminal (v0.20.0+). Staged text (`submit=0`) and refused sends don't stamp. |
 
 `now` is the bridge's clock at response time, so callers compute ages against it rather than their own.
 
@@ -266,7 +268,17 @@ Status alone answers "what state is this in". The question an orchestrator actua
 
 **`pidAlive` is narrower than it looks.** The tracked pid is the terminal's *shell*, not the agent inside it, and a crashed `claude` usually drops back to a live shell prompt — so `pidAlive` stays `true`. It catches the tab-is-gone case cheaply; `lastHeartbeatAt` is what distinguishes wedged from working. `null` means no pid was ever recorded.
 
-**Entries predating v0.18.0 report `null`** for all four timestamps rather than a fabricated value. Treat `null` as unknown, not as zero.
+**`lastSendAt` is how you confirm a send was picked up (v0.20.0+).** `/send-text` returning 200 means the text was *written* to the terminal, not read — `sendText` queues in the buffer. Comparing the two timestamps answers what the exit code can't:
+
+| Observation | Means |
+|---|---|
+| `lastHeartbeatAt` < `lastSendAt` | Delivered, not yet picked up |
+| `lastHeartbeatAt` > `lastSendAt` | Picked up — the agent has done something since your text landed |
+| `lastSendAt` is `null` | Nothing was ever sent |
+
+Watching for a status *transition* instead doesn't work: hooks fire on tool calls, so an agent that reasons for a while before acting still reads `needs-input` long after your text landed — and a transition that does happen can't be attributed to your send rather than to the agent acting on its own. A heartbeat *after* your send is attributable in a way a bare status change never is.
+
+**Entries predating a field's release report `null`** rather than a fabricated value — the four v0.18.0 timestamps on older entries, and `lastSendAt` on any terminal that hasn't been sent to. Treat `null` as unknown, not as zero.
 
 Or via the bundled client: `bash ~/.vscode-terminal-bridge/bin/bridgectl.sh list`.
 
@@ -311,7 +323,7 @@ curl -G "http://127.0.0.1:${PORT}/send-text" \
 
 **Prompt-state safety.** Text injected while the target sits at a permission dialog or a numbered question is consumed as *an answer to that menu*, not read as a message. `/send-text` returns **409** when the tracked status is `needs-input` or `permission`; pass `force=1` when answering the prompt is what you actually mean. Unknown or non-live terminal → **404**.
 
-**Exit 0 means delivered, not received.** `sendText` queues in the terminal buffer when the target is mid-execution, so a successful response says the text was written — not that the agent read it or acted on it. To confirm receipt, watch for a status transition (e.g. `needs-input` → `working`) via `/list`.
+**Exit 0 means delivered, not received.** `sendText` queues in the terminal buffer when the target is mid-execution, so a successful response says the text was written — not that the agent read it or acted on it. To confirm pickup, compare `lastHeartbeatAt` against `lastSendAt` in `/list`: a heartbeat *after* your send means the agent has acted since your text landed (v0.20.0+). Don't watch for a status transition instead — hooks fire on tool calls, so a status can lag a pickup by minutes, and a transition that does occur can't be attributed to your send.
 
 Or via the bundled client:
 

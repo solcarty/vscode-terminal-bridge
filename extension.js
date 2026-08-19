@@ -142,6 +142,37 @@ async function touchHeartbeat(context, name) {
   await context.workspaceState.update(METADATA_KEY, meta);
 }
 
+// Record that we injected text into this terminal (issue #39).
+//
+// /send-text's exit status says the text was WRITTEN, not that the agent read
+// it — sendText queues in the terminal buffer, so a success is a delivery
+// receipt, not an acknowledgment. The docs used to suggest confirming pickup
+// by watching for a status transition, which doesn't survive contact: hooks
+// fire on tool calls, so an agent that reasons before acting still reads
+// `needs-input` well after your text landed, and a transition that does happen
+// can't be attributed to your send rather than to the agent acting on its own.
+//
+// A timestamp makes acknowledgment a comparison the CALLER makes:
+//
+//   lastHeartbeatAt < lastSendAt   delivered, not yet picked up
+//   lastHeartbeatAt > lastSendAt   picked up — the agent has acted since
+//   lastSendAt === null            nothing was ever sent
+//
+// Deliberately NOT a status mutation. Optimistically flipping needs-input to
+// working on send would be the bridge asserting a transition it hasn't
+// observed, and it breaks exactly where it matters most: text injected at a
+// permission dialog is consumed as an answer to that dialog, and if the answer
+// doesn't unblock the agent the terminal is still waiting while the registry
+// claims otherwise. Facts, not verdicts.
+async function touchLastSend(context, name) {
+  const meta = loadMetadata(context);
+  if (!meta[name]) return null;  // never conjure an entry for an untracked name
+  const now = new Date().toISOString();
+  meta[name] = { ...meta[name], lastSendAt: now };
+  await context.workspaceState.update(METADATA_KEY, meta);
+  return now;
+}
+
 // Is the tracked process still there? `process.kill(pid, 0)` sends no signal —
 // it just tests for existence (and our permission to signal it).
 //
@@ -558,10 +589,17 @@ async function sendTextToTerminal(context, name, text, opts = {}) {
   // inside it, it's just pasted content and never submits.
   if (submit) terminal.sendText('', true);
 
+  // Stamp only on an actual submit. Staged-but-unsent text (submit=0) hasn't
+  // been delivered to the agent, so recording it as a send would manufacture
+  // the exact false positive lastSendAt exists to remove — a caller would
+  // compare a heartbeat against a send that never happened.
+  const lastSendAt = submit ? await touchLastSend(context, name) : null;
+
   return {
     ok: true, name, status, submitted: submit,
     mode: mode === 'join' ? 'join' : (usePaste ? 'paste' : 'literal'),
     bytes: Buffer.byteLength(delivered, 'utf8'),
+    lastSendAt,
   };
 }
 
@@ -1105,6 +1143,10 @@ function activate(context) {
         updatedAt: meta.updatedAt ?? null,
         statusChangedAt: meta.statusChangedAt ?? null,
         lastHeartbeatAt: meta.lastHeartbeatAt ?? null,
+        // v0.20.0+ — set by /send-text on a submitted send. Compare against
+        // lastHeartbeatAt to tell "delivered but not picked up" from
+        // "picked up"; see touchLastSend().
+        lastSendAt: meta.lastSendAt ?? null,
       }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, now: new Date().toISOString(), terminals: list }));

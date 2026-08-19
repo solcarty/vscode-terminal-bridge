@@ -70,6 +70,16 @@ Three things are load-bearing:
 
 A note is a **self-report**, with more authority than a status colour because it reads like a report. Write receipts, not prose — `shipped: pr=<n> branch=<b> sha=<sha>`, `touched: env=shared-dev mutations=1 row` — so the orchestrator can reconcile against git/PR state rather than relay a claim. The bridge deliberately does not validate note contents, the same way it never derives status from staleness.
 
+## `output` is read-back without reading the terminal (v0.23.0+)
+
+An orchestrator could send into a session and read its self-reported note, but not learn what the agent actually *said* — so anything conversational still needed a human to paste it back. VS Code has no stable API for reading a terminal buffer (`onDidWriteTerminalData` is proposed-only; shell integration models discrete commands, not a long-running TUI), so this reuses the hook rail instead.
+
+`bridgectl hook-output`, wired on `Stop`/`SubagentStop`, reads **`last_assistant_message` out of the hook payload** and posts it. It deliberately does *not* tail `transcript_path`: the transcript lags the live conversation and parsing it would couple the bridge to Claude Code's on-disk format. The bridge stores an opaque string it never interprets.
+
+Bounded by construction: a ring of the last 3 messages, 4KB each, keeping the **tail** (a message's conclusion is what an orchestrator is asking about — notes cap the other way, since receipts put facts first). `list` exposes `lastOutputAt`/`outputCount` only.
+
+It degrades to silence, never an error: nothing published reads as an empty list, a quiet turn as `stored: false`, and a malformed payload / missing field / missing `node` as a no-op that still exits 0 — a hook on every Stop must never fail the turn. Two limits worth knowing: it captures only the turn's final text (not tool output or intermediate reasoning), and remote worker nodes aren't covered — a remote job publishes a `note` instead.
+
 ## Key endpoints
 
 All endpoints are GET with query-string params (not POST/JSON — see `extension.js`).
@@ -84,6 +94,7 @@ All endpoints are GET with query-string params (not POST/JSON — see `extension
 | `/bg-task` | Report outstanding background work (`op=start|end|clear`) — a dimension of its own, not a status |
 | `/send-text` | Inject text into an already-running tracked terminal (`text=` or `textFile=`) |
 | `/set-note` · `/note` · `/clear-note` | A worker's short handoff for its orchestrator (`text=` / `textFile=`) |
+| `/set-output` · `/output` · `/clear-output` | Read-back: the turn's final assistant text, pushed in by a Stop hook |
 | `/sweep` | Dispose terminals whose cwd no longer maps to a live `git worktree` |
 | `/add-folder` / `/remove-folder` | Attach/detach a workspace folder |
 | `/reindex` | Re-link open terminals to persisted metadata |
@@ -101,6 +112,7 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh close <name>
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh forget <name>
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note set <text>|--text-file=<path> [--name=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note get <name>
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh output <name> [--n=<1..3>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh bg-task {start|end|clear} [--name=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status <status> [--name=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend {cline|claude} [--dir=<repo>]

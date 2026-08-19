@@ -87,6 +87,7 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh list
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh bg-task {start|end|clear} [--name=<name>]   # outstanding background work
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note set <text>|--text-file=<path>          # publish a handoff
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note get <name>                             # read one back
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh output <name> [--n=<1..3>]                  # read back what it last said
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh sweep
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh ping
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status <status> [--name=<name>]
@@ -250,7 +251,8 @@ curl "http://127.0.0.1:${PORT}/list"
       "bgTaskStartedAt": "2026-08-05T11:44:30.007Z",
       "displayStatus": "bg-task",
       "noteUpdatedAt": "2026-08-05T11:50:12.771Z",
-      "noteBytes": 128, "noteTruncated": false
+      "noteBytes": 128, "noteTruncated": false,
+      "lastOutputAt": "2026-08-05T11:51:02.310Z", "outputCount": 3
     }
   ]
 }
@@ -268,6 +270,7 @@ Status alone answers "what state is this in". The question an orchestrator actua
 | `lastHeartbeatAt` | **Any** `/rename-terminal` call lands, including the idempotent no-ops. |
 | `lastSendAt` | A `/send-text` call **submits** text into this terminal (v0.20.0+). Staged text (`submit=0`) and refused sends don't stamp. |
 | `bgTaskStartedAt` | `pendingTasks` goes from 0 to 1 (v0.21.0+). Cleared when the count returns to 0, so it can't outlive the work it described. |
+| `lastOutputAt` | A Stop hook publishes the turn's final assistant text (v0.23.0+). Bodies come from [`/output`](#get-set-output--get-output--get-clear-output), never from `/list`. |
 | `noteUpdatedAt` | A worker publishes a note via `/set-note` (v0.22.0+). The **body is not in `/list`** — fetch it from [`/note`](#get-set-note--get-note--get-clear-note) for the entries whose timestamp moved. |
 
 `pendingTasks` / `bgTask` / `displayStatus` (v0.21.0+) carry the background-work dimension — see [`/bg-task`](#get-bg-task) for why that is separate from `status`. `status` remains the raw turn state; `displayStatus` is what the tab renders.
@@ -432,6 +435,59 @@ Response (idempotent no-op):
 ```
 
 Returns `404` if the terminal is not in the registry (e.g. opened before the last reload).
+
+---
+
+### `GET /set-output` · `GET /output` · `GET /clear-output`
+
+Read-back: what the agent in a tracked terminal last **said**, so an orchestrating session can learn the outcome of work it delegated without a human copy-pasting it back (v0.23.0+).
+
+| Endpoint | Parameters | Purpose |
+| -------- | ---------- | ------- |
+| `/set-output` | `name` (req), `text=` or `textFile=` | Publish a turn's final assistant text (called by a hook, not by hand) |
+| `/output` | `name` (req), `n=` (1–3, default 1) | Read the most recent message(s) back |
+| `/clear-output` | `name` (req) | Drop what's stored |
+
+```bash
+bridgectl output my-task          # most recent message
+bridgectl output my-task --n=3    # the last three
+```
+
+```json
+{
+  "ok": true, "name": "my-task",
+  "outputs": [{ "at": "2026-08-19T15:02:11.004Z", "text": "Root cause: …\nFix here or split it?", "truncated": false }],
+  "lastOutputAt": "2026-08-19T15:02:11.004Z",
+  "available": 3, "maxEntries": 3
+}
+```
+
+#### How it works — and what it deliberately isn't
+
+There is no stable VS Code API for reading a terminal's buffer: `onDidWriteTerminalData` is proposed-API only, and the shell-integration APIs model discrete shell commands rather than a long-running TUI like a `claude` session. So this doesn't read the terminal at all — it reuses the hook plumbing that already populates `status`:
+
+```json
+"Stop": [{ "hooks": [
+  { "type": "command", "command": "bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status idle" },
+  { "type": "command", "command": "bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-output" }
+]}]
+```
+
+`hook-output` reads **`last_assistant_message`** straight from the Stop / SubagentStop payload on stdin. It does **not** tail the transcript at `transcript_path`: that file is written asynchronously and can lag the live conversation, and parsing it would couple this extension to Claude Code's on-disk format — which isn't ours and can change under us. Everything the bridge stores is an opaque string it never interprets.
+
+`scaffold --backend claude` emits this wiring.
+
+#### Bounds and failure modes
+
+- **Bounded by construction** — a ring of the last 3 messages, each capped at 4KB. Long messages keep the **tail**, not the head: the conclusion is the part an orchestrator is asking about ("so, PR or split?"). Notes cap the other way round, because a receipts-format note puts its facts first.
+- **Degrades to silence, never to an error.** A terminal with nothing to report returns an empty list with a `null` timestamp — "hasn't said anything yet" is a normal state, and a terminal whose hook was never wired must read as quiet rather than broken. A turn that said nothing returns `stored: false`. A malformed payload, a missing field, or a missing `node` makes `hook-output` a no-op that still exits 0, because a hook firing on every Stop must never fail the turn.
+- **`/list` carries `lastOutputAt` and `outputCount` only** — bodies come from `/output`, same discipline as notes.
+- **Only captures what the hook fires on.** This is the turn's *final* text, not a byte-accurate replay: intermediate reasoning, tool output, and anything printed by a non-agent process in the tab are not here. For those, the terminal itself is still the only source.
+- **Remote worker nodes are not covered.** A job on another machine can publish a [note](#notes-from-a-remote-worker-node) over the worker rail, but `hook-output` posts to the local bridge only.
+
+#### Notes vs. output
+
+Both are self-reports, and they answer different questions. A [note](#get-set-note--get-note--get-clear-note) is written *for* the orchestrator — deliberate, structured, checkable. Output is the agent's own words verbatim, which is what catches the case a note can't: the two incidents in [#38](https://github.com/solcarty/vscode-terminal-bridge/issues/38) where a worker's summary was confidently wrong were both caught by reading what it actually said. Poll `/list`, and fetch whichever the timestamps say has changed.
 
 ---
 
@@ -754,7 +810,7 @@ curl -s "http://127.0.0.1:${PORT}/rename-terminal?name=$N&status=working" \
 | ---- | ------------- | --------------------- |
 | `PreToolUse` | Before every tool call | `working` |
 | `Notification` | Claude needs input (permission prompt, question) | `needs-input` |
-| `Stop` | Claude's turn is complete | `idle` |
+| `Stop` | Claude's turn is complete | `idle` — wire `hook-output` here too, see [read-back](#get-set-output--get-output--get-clear-output) |
 
 ### Recommended state scheme
 

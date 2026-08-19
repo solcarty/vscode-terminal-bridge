@@ -400,6 +400,59 @@ async function clearNote(context, name) {
 }
 
 // ---------------------------------------------------------------------------
+// Read-back: what the agent last SAID, pushed in by its own Stop hook (#32).
+//
+// The blocker on reading a terminal was never the wanting — it's that VS Code
+// has no stable API for it. onDidWriteTerminalData is proposed-only, and the
+// shell-integration APIs model discrete shell commands rather than a
+// long-running TUI like a `claude` session.
+//
+// So this doesn't read the terminal at all: it reuses the hook plumbing that
+// already populates `status`. Claude Code's Stop and SubagentStop hooks carry
+// `last_assistant_message` in their payload, so the hook posts that text here
+// and /output hands it back. The bridge stores an opaque string and never
+// parses a transcript — deliberately, because transcript tailing would couple
+// this extension to Claude Code's on-disk format, which is not ours and can
+// change under us.
+//
+// What this cannot do, and #38's notes can't either: capture what the agent
+// did rather than what it said. Both are self-reports. The difference is that
+// a note is written for the orchestrator while this is the agent's own words
+// verbatim, which is what catches the case where a worker's summary is wrong.
+const MAX_OUTPUT_BYTES = 4096;
+const MAX_OUTPUT_ENTRIES = 3;
+
+function capText(raw, max) {
+  const text = String(raw ?? '');
+  if (Buffer.byteLength(text, 'utf8') <= max) return { text, truncated: false };
+  // Cut on a character boundary so the stored text stays valid UTF-8. Keep the
+  // TAIL, not the head: the conclusion of a message is the part an orchestrator
+  // is asking about ("so, PR or split?"), where a note's facts sit at its head.
+  const buf = Buffer.from(text, 'utf8').subarray(-max);
+  return { text: buf.toString('utf8').replace(/^\uFFFD/, ''), truncated: true };
+}
+
+async function pushOutput(context, name, text) {
+  const meta = loadMetadata(context);
+  if (!meta[name]) return null;  // never conjure an entry for an untracked name
+
+  const { text: body, truncated } = capText(text, MAX_OUTPUT_BYTES);
+  if (!body.trim()) return { skipped: true };  // nothing said — not an error
+
+  const now = new Date().toISOString();
+  const entry = { at: now, text: body, truncated };
+  const prev = Array.isArray(meta[name].outputs) ? meta[name].outputs : [];
+
+  // Bounded ring, oldest evicted. An unbounded buffer is exactly what the
+  // issue asks this NOT to be, and workspaceState is not a log store.
+  const outputs = [...prev, entry].slice(-MAX_OUTPUT_ENTRIES);
+
+  meta[name] = { ...meta[name], outputs, lastOutputAt: now };
+  await context.workspaceState.update(METADATA_KEY, meta);
+  return { lastOutputAt: now, truncated, bytes: Buffer.byteLength(body, 'utf8'), count: outputs.length };
+}
+
+// ---------------------------------------------------------------------------
 // Background work is a SECOND dimension, not a status value (issue #40).
 //
 // `status` is a last-writer-wins scalar, but the things written into it aren't
@@ -1211,6 +1264,100 @@ function activate(context) {
         bytes: meta.noteBytes ?? 0,
       }));
 
+    } else if (url.pathname === '/set-output' || url.pathname === '/clear-output') {
+      // Write path for read-back. Called by a Stop/SubagentStop hook with the
+      // turn's final assistant text; same parameter shape as /send-text and
+      // /set-note.
+      const name = url.searchParams.get('name');
+      if (!name) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'name param required' }));
+        return;
+      }
+
+      if (url.pathname === '/clear-output') {
+        const meta = loadMetadata(context);
+        if (!meta[name]) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Terminal not found', name }));
+          return;
+        }
+        meta[name] = { ...meta[name], outputs: [], lastOutputAt: null };
+        await context.workspaceState.update(METADATA_KEY, meta);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, name, cleared: true, lastOutputAt: null }));
+        return;
+      }
+
+      const outFile = url.searchParams.get('textFile') || undefined;
+      let text = url.searchParams.get('text');
+      if (outFile) {
+        try {
+          text = fs.readFileSync(outFile, 'utf8');
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `Could not read textFile: ${err.message}`, textFile: outFile }));
+          return;
+        }
+      }
+
+      // An empty payload is a turn that said nothing, not a failure — a hook
+      // firing on every Stop must not start erroring on quiet turns.
+      const pushed = await pushOutput(context, name, text ?? '');
+      if (!pushed) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Terminal not found', name }));
+        return;
+      }
+      if (pushed.skipped) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, name, stored: false, reason: 'empty' }));
+        return;
+      }
+
+      await touchHeartbeat(context, name);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true, name, stored: true,
+        lastOutputAt: pushed.lastOutputAt,
+        bytes: pushed.bytes, truncated: pushed.truncated,
+        count: pushed.count, maxBytes: MAX_OUTPUT_BYTES, maxEntries: MAX_OUTPUT_ENTRIES,
+      }));
+
+    } else if (url.pathname === '/output') {
+      // Read path. Bounded by construction: at most MAX_OUTPUT_ENTRIES are
+      // kept, and n= asks for fewer. Like /note, bodies live here rather than
+      // in /list so a triage poll stays cheap.
+      const name = url.searchParams.get('name');
+      if (!name) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'name param required' }));
+        return;
+      }
+      const meta = loadMetadata(context)[name];
+      if (!meta) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Terminal not found', name }));
+        return;
+      }
+
+      const nRaw = parseInt(url.searchParams.get('n') ?? '1', 10);
+      const n = Number.isFinite(nRaw) ? Math.min(Math.max(nRaw, 1), MAX_OUTPUT_ENTRIES) : 1;
+      const all = Array.isArray(meta.outputs) ? meta.outputs : [];
+
+      // A terminal with nothing to report returns an empty list, not an error:
+      // "hasn't said anything yet" is a normal state, and a hook that was
+      // never wired should read as silence rather than as a failure.
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true, name,
+        outputs: all.slice(-n),
+        lastOutputAt: meta.lastOutputAt ?? null,
+        available: all.length,
+        maxEntries: MAX_OUTPUT_ENTRIES,
+      }));
+
     } else if (url.pathname === '/bg-task') {
       // The explicit write path for the background-work dimension, for hooks
       // that can say what they mean rather than borrowing a status value.
@@ -1476,6 +1623,10 @@ function activate(context) {
         noteUpdatedAt: meta.noteUpdatedAt ?? null,
         noteBytes: meta.noteBytes ?? 0,
         noteTruncated: meta.noteTruncated ?? false,
+        // v0.23.0+ — read-back timestamp only, bodies via /output. Same
+        // reasoning as noteUpdatedAt: a triage poll must not carry payloads.
+        lastOutputAt: meta.lastOutputAt ?? null,
+        outputCount: Array.isArray(meta.outputs) ? meta.outputs.length : 0,
       }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, now: new Date().toISOString(), terminals: list }));

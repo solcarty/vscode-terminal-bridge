@@ -308,14 +308,61 @@ bridge_send() {
   esac
 }
 
+# _bridge_emit_json <body> — print a bridge response, or a structured stand-in
+# when the running bridge is older than the endpoint we just called (unknown
+# routes answer with a bare `Not found` text body). Callers that parse stdout
+# should never have to distinguish "old bridge" from "malformed JSON".
+_bridge_emit_json() {
+  local body="$1"
+  case "$body" in
+    '{'*) echo "$body" ;;
+    '')   ;;
+    *)    echo '{"ok":false,"reason":"unsupported-by-bridge"}' ;;
+  esac
+}
+
 # bridge_close <name>
+#
+# Reconciles the registry, not just the terminal object (bridge v0.19.0+).
+# Closing a name whose process is already gone removes the tracked row and
+# says so, instead of exiting 0 having done nothing and leaving a row that
+# only the untargeted `sweep` could clear (issue #41).
+#
+# Prints the bridge's JSON outcome so a caller can tell the cases apart:
+#   {"ok":true,...,"outcome":"closed"}       disposed a live terminal (or killed its pid)
+#   {"ok":true,...,"outcome":"row-removed"}  process was already gone; row cleaned up
+#   {"ok":false,...,"outcome":"not-tracked"} no such row — nothing to remove
+#
+# Exit status stays 0 in every one of those cases, including not-tracked: this
+# is a mutating verb that skills and cleanup paths call under `set -e`, and
+# "the terminal you asked to be gone is gone" is not a failure. Silent no-op
+# (no output at all) still means the bridge was unreachable.
 bridge_close() {
   _bridge_active || return 0
   local name="$1"
-  local port
+  local port out
   port=$(_bridge_port)
-  curl -fsS -m 1 --get --data-urlencode "name=$name" \
-    "http://127.0.0.1:${port}/close-terminal" >/dev/null 2>&1 || true
+  out=$(curl -sS -m 1 --get --data-urlencode "name=$name" \
+    "http://127.0.0.1:${port}/close-terminal" 2>/dev/null) || return 0
+  _bridge_emit_json "$out"
+  return 0
+}
+
+# bridge_forget <name> — drop a tracked row WITHOUT touching any process.
+#
+# The targeted counterpart to sweep: use it when a row is known-dead and you
+# want the bookkeeping cleared without sweep's blast radius (issue #22). Never
+# signals a pid, never disposes a terminal — if you want the process gone too,
+# that's bridge_close.
+bridge_forget() {
+  _bridge_active || return 0
+  local name="$1"
+  local port out
+  port=$(_bridge_port)
+  out=$(curl -sS -m 1 --get --data-urlencode "name=$name" \
+    "http://127.0.0.1:${port}/forget-terminal" 2>/dev/null) || return 0
+  _bridge_emit_json "$out"
+  return 0
 }
 
 # bridge_sweep — dispose every tracked terminal whose cwd no longer maps to a

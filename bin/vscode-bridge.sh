@@ -368,6 +368,45 @@ bridge_forget() {
   return 0
 }
 
+# bridge_bg_task <start|end|clear> [--name=<name>]
+#
+# Report OUTSTANDING BACKGROUND WORK (bridge v0.21.0+) — a dimension of its
+# own, not a status value. `status` is last-writer-wins, so a hook that
+# announced "background task running" used to be erased seconds later by the
+# Stop/Notification hook that announced the turn had ended, leaving the tab
+# reading needs-input while nothing needed a human (issue #40).
+#
+#   start   something is now outstanding (a Task was created, a job spawned)
+#   end     one outstanding thing finished
+#   clear   reset the count to zero
+#
+# Resolves the terminal name exactly as hook_status does when --name is
+# omitted, so it drops into hook wiring unchanged. Silent no-op outside VS Code.
+bridge_bg_task() {
+  _bridge_active || return 0
+  local op="" name=""
+  for arg in "$@"; do
+    case "$arg" in
+      --name=*)          name="${arg#--name=}" ;;
+      start|end|clear)   [ -z "$op" ] && op="$arg" ;;
+      *)                 : ;;
+    esac
+  done
+  if [ -z "$op" ]; then
+    echo "usage: bridgectl.sh bg-task {start|end|clear} [--name=<name>]" >&2
+    return 2
+  fi
+  [ -z "$name" ] && name="${CLAUDE_TAB_NAME:-}"
+  [ -z "$name" ] && name="${PWD##*/}"
+
+  local port
+  port=$(_bridge_port)
+  curl -fsS -m 1 --get \
+    --data-urlencode "name=$name" \
+    --data-urlencode "op=$op" \
+    "http://127.0.0.1:${port}/bg-task" >/dev/null 2>&1 || true
+}
+
 # bridge_sweep — dispose every tracked terminal whose cwd no longer maps to a
 # live `git worktree list` entry, returning {ok, closed:[names]}. Bridge
 # v0.12.0+; older bridges 404 and this no-ops. Safe (and idempotent) to fire
@@ -543,9 +582,18 @@ EOF
     "Notification":      [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status needs-input" }] }],
     "Stop":              [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status idle" }] }],
     "SubagentStart":     [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status subagent" }] }],
-    "SubagentStop":      [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status working" }] }]
+    "SubagentStop":      [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status working" }] }],
+
+    "TaskCreated":       [{ "hooks": [{ "type": "command", "command": "bash $ctl bg-task start" }] }],
+    "TaskCompleted":     [{ "hooks": [{ "type": "command", "command": "bash $ctl bg-task end" }] }]
   }
 }
+
+# TaskCreated/TaskCompleted drive a SEPARATE dimension from the status hooks
+# above, deliberately: an agent that starts a background task and then ends its
+# turn would otherwise have its bg-task status overwritten by Stop/Notification
+# and read as needs-input while nothing needed a human. Keep the pair wired
+# together — a start with no matching end leaves the count stuck above zero.
 EOF
       ;;
     *)

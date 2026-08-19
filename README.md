@@ -84,6 +84,7 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh close  <name>   # disposes the t
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh forget <name>   # removes the tracked row only, never touches a process
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh send   <name> <text>|--text-file=<path> [--no-submit] [--force] [--mode=...]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh list
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh bg-task {start|end|clear} [--name=<name>]   # outstanding background work
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh sweep
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh ping
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status <status> [--name=<name>]
@@ -242,7 +243,10 @@ curl "http://127.0.0.1:${PORT}/list"
       "updatedAt": "2026-08-05T11:52:04.019Z",
       "statusChangedAt": "2026-08-05T09:14:11.226Z",
       "lastHeartbeatAt": "2026-08-05T11:52:04.019Z",
-      "lastSendAt": "2026-08-05T11:51:58.004Z"
+      "lastSendAt": "2026-08-05T11:51:58.004Z",
+      "pendingTasks": 1, "bgTask": true,
+      "bgTaskStartedAt": "2026-08-05T11:44:30.007Z",
+      "displayStatus": "bg-task"
     }
   ]
 }
@@ -259,6 +263,9 @@ Status alone answers "what state is this in". The question an orchestrator actua
 | `statusChangedAt` | The status **value** changes. A `PreToolUse` hook firing `status=working` every few seconds does *not* reset it, or "how long has this been working" becomes unanswerable. |
 | `lastHeartbeatAt` | **Any** `/rename-terminal` call lands, including the idempotent no-ops. |
 | `lastSendAt` | A `/send-text` call **submits** text into this terminal (v0.20.0+). Staged text (`submit=0`) and refused sends don't stamp. |
+| `bgTaskStartedAt` | `pendingTasks` goes from 0 to 1 (v0.21.0+). Cleared when the count returns to 0, so it can't outlive the work it described. |
+
+`pendingTasks` / `bgTask` / `displayStatus` (v0.21.0+) carry the background-work dimension — see [`/bg-task`](#get-bg-task) for why that is separate from `status`. `status` remains the raw turn state; `displayStatus` is what the tab renders.
 
 `now` is the bridge's clock at response time, so callers compute ages against it rather than their own.
 
@@ -366,8 +373,8 @@ Renames a tracked terminal tab and optionally updates its icon and color. Suppor
 | `error` | `$(error)` | red | `PostToolUseFailure` / `StopFailure` — needs human eyes |
 | `compacting` | `$(archive)` | blue | `PreCompact` — auto-compaction running |
 | `subagent` | `$(symbol-array)` | magenta | `SubagentStart` — parallel sub-agent active |
-| `bg-task` | `$(server-process)` | blue | `TaskCreated` — background task queued/running |
-| `task-done` | `$(check-all)` | green | `TaskCompleted` — sticky "go look at this" badge |
+| `bg-task` | `$(server-process)` | blue | `TaskCreated` — **routed to the background-work dimension** (v0.21.0+), see below. Prefer `/bg-task?op=start` |
+| `task-done` | `$(check-all)` | green | `TaskCompleted` — decrements the background count when work is outstanding (v0.21.0+); otherwise a sticky "go look at this" badge |
 | `pr-open` | `$(pass-filled)` | green | After `gh pr create` |
 | `merged` | `$(git-merge)` | magenta | After merge |
 | `none` | *(strip prefix)* | *(unchanged)* | Manual reset |
@@ -420,6 +427,62 @@ Response (idempotent no-op):
 ```
 
 Returns `404` if the terminal is not in the registry (e.g. opened before the last reload).
+
+---
+
+### `GET /bg-task`
+
+Reports **outstanding background work**, which is a dimension of its own — not a `status=` value (v0.21.0+).
+
+| Parameter | Required | Description |
+| --------- | -------- | ----------- |
+| `name` | Yes | Registry name |
+| `op` | No | `start` (default) / `end` / `clear` |
+
+```bash
+curl "http://127.0.0.1:${PORT}/bg-task?name=my-task&op=start"   # a task is now outstanding
+curl "http://127.0.0.1:${PORT}/bg-task?name=my-task&op=end"     # one finished
+curl "http://127.0.0.1:${PORT}/bg-task?name=my-task&op=clear"   # reset the count
+```
+
+```json
+{
+  "ok": true, "name": "my-task", "op": "start",
+  "pendingTasks": 1, "bgTask": true,
+  "bgTaskStartedAt": "2026-08-19T14:45:15.367Z",
+  "status": "idle", "displayStatus": "bg-task",
+  "label": "$(server-process) my-task"
+}
+```
+
+#### Why this isn't a status
+
+`status` is a single last-writer-wins scalar, but the things being written into it are not mutually exclusive. Two independent dimensions were sharing one field:
+
+- **Turn state** — working / idle / waiting on input. Written by `PreToolUse`, `Notification`, `Stop`.
+- **Outstanding background work** — written by `TaskCreated` / `SubagentStart`.
+
+An agent that starts a background task and *then ends its turn* wrote `bg-task`, and `Notification`/`Stop` overwrote it moments later. Both writes were correct about their own dimension; collapsing them meant the later one silently erased the earlier — and the tab read `needs-input`, the one status that asserts a human is required, for exactly the interval the work was actually in flight. An orchestrator reading `/list` routed attention to a tab that needed nothing.
+
+Separate fields mean there are no precedence rules to get wrong, and the both-at-once case — genuinely blocked on a human *while* a task runs — is representable, which no single scalar can express.
+
+#### What the tab renders
+
+`/list` reports both dimensions raw; `displayStatus` is the derived value the tab shows:
+
+1. `needs-input`, `permission`, `error` — a human being required outranks a machine being busy.
+2. Otherwise `bg-task` if `pendingTasks > 0` — "idle" on a terminal with a job in flight is the reading that sent an orchestrator to the wrong tab.
+3. Otherwise the raw turn state.
+
+That precedence is a **display** decision only. `status`, `pendingTasks`, and `bgTask` stay orthogonal in the data, so a consumer can apply its own rule.
+
+#### Existing hook wiring keeps working
+
+`status=bg-task` arriving on `/rename-terminal` is routed into this dimension instead of overwriting the turn state, and `status=task-done` decrements it — so hooks already wired against those values are fixed without editing anyone's `settings.json`. `task-done` on a terminal with **nothing** outstanding still behaves as the manual completion badge it always was.
+
+Keep `start` and `end` wired as a pair: a start with no matching end leaves the count above zero indefinitely. The bridge will not guess — it never derives one dimension from the staleness of another (`bgTaskStartedAt` is reported so you can apply your own threshold).
+
+Via the bundled client: `bash ~/.vscode-terminal-bridge/bin/bridgectl.sh bg-task start` (resolves the terminal name from `$CLAUDE_TAB_NAME` / cwd exactly like `hook-status`).
 
 ---
 
@@ -616,8 +679,8 @@ Use `status=` for all lifecycle hooks — the bridge owns the codicon + color ma
 | `PostToolUseFailure` / `StopFailure` | `error` | `$(error) my-task` | Red |
 | `PreCompact` | `compacting` | `$(archive) my-task` | Blue |
 | `SubagentStart` | `subagent` | `$(symbol-array) my-task` | Magenta |
-| `TaskCreated` | `bg-task` | `$(server-process) my-task` | Blue |
-| `TaskCompleted` | `task-done` | `$(check-all) my-task` | Green |
+| `TaskCreated` | `bg-task start` *(a separate dimension — see [`/bg-task`](#get-bg-task))* | `$(server-process) my-task` | Blue |
+| `TaskCompleted` | `bg-task end` | reverts to the turn state | — |
 
 The `hubot` icon set at creation persists as the Claude-session identity marker throughout — `status=` never touches `iconPath`.
 
@@ -668,10 +731,38 @@ Copy this into `~/.claude/settings.json` (or merge into your existing `hooks` ke
           }
         ]
       }
+    ],
+    "TaskCreated": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.vscode-terminal-bridge/bin/bridgectl.sh bg-task start",
+            "async": true,
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "TaskCompleted": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.vscode-terminal-bridge/bin/bridgectl.sh bg-task end",
+            "async": true,
+            "timeout": 2
+          }
+        ]
+      }
     ]
   }
 }
 ```
+
+`TaskCreated` / `TaskCompleted` write the **background-work dimension**, not `status` — that's what stops an agent waiting on a job it started from reporting `needs-input` the moment its turn ends. Wire them as a pair; see [`/bg-task`](#get-bg-task).
 
 > **Why `async: true`?** Hook commands run synchronously by default and block Claude's response. `async: true` fires the curl in the background so it adds no latency.
 >

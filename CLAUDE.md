@@ -28,6 +28,16 @@ Two things the bridge deliberately does not do: it never derives status from sta
 
 `pidAlive` tracks the terminal's **shell**, not the agent inside it. A crashed `claude` usually leaves a live shell prompt behind, so `pidAlive` stays true — it catches the tab-is-gone case, nothing more.
 
+## Background work is a second dimension, not a status (v0.21.0+)
+
+`status` is last-writer-wins, and the states written into it aren't mutually exclusive. Turn state (`working`/`idle`/`needs-input`, from `PreToolUse`/`Notification`/`Stop`) and outstanding background work (`bg-task`, from `TaskCreated`) were sharing one field. An agent that started a background task and then ended its turn wrote `bg-task` and had it overwritten moments later — so the tab read `needs-input`, the one status asserting a human is required, for exactly the interval the work was in flight. An orchestrator reading `list` sent attention to a tab that needed nothing.
+
+So the count lives in `pendingTasks` / `bgTask` / `bgTaskStartedAt`, written by `/bg-task?op=start|end|clear` and never by `status`. The both-at-once case — blocked on a human *while* a task runs — is now representable, which no single scalar can express.
+
+`list` reports both dimensions raw plus `displayStatus`, the derived value the tab renders: prompt/error states first (a human being required outranks a machine being busy), then `bg-task` when anything is outstanding, then the raw turn state. That precedence is display-only; consumers can apply their own.
+
+Existing wiring is routed rather than broken: `status=bg-task` on `/rename-terminal` counts up without touching turn state, and `status=task-done` counts down *when something is outstanding* — on a terminal with nothing pending it stays the manual completion badge it always was. Wire `start`/`end` as a pair; a start with no end leaves the count stuck, and the bridge won't guess (it reports `bgTaskStartedAt` and lets you pick a threshold).
+
 ## `close` removes the row, not just the tab (v0.19.0+)
 
 `close` used to operate on the VS Code terminal object and treat "no such object" as nothing-to-do. A terminal whose process had already exited therefore left a registry row that no *targeted* verb could remove — `sweep` was the only escape, and `sweep` takes no target, so clearing one dead row meant risking every live worktree tab (#22). Rows accumulated permanently, and `list` — the orchestrator's only status query — accumulated permanent false entries.
@@ -58,7 +68,8 @@ All endpoints are GET with query-string params (not POST/JSON — see `extension
 | `/close-terminal` | Close a named terminal (falls back to PID kill if registry desynced; always reconciles the registry row) |
 | `/forget-terminal` | Drop a tracked registry row without touching any process |
 | `/rename-terminal` | Rename / set status icon via `status=` (or `label=`, or `quiet=1`) |
-| `/list` | Query tracked terminals (name, cwd, status, pid, live, timestamps) |
+| `/list` | Query tracked terminals (name, cwd, status, pid, live, timestamps, background work) |
+| `/bg-task` | Report outstanding background work (`op=start|end|clear`) — a dimension of its own, not a status |
 | `/send-text` | Inject text into an already-running tracked terminal (`text=` or `textFile=`) |
 | `/sweep` | Dispose terminals whose cwd no longer maps to a live `git worktree` |
 | `/add-folder` / `/remove-folder` | Attach/detach a workspace folder |
@@ -75,6 +86,7 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh status <name> <state>
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh send <name> <text>|--text-file=<path>
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh close <name>
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh forget <name>
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh bg-task {start|end|clear} [--name=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status <status> [--name=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend {cline|claude} [--dir=<repo>]
 ```
@@ -91,6 +103,9 @@ Source of these scripts is `bin/` in this repo — edit there, not the installed
 | `needs-input` | bell | yellow |
 | `subagent` | array symbol | magenta |
 | `task-done` | checkmark | green |
+| `bg-task` | server process | blue |
+
+`bg-task` and `task-done` are routed to the background-work dimension when sent as `status=` — see above.
 
 ## Spawning a named terminal
 

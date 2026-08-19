@@ -37,6 +37,7 @@ case "$sub" in
   status) bridge_status "$@" ;;
   rename) bridge_rename "$@" ;;
   sweep)  bridge_sweep  "$@" ;;
+  bg-task) bridge_bg_task "$@" ;;
   list)   bridge_list   "$@" ;;
   hook-status) bridge_hook_status "$@" ;;
   scaffold)    bridge_scaffold    "$@" ;;
@@ -48,13 +49,14 @@ case "$sub" in
     fi
     ;;
   *)
-    echo "usage: bridgectl.sh {open|close|forget|send|status|rename|sweep|list|ping|hook-status|scaffold} [args...]" >&2
+    echo "usage: bridgectl.sh {open|close|forget|send|status|rename|sweep|list|ping|hook-status|bg-task|scaffold} [args...]" >&2
     echo "       bridgectl.sh open <name> <cwd> [cmd] [icon] [color] [--node=<name>] [--ref=<ref>] [--cmd-file=<path>]" >&2
     echo "       bridgectl.sh send <name> <text>|--text-file=<path> [--no-submit] [--force] [--mode=auto|paste|literal|join]" >&2
     echo "         (send refuses when the target sits at an interactive prompt — injected text would answer it. --force overrides.)" >&2
     echo "         (exit 0 means delivered to the terminal, not read: confirm pickup by comparing lastSendAt vs lastHeartbeatAt in \`list\`.)" >&2
     echo "       bridgectl.sh close <name>    # disposes the terminal AND removes its tracked row; prints outcome JSON" >&2
     echo "       bridgectl.sh forget <name>   # removes the tracked row only, never touches a process" >&2
+    echo "       bridgectl.sh bg-task {start|end|clear} [--name=<name>]   # outstanding background work — a dimension of its own, not a status" >&2
     echo "       bridgectl.sh hook-status <status> [--name=<name>]   # reads Cline's stdin payload or Claude's env" >&2
     echo "       bridgectl.sh scaffold --backend {cline|claude} [--dir=<repo>] [--force]" >&2
     echo "       bridgectl.sh ping --node <name>" >&2

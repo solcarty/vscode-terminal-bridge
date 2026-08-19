@@ -368,6 +368,103 @@ bridge_forget() {
   return 0
 }
 
+# bridge_hook_output   (stdin: a Stop / SubagentStop hook payload)
+#
+# Publishes the turn's final assistant text so an orchestrating session can
+# read back what a worker SAID, without a human relaying it (bridge v0.23.0+).
+#
+# Wire it on Stop alongside the status hook:
+#   "Stop": [{ "hooks": [
+#     { "type": "command", "command": "bash <ctl> hook-status idle" },
+#     { "type": "command", "command": "bash <ctl> hook-output" }
+#   ]}]
+#
+# Reads `last_assistant_message` straight out of the hook payload. It does NOT
+# tail the transcript at `transcript_path`: the transcript is written
+# asynchronously and can lag the live conversation, and parsing it would couple
+# the bridge to Claude Code's on-disk format, which is not ours to depend on.
+#
+# Degrades to a silent no-op — no payload, no such field, an empty turn, no
+# node, no bridge. A hook that fires on every Stop must never fail the turn.
+bridge_hook_output() {
+  local name="" payload=""
+  for arg in "$@"; do
+    case "$arg" in --name=*) name="${arg#--name=}" ;; esac
+  done
+
+  [ -t 0 ] && return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    payload="$payload$line"
+  done
+  [ -z "$payload" ] && return 0
+
+  command -v node >/dev/null 2>&1 || return 0
+
+  local tmp
+  tmp=$(mktemp) || return 0
+  # last_assistant_message is a plain string today; tolerate the content-block
+  # array shape too rather than silently publishing "[object Object]".
+  printf '%s' "$payload" | node -e '
+    let raw = "";
+    process.stdin.on("data", c => raw += c);
+    process.stdin.on("end", () => {
+      let j;
+      try { j = JSON.parse(raw); } catch { process.exit(0); }
+      const m = j.last_assistant_message;
+      let text = "";
+      if (typeof m === "string") text = m;
+      else if (Array.isArray(m)) text = m.filter(b => b && b.type === "text").map(b => b.text).join("\n");
+      else if (m && typeof m === "object" && typeof m.text === "string") text = m.text;
+      process.stdout.write(text);
+    });
+  ' > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+
+  if [ ! -s "$tmp" ]; then rm -f "$tmp"; return 0; fi
+
+  if _bridge_active; then
+    [ -z "$name" ] && name="${CLAUDE_TAB_NAME:-}"
+    [ -z "$name" ] && name="${PWD##*/}"
+    local port
+    port=$(_bridge_port)
+    curl -fsS -m 2 --get \
+      --data-urlencode "name=$name" --data-urlencode "textFile=$tmp" \
+      "http://127.0.0.1:${port}/set-output" >/dev/null 2>&1 || true
+  fi
+  rm -f "$tmp"
+}
+
+# bridge_output <name> [--n=<1..3>] — read back what a terminal last said.
+#
+# A QUERY, so it fails loudly like bridge_list rather than no-opping: an empty
+# stdout would be indistinguishable from "the agent has said nothing", which is
+# the exact ambiguity this whole endpoint exists to remove.
+bridge_output() {
+  local name="" n="1"
+  for arg in "$@"; do
+    case "$arg" in
+      --n=*)    n="${arg#--n=}" ;;
+      --name=*) name="${arg#--name=}" ;;
+      *)        [ -z "$name" ] && name="$arg" ;;
+    esac
+  done
+  [ -z "$name" ] && name="${CLAUDE_TAB_NAME:-${PWD##*/}}"
+
+  if ! _bridge_active; then
+    echo '{"ok":false,"reason":"bridge-unreachable"}'
+    return 1
+  fi
+  local port out
+  port=$(_bridge_port)
+  if ! out=$(curl -sS -m 2 --get \
+      --data-urlencode "name=$name" --data-urlencode "n=$n" \
+      "http://127.0.0.1:${port}/output" 2>/dev/null); then
+    echo '{"ok":false,"reason":"bridge-unreachable"}'
+    return 1
+  fi
+  _bridge_emit_json "$out"
+  case "$out" in *'"ok":true'*) return 0 ;; *) return 1 ;; esac
+}
+
 # bridge_note set <text>|--text-file=<path> [--name=<name>]
 # bridge_note get [<name>]
 # bridge_note clear [--name=<name>]
@@ -688,7 +785,8 @@ EOF
   "hooks": {
     "PreToolUse":        [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status working" }] }],
     "Notification":      [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status needs-input" }] }],
-    "Stop":              [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status idle" }] }],
+    "Stop":              [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status idle" },
+                                      { "type": "command", "command": "bash $ctl hook-output" }] }],
     "SubagentStart":     [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status subagent" }] }],
     "SubagentStop":      [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status working" }] }],
 

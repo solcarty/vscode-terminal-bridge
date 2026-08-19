@@ -2,6 +2,12 @@
 // bridge's HTTP surface can be driven from plain node — no VS Code, no VSIX
 // install, no window reload.
 //
+// The bridge under test runs IN THIS PROCESS. A test that shells out to the
+// bundled CLI must therefore spawn it asynchronously — spawnSync blocks the
+// event loop that would answer the CLI's HTTP request, so its curl times out
+// and the command silently no-ops (which is what every bridge verb does when
+// it can't reach a bridge, so the test fails looking like a product bug).
+//
 // Always run through `npm test` (test/run.js). It points $HOME at a throwaway
 // directory and moves the port range, because activate() writes
 // ~/.vscode-terminal-bridge/port and binds from 31415 — against a real $HOME

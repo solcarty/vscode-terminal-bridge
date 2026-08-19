@@ -39,6 +39,8 @@ case "$sub" in
   sweep)  bridge_sweep  "$@" ;;
   bg-task) bridge_bg_task "$@" ;;
   note)    bridge_note    "$@" ;;
+  output)  bridge_output  "$@" ;;
+  hook-output) bridge_hook_output "$@" ;;
   list)   bridge_list   "$@" ;;
   hook-status) bridge_hook_status "$@" ;;
   scaffold)    bridge_scaffold    "$@" ;;
@@ -50,13 +52,15 @@ case "$sub" in
     fi
     ;;
   *)
-    echo "usage: bridgectl.sh {open|close|forget|send|status|rename|sweep|list|ping|hook-status|bg-task|note|scaffold} [args...]" >&2
+    echo "usage: bridgectl.sh {open|close|forget|send|status|rename|sweep|list|ping|hook-status|hook-output|bg-task|note|output|scaffold} [args...]" >&2
     echo "       bridgectl.sh open <name> <cwd> [cmd] [icon] [color] [--node=<name>] [--ref=<ref>] [--cmd-file=<path>]" >&2
     echo "       bridgectl.sh send <name> <text>|--text-file=<path> [--no-submit] [--force] [--mode=auto|paste|literal|join]" >&2
     echo "         (send refuses when the target sits at an interactive prompt — injected text would answer it. --force overrides.)" >&2
     echo "         (exit 0 means delivered to the terminal, not read: confirm pickup by comparing lastSendAt vs lastHeartbeatAt in \`list\`.)" >&2
     echo "       bridgectl.sh close <name>    # disposes the terminal AND removes its tracked row; prints outcome JSON" >&2
     echo "       bridgectl.sh forget <name>   # removes the tracked row only, never touches a process" >&2
+    echo "       bridgectl.sh output <name> [--n=<1..3>]   # read back what the agent last said (needs the Stop hook-output hook)" >&2
+    echo "       bridgectl.sh hook-output   # Stop/SubagentStop hook: publishes last_assistant_message from the payload on stdin" >&2
     echo "       bridgectl.sh note set <text>|--text-file=<path> [--name=<name>]   # publish a handoff for an orchestrator to read" >&2
     echo "       bridgectl.sh note get [<name>] | note clear [--name=<name>]" >&2
     echo "       bridgectl.sh bg-task {start|end|clear} [--name=<name>]   # outstanding background work — a dimension of its own, not a status" >&2

@@ -44,12 +44,17 @@ const JOBS_DIR = path.join(os.homedir(), '.vscode-terminal-bridge', 'jobs');
 
 const JOB_ID_RE = /^[a-zA-Z0-9._-]+$/;
 
+// Matches the bridge's own note cap. A handoff summary, not a log — detail
+// belongs in the job's output and in whatever the job wrote to disk locally.
+const MAX_NOTE_BYTES = 4096;
+
 function jobPaths(jobId) {
   const dir = path.join(JOBS_DIR, jobId);
   return {
     dir,
     log: path.join(dir, 'log'),
     exitCode: path.join(dir, 'exit-code'),
+    note: path.join(dir, 'note'),
     swept: path.join(dir, 'swept'),
     worktree: path.join(WORKTREES_DIR, jobId),
   };
@@ -132,7 +137,16 @@ async function handleRunJob(req, res) {
 
     await execAsync(`git -C ${shQuote(REPO_DIR)} worktree add ${shQuote(worktree)} ${shQuote(sha)}`);
 
-    const inner = `cd ${shQuote(worktree)} && { ${cmd} ; } > ${shQuote(log)} 2>&1; echo $? > ${shQuote(exitCode)}`;
+    // Export the job's identity into its own environment so anything running
+    // inside it — `bridgectl note set`, most usefully — can reach this daemon
+    // without being told where it is. There's no shared filesystem with the
+    // orchestrating laptop, so this is the only rail a note can ride.
+    const env = [
+      `export WORKER_JOB_ID=${shQuote(jobId)}`,
+      `export WORKER_PORT=${shQuote(String(PORT))}`,
+      `export WORKER_TOKEN=${shQuote(TOKEN)}`,
+    ].join('; ');
+    const inner = `${env}; cd ${shQuote(worktree)} && { ${cmd} ; } > ${shQuote(log)} 2>&1; echo $? > ${shQuote(exitCode)}`;
     await execAsync(`rmux new-session -d -s ${shQuote(jobId)} bash -lc ${shQuote(inner)}`);
 
     sendJson(res, 200, { ok: true, jobId, ref, sha });
@@ -150,7 +164,7 @@ async function handleJobStatus(req, res, url) {
     return;
   }
 
-  const { log, exitCode: exitCodePath } = jobPaths(jobId);
+  const { log, exitCode: exitCodePath, note: notePath } = jobPaths(jobId);
 
   const done = fs.existsSync(exitCodePath);
   const code = done ? parseInt(fs.readFileSync(exitCodePath, 'utf8').trim(), 10) : null;
@@ -175,9 +189,50 @@ async function handleJobStatus(req, res, url) {
     }
   }
 
+  // The note (if the job published one) rides back with the status poll —
+  // bridge-tail relays it into the orchestrator's bridge. Read before the
+  // sweep below, which removes the worktree but not the job dir.
+  let note = null;
+  let noteUpdatedAt = null;
+  if (fs.existsSync(notePath)) {
+    note = fs.readFileSync(notePath, 'utf8');
+    noteUpdatedAt = fs.statSync(notePath).mtime.toISOString();
+  }
+
   if (done && code === 0) await sweepWorktree(jobId);
 
-  sendJson(res, 200, { ok: true, done, exitCode: code, running, logChunk, nextOffset });
+  sendJson(res, 200, { ok: true, done, exitCode: code, running, logChunk, nextOffset, note, noteUpdatedAt });
+}
+
+// A job publishing a handoff for the orchestrator that started it. The body is
+// the note text; the daemon stores it next to the job's log and hands it back
+// on the next /job-status poll.
+async function handleJobNote(req, res, url) {
+  const jobId = url.searchParams.get('id');
+  if (!jobId || !JOB_ID_RE.test(jobId)) {
+    sendJson(res, 400, { ok: false, error: 'id must match [a-zA-Z0-9._-]+' });
+    return;
+  }
+
+  const { dir, note: notePath } = jobPaths(jobId);
+  const raw = await readBody(req);
+
+  let body = raw;
+  let truncated = false;
+  if (Buffer.byteLength(raw, 'utf8') > MAX_NOTE_BYTES) {
+    body = Buffer.from(raw, 'utf8').subarray(0, MAX_NOTE_BYTES).toString('utf8').replace(/\uFFFD$/, '');
+    truncated = true;
+  }
+
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(notePath, body);
+  } catch (err) {
+    sendJson(res, 500, { ok: false, error: err.message });
+    return;
+  }
+
+  sendJson(res, 200, { ok: true, jobId, bytes: Buffer.byteLength(body, 'utf8'), truncated, maxBytes: MAX_NOTE_BYTES });
 }
 
 async function handleSweepJob(req, res, url) {
@@ -203,6 +258,8 @@ const server = http.createServer(async (req, res) => {
     await handleRunJob(req, res);
   } else if (req.method === 'GET' && url.pathname === '/job-status') {
     await handleJobStatus(req, res, url);
+  } else if (req.method === 'POST' && url.pathname === '/job-note') {
+    await handleJobNote(req, res, url);
   } else if (req.method === 'POST' && url.pathname === '/sweep-job') {
     await handleSweepJob(req, res, url);
   } else if (req.method === 'GET' && url.pathname === '/ping') {

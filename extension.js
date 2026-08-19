@@ -339,6 +339,67 @@ async function parseWorktrees() {
 }
 
 // ---------------------------------------------------------------------------
+// Notes: let a worker publish a short handoff its orchestrator can read.
+//
+// The tractable subset of "read a terminal's output" (#32): most of what an
+// orchestrator needs from a worker isn't the raw buffer, it's a handful of
+// facts — am I done, what did I ship, what needs deciding, what did I touch.
+// That doesn't require reading output at all, only the worker being able to
+// publish it.
+//
+// Stored server-side in the registry next to `status`, never on the caller's
+// disk, for the same reason `status` works that way: a worker may be running
+// on another machine, where there is no shared filesystem with the
+// orchestrating session.
+//
+// The bridge does NOT validate note contents — same principle as never
+// deriving status from staleness. A note is a self-report, and one that reads
+// like a report carries more authority than a status colour does; the README
+// recommends a receipts format (pointers the orchestrator can independently
+// check) rather than the bridge trying to police prose.
+const MAX_NOTE_BYTES = 4096;
+
+async function setNote(context, name, text) {
+  const meta = loadMetadata(context);
+  if (!meta[name]) return null;  // never conjure an entry for an untracked name
+
+  // Truncate rather than reject: a handoff arriving clipped still carries the
+  // state/shipped lines at its head, where the recommended format puts the
+  // facts. Rejecting would lose the whole thing over a detail at the end.
+  // Cut on a character boundary so the stored note stays valid UTF-8.
+  const raw = String(text ?? '');
+  let body = raw;
+  let truncated = false;
+  if (Buffer.byteLength(raw, 'utf8') > MAX_NOTE_BYTES) {
+    const buf = Buffer.from(raw, 'utf8').subarray(0, MAX_NOTE_BYTES);
+    body = buf.toString('utf8').replace(/\uFFFD$/, '');
+    truncated = true;
+  }
+
+  const now = new Date().toISOString();
+  meta[name] = {
+    ...meta[name],
+    note: body,
+    noteUpdatedAt: now,
+    noteTruncated: truncated,
+    noteBytes: Buffer.byteLength(body, 'utf8'),
+  };
+  await context.workspaceState.update(METADATA_KEY, meta);
+  return { noteUpdatedAt: now, truncated, bytes: meta[name].noteBytes };
+}
+
+async function clearNote(context, name) {
+  const meta = loadMetadata(context);
+  if (!meta[name]) return null;
+  meta[name] = {
+    ...meta[name],
+    note: null, noteUpdatedAt: null, noteTruncated: false, noteBytes: 0,
+  };
+  await context.workspaceState.update(METADATA_KEY, meta);
+  return { cleared: true };
+}
+
+// ---------------------------------------------------------------------------
 // Background work is a SECOND dimension, not a status value (issue #40).
 //
 // `status` is a last-writer-wins scalar, but the things written into it aren't
@@ -1064,6 +1125,92 @@ function activate(context) {
         ...(shown.noOp ? { noOp: true } : {}),
       }));
 
+    } else if (url.pathname === '/set-note' || url.pathname === '/clear-note') {
+      // Worker → orchestrator handoff. Parameter shape mirrors /send-text:
+      //   text=      inline note
+      //   textFile=  path whose CONTENTS become the note
+      const name = url.searchParams.get('name');
+      if (!name) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'name param required' }));
+        return;
+      }
+
+      if (url.pathname === '/clear-note') {
+        const cleared = await clearNote(context, name);
+        if (!cleared) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Terminal not found', name }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, name, cleared: true, noteUpdatedAt: null }));
+        return;
+      }
+
+      const noteFile = url.searchParams.get('textFile') || undefined;
+      let text = url.searchParams.get('text');
+      if (noteFile) {
+        try {
+          text = fs.readFileSync(noteFile, 'utf8');
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `Could not read textFile: ${err.message}`, textFile: noteFile }));
+          return;
+        }
+      }
+      if (text === null || text === undefined || text === '') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Provide text= or textFile= (use /clear-note to remove a note)' }));
+        return;
+      }
+
+      const stored = await setNote(context, name, text);
+      if (!stored) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Terminal not found', name }));
+        return;
+      }
+
+      // Publishing a note is the agent reporting in, so it counts as liveness.
+      await touchHeartbeat(context, name);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true, name,
+        noteUpdatedAt: stored.noteUpdatedAt,
+        bytes: stored.bytes,
+        truncated: stored.truncated,
+        maxBytes: MAX_NOTE_BYTES,
+      }));
+
+    } else if (url.pathname === '/note') {
+      // The read half. Deliberately NOT part of /list: an orchestrator polls
+      // /list constantly, and inlining N note bodies would make every triage
+      // pass expensive. /list carries noteUpdatedAt; bodies are fetched only
+      // for the entries that have something new.
+      const name = url.searchParams.get('name');
+      if (!name) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'name param required' }));
+        return;
+      }
+      const meta = loadMetadata(context)[name];
+      if (!meta) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Terminal not found', name }));
+        return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true, name,
+        note: meta.note ?? null,
+        noteUpdatedAt: meta.noteUpdatedAt ?? null,
+        truncated: meta.noteTruncated ?? false,
+        bytes: meta.noteBytes ?? 0,
+      }));
+
     } else if (url.pathname === '/bg-task') {
       // The explicit write path for the background-work dimension, for hooks
       // that can say what they mean rather than borrowing a status value.
@@ -1323,6 +1470,12 @@ function activate(context) {
         bgTask: (Number(meta.pendingTasks) || 0) > 0,
         bgTaskStartedAt: meta.bgTaskStartedAt ?? null,
         displayStatus: displayStatusKey(meta),
+        // v0.22.0+ — the note's TIMESTAMP only. Bodies are fetched per-entry
+        // via /note; inlining them here would make the poll an orchestrator
+        // runs constantly proportional to how much everyone has written.
+        noteUpdatedAt: meta.noteUpdatedAt ?? null,
+        noteBytes: meta.noteBytes ?? 0,
+        noteTruncated: meta.noteTruncated ?? false,
       }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, now: new Date().toISOString(), terminals: list }));

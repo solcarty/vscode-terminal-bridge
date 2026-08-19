@@ -2,7 +2,7 @@
   "name": "terminal-bridge",
   "displayName": "SDO Terminal Bridge",
   "description": "Opens named terminal tabs via HTTP — used by /worktree-start",
-  "version": "0.21.0",
+  "version": "0.22.0",
   "scripts": {
     "test": "node test/run.js"
   },

@@ -58,6 +58,18 @@ Exit 0 means *written to the terminal*, not *read and acted on* — `sendText` q
 
 Confirm pickup by comparing `lastSendAt` (stamped on a submitted send, v0.20.0+) against `lastHeartbeatAt` in `list`: heartbeat older than send means delivered-but-not-picked-up, heartbeat newer means the agent has acted since your text landed. A status transition is not a substitute — hooks fire on tool calls, so an agent that reasons before acting still reads `needs-input` well after your text arrived, and a transition that does happen can't be attributed to your send. `send` deliberately does *not* flip status itself: that would assert a transition the bridge hasn't observed, and it breaks worst at a permission prompt, where injected text is consumed as an answer that may not unblock anything. Reading a terminal's output back is a separate, unsolved problem (issue #32).
 
+## `note` is the worker's half of the loop (v0.22.0+)
+
+`send` gets a message *into* a running session; a note is how that session reports back. It's the tractable subset of #32: most of what an orchestrator needs isn't the raw terminal buffer, it's *am I done, what did I ship, what needs deciding, what did I touch* — which requires only that the worker can publish it.
+
+Three things are load-bearing:
+
+- **`list` returns `noteUpdatedAt`, never the body.** An orchestrator polls `list` constantly; inlining bodies would make every triage pass proportional to how much everyone wrote. Fetch bodies from `note get` only for entries whose timestamp moved.
+- **Notes go through the bridge, not a file on disk.** A worker may be on another machine with no shared filesystem. `bridgectl note set` inside a remote job posts to that machine's worker daemon (`/job-note`, using `WORKER_JOB_ID`/`WORKER_TOKEN` exported into the job), and `bridge-tail.sh` relays it home on the next `/job-status` poll — same command wherever the worker runs.
+- **Over 4KB is truncated, not rejected**, on a character boundary, with `truncated: true` reported. A clipped handoff still carries the facts at its head; this is a summary, not a log.
+
+A note is a **self-report**, with more authority than a status colour because it reads like a report. Write receipts, not prose — `shipped: pr=<n> branch=<b> sha=<sha>`, `touched: env=shared-dev mutations=1 row` — so the orchestrator can reconcile against git/PR state rather than relay a claim. The bridge deliberately does not validate note contents, the same way it never derives status from staleness.
+
 ## Key endpoints
 
 All endpoints are GET with query-string params (not POST/JSON — see `extension.js`).
@@ -71,6 +83,7 @@ All endpoints are GET with query-string params (not POST/JSON — see `extension
 | `/list` | Query tracked terminals (name, cwd, status, pid, live, timestamps, background work) |
 | `/bg-task` | Report outstanding background work (`op=start|end|clear`) — a dimension of its own, not a status |
 | `/send-text` | Inject text into an already-running tracked terminal (`text=` or `textFile=`) |
+| `/set-note` · `/note` · `/clear-note` | A worker's short handoff for its orchestrator (`text=` / `textFile=`) |
 | `/sweep` | Dispose terminals whose cwd no longer maps to a live `git worktree` |
 | `/add-folder` / `/remove-folder` | Attach/detach a workspace folder |
 | `/reindex` | Re-link open terminals to persisted metadata |
@@ -86,6 +99,8 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh status <name> <state>
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh send <name> <text>|--text-file=<path>
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh close <name>
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh forget <name>
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note set <text>|--text-file=<path> [--name=<name>]
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note get <name>
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh bg-task {start|end|clear} [--name=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status <status> [--name=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend {cline|claude} [--dir=<repo>]

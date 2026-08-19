@@ -52,23 +52,43 @@ while true; do
     continue
   }
 
-  # First line is "META <done> <exitCode> <nextOffset>"; everything after is
-  # the raw log chunk to print verbatim.
+  # First line is "META <done> <exitCode> <nextOffset> <noteUpdatedAt>";
+  # everything after is the raw log chunk to print verbatim.
   out=$(node -e '
     let raw = "";
     process.stdin.on("data", c => raw += c);
     process.stdin.on("end", () => {
       const j = JSON.parse(raw);
-      process.stdout.write(`META ${j.done ? 1 : 0} ${j.exitCode ?? ""} ${j.nextOffset}\n`);
+      process.stdout.write(`META ${j.done ? 1 : 0} ${j.exitCode ?? ""} ${j.nextOffset} ${j.noteUpdatedAt ?? "-"}\n`);
       if (j.logChunk) process.stdout.write(j.logChunk);
     });
   ' <<< "$resp")
 
   meta_line=$(printf '%s\n' "$out" | head -n1)
-  read -r _ done_flag exit_code next_offset <<< "$meta_line"
+  read -r _ done_flag exit_code next_offset note_updated <<< "$meta_line"
   printf '%s\n' "$out" | tail -n +2
 
   offset="$next_offset"
+
+  # Relay a published note into the LOCAL bridge. A remote job has no shared
+  # filesystem with the orchestrating session and can't reach its 127.0.0.1
+  # bridge, so this poll is the only rail a note can ride home. Only on change,
+  # so a static note isn't rewritten every three seconds.
+  if [ -n "${note_updated:-}" ] && [ "$note_updated" != "-" ] && [ "$note_updated" != "${last_note_updated:-}" ]; then
+    note_tmp=$(mktemp)
+    if node -e '
+      let raw = "";
+      process.stdin.on("data", c => raw += c);
+      process.stdin.on("end", () => {
+        const j = JSON.parse(raw);
+        if (j.note) process.stdout.write(j.note);
+      });
+    ' <<< "$resp" > "$note_tmp" && [ -s "$note_tmp" ]; then
+      bridge_note set --text-file="$note_tmp" --name="$tab_name"
+      last_note_updated="$note_updated"
+    fi
+    rm -f "$note_tmp"
+  fi
 
   if [ "$done_flag" = "1" ]; then
     if [ "$exit_code" = "0" ]; then

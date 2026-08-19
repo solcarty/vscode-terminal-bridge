@@ -368,6 +368,114 @@ bridge_forget() {
   return 0
 }
 
+# bridge_note set <text>|--text-file=<path> [--name=<name>]
+# bridge_note get [<name>]
+# bridge_note clear [--name=<name>]
+#
+# A short handoff a worker publishes for its orchestrator to read (bridge
+# v0.22.0+) — the tractable subset of "read the terminal back" (#32). The
+# orchestrator sees noteUpdatedAt in `list` and fetches the body only for the
+# entries that changed.
+#
+# Notes ride the same rail as hook-status rather than a file on disk, because
+# a worker may not share a filesystem with the session orchestrating it. When
+# this runs inside a REMOTE job (WORKER_JOB_ID + WORKER_TOKEN exported into the
+# job by bin/worker.js), the note is posted to the worker daemon on that
+# machine, and bridge-tail.sh relays it into the laptop's bridge on its next
+# poll. Same command either way — the worker doesn't need to know where it is.
+#
+# `set`/`clear` are mutations and no-op silently when the bridge is
+# unreachable; `get` is a QUERY and fails loudly, like bridge_list.
+bridge_note() {
+  local sub="${1:-}"
+  shift || true
+
+  case "$sub" in
+    set)
+      local text="" text_file="" name=""
+      for arg in "$@"; do
+        case "$arg" in
+          --text-file=*) text_file="${arg#--text-file=}" ;;
+          --name=*)      name="${arg#--name=}" ;;
+          *)             [ -z "$text" ] && text="$arg" ;;
+        esac
+      done
+      if [ -z "$text" ] && [ -z "$text_file" ]; then
+        echo "usage: bridgectl.sh note set <text>|--text-file=<path> [--name=<name>]" >&2
+        return 2
+      fi
+
+      # Remote job: post to the worker daemon on THIS machine; bridge-tail
+      # relays it to the orchestrator's bridge.
+      if [ -n "${WORKER_JOB_ID:-}" ] && [ -n "${WORKER_TOKEN:-}" ]; then
+        local wport="${WORKER_PORT:-31416}"
+        if [ -n "$text_file" ]; then
+          curl -fsS -m 5 -X POST -H "Authorization: Bearer $WORKER_TOKEN" \
+            --data-binary "@$text_file" \
+            "http://127.0.0.1:${wport}/job-note?id=${WORKER_JOB_ID}" >/dev/null 2>&1 || true
+        else
+          curl -fsS -m 5 -X POST -H "Authorization: Bearer $WORKER_TOKEN" \
+            --data-binary "$text" \
+            "http://127.0.0.1:${wport}/job-note?id=${WORKER_JOB_ID}" >/dev/null 2>&1 || true
+        fi
+        return 0
+      fi
+
+      _bridge_active || return 0
+      [ -z "$name" ] && name="${CLAUDE_TAB_NAME:-}"
+      [ -z "$name" ] && name="${PWD##*/}"
+      local port
+      port=$(_bridge_port)
+      if [ -n "$text_file" ]; then
+        curl -fsS -m 2 --get \
+          --data-urlencode "name=$name" --data-urlencode "textFile=$text_file" \
+          "http://127.0.0.1:${port}/set-note" >/dev/null 2>&1 || true
+      else
+        curl -fsS -m 2 --get \
+          --data-urlencode "name=$name" --data-urlencode "text=$text" \
+          "http://127.0.0.1:${port}/set-note" >/dev/null 2>&1 || true
+      fi
+      ;;
+
+    get)
+      local name="${1:-}"
+      case "$name" in --name=*) name="${name#--name=}" ;; esac
+      [ -z "$name" ] && name="${CLAUDE_TAB_NAME:-${PWD##*/}}"
+      if ! _bridge_active; then
+        echo '{"ok":false,"reason":"bridge-unreachable"}'
+        return 1
+      fi
+      local port out
+      port=$(_bridge_port)
+      if ! out=$(curl -sS -m 2 --get --data-urlencode "name=$name" \
+        "http://127.0.0.1:${port}/note" 2>/dev/null); then
+        echo '{"ok":false,"reason":"bridge-unreachable"}'
+        return 1
+      fi
+      _bridge_emit_json "$out"
+      case "$out" in *'"ok":true'*) return 0 ;; *) return 1 ;; esac
+      ;;
+
+    clear)
+      _bridge_active || return 0
+      local name=""
+      for arg in "$@"; do
+        case "$arg" in --name=*) name="${arg#--name=}" ;; *) [ -z "$name" ] && name="$arg" ;; esac
+      done
+      [ -z "$name" ] && name="${CLAUDE_TAB_NAME:-${PWD##*/}}"
+      local port
+      port=$(_bridge_port)
+      curl -fsS -m 2 --get --data-urlencode "name=$name" \
+        "http://127.0.0.1:${port}/clear-note" >/dev/null 2>&1 || true
+      ;;
+
+    *)
+      echo "usage: bridgectl.sh note {set|get|clear} ..." >&2
+      return 2
+      ;;
+  esac
+}
+
 # bridge_bg_task <start|end|clear> [--name=<name>]
 #
 # Report OUTSTANDING BACKGROUND WORK (bridge v0.21.0+) — a dimension of its

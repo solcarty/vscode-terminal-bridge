@@ -85,6 +85,8 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh forget <name>   # removes the tr
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh send   <name> <text>|--text-file=<path> [--no-submit] [--force] [--mode=...]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh list
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh bg-task {start|end|clear} [--name=<name>]   # outstanding background work
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note set <text>|--text-file=<path>          # publish a handoff
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note get <name>                             # read one back
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh sweep
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh ping
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status <status> [--name=<name>]
@@ -246,7 +248,9 @@ curl "http://127.0.0.1:${PORT}/list"
       "lastSendAt": "2026-08-05T11:51:58.004Z",
       "pendingTasks": 1, "bgTask": true,
       "bgTaskStartedAt": "2026-08-05T11:44:30.007Z",
-      "displayStatus": "bg-task"
+      "displayStatus": "bg-task",
+      "noteUpdatedAt": "2026-08-05T11:50:12.771Z",
+      "noteBytes": 128, "noteTruncated": false
     }
   ]
 }
@@ -264,6 +268,7 @@ Status alone answers "what state is this in". The question an orchestrator actua
 | `lastHeartbeatAt` | **Any** `/rename-terminal` call lands, including the idempotent no-ops. |
 | `lastSendAt` | A `/send-text` call **submits** text into this terminal (v0.20.0+). Staged text (`submit=0`) and refused sends don't stamp. |
 | `bgTaskStartedAt` | `pendingTasks` goes from 0 to 1 (v0.21.0+). Cleared when the count returns to 0, so it can't outlive the work it described. |
+| `noteUpdatedAt` | A worker publishes a note via `/set-note` (v0.22.0+). The **body is not in `/list`** — fetch it from [`/note`](#get-set-note--get-note--get-clear-note) for the entries whose timestamp moved. |
 
 `pendingTasks` / `bgTask` / `displayStatus` (v0.21.0+) carry the background-work dimension — see [`/bg-task`](#get-bg-task) for why that is separate from `status`. `status` remains the raw turn state; `displayStatus` is what the tab renders.
 
@@ -427,6 +432,91 @@ Response (idempotent no-op):
 ```
 
 Returns `404` if the terminal is not in the registry (e.g. opened before the last reload).
+
+---
+
+### `GET /set-note` · `GET /note` · `GET /clear-note`
+
+A short handoff a worker publishes for its orchestrator to read (v0.22.0+).
+
+| Endpoint | Parameters | Purpose |
+| -------- | ---------- | ------- |
+| `/set-note` | `name` (req), `text=` or `textFile=` | Publish a note (parameter shape mirrors `/send-text`) |
+| `/note` | `name` (req) | Read one terminal's note body |
+| `/clear-note` | `name` (req) | Remove it |
+
+```bash
+curl "http://127.0.0.1:${PORT}/set-note?name=my-task&textFile=/tmp/handoff.md"
+curl "http://127.0.0.1:${PORT}/note?name=my-task"
+```
+
+```json
+{
+  "ok": true, "name": "my-task",
+  "note": "state: done\nshipped: pr=44 branch=feat/x sha=abc123\n",
+  "noteUpdatedAt": "2026-08-19T15:02:11.004Z",
+  "truncated": false, "bytes": 58
+}
+```
+
+Via the bundled client:
+
+```bash
+# worker, from anywhere — resolves its own tab name like hook-status does
+bridgectl note set "blocked: needs a decision on the schema bump"
+bridgectl note set --text-file=/tmp/handoff.md
+bridgectl note clear
+
+# orchestrator
+bridgectl note get my-task
+```
+
+#### Why this exists
+
+`send` closed orchestrator → worker. The reverse direction is [#32](https://github.com/solcarty/vscode-terminal-bridge/issues/32), which is blocked on APIs that don't exist — `onDidWriteTerminalData` is proposed-only, and the shell-integration APIs model discrete commands rather than a long-running TUI.
+
+But most of what an orchestrator needs from a worker isn't the raw buffer. It's a handful of facts: *am I done, what did I ship, what needs deciding, what did I touch.* That subset doesn't require reading output at all — only the worker being able to **publish** it. This doesn't replace `#32` (raw output is still the only way to see what actually happened when a worker's own account is wrong); it makes the common case work without waiting for it.
+
+#### `/list` carries the timestamp, not the body
+
+An orchestrator polls `/list` constantly. Inlining N note bodies would make every triage pass proportional to how much everyone has written, so `/list` exposes `noteUpdatedAt` / `noteBytes` / `noteTruncated` and nothing else. Fetch bodies from `/note` only for the entries whose timestamp moved.
+
+Notes are persisted in workspace state alongside `status`, so they **survive a window reload** — which is exactly the moment context is lost and a note is worth most.
+
+#### Notes over 4KB are truncated, not rejected
+
+The cap is 4096 bytes, applied on a character boundary so the stored note stays valid UTF-8. The response reports `truncated: true` and `bytes`, and `/list` carries `noteTruncated`. Truncation rather than rejection because a clipped handoff still carries the facts at its head — this is a summary, not a log. Detail belongs in the terminal and in whatever the worker wrote to disk locally.
+
+#### A note is a self-report — prefer receipts to prose
+
+Same caveat that motivated the heartbeat: `status` says what the agent *claims*. A prose note has that problem with more authority, because it reads like a report. Two real cases from one afternoon of orchestrating, both caught only by checking git/PR state against the claim:
+
+- A worker reported shipping one PR when it had actually shipped a different one — it had picked up the number of a pre-existing PR on a sibling branch. The narrative was detailed, confident, and wrong about the one fact that mattered.
+- A worker reported "zero writes" for a verification run. True of the engine call — but it had also closed a fixture row in a **shared** environment and toggled a runtime setting there. Neither appeared in the summary.
+
+So write notes as **checkable pointers**, not narrative:
+
+```
+state: done | blocked | needs-decision
+shipped: pr=<number> branch=<branch> sha=<sha>
+touched: env=shared-dev  mutations=1 row  restored=<flag>=false
+needs-decision: <one line>
+findings: <one line each>
+```
+
+Everything under `shipped` and `touched` can be independently verified by the orchestrator, so it *reconciles* rather than relays. `touched` is the one to insist on — shared-environment side effects are what an orchestrator most needs surfaced, and no status colour can carry them.
+
+The bridge does **not** validate note contents, the same way it deliberately doesn't derive status from staleness. Report facts; let the caller judge.
+
+#### Notes from a remote worker node
+
+A worker on another machine has no shared filesystem with the orchestrating session and can't reach its `127.0.0.1` bridge, so `bridgectl note set` takes a different route there — automatically, with no change to the command:
+
+1. `bin/worker.js` exports `WORKER_JOB_ID` / `WORKER_PORT` / `WORKER_TOKEN` into every job's environment.
+2. `bridgectl note set` sees those and POSTs to `/job-note` on the worker daemon instead of the local bridge.
+3. The note rides home on the next `/job-status` poll, and `bridge-tail.sh` relays it into the orchestrator's bridge — only when `noteUpdatedAt` changes, so a static note isn't rewritten every three seconds.
+
+The same 4KB cap applies at both ends.
 
 ---
 
@@ -1024,6 +1114,7 @@ Unlike the local bridge, every worker endpoint requires `Authorization: Bearer <
 | --- | --- |
 | `POST /run-job` | Body `{ jobId, cmd, ref? }`. Cuts a worktree at the resolved ref and starts `cmd` in an `rmux` session. |
 | `GET /job-status` | `?id=&offset=` — returns `{ done, exitCode, running, logChunk, nextOffset }`. `offset`/`nextOffset` let callers tail the log incrementally instead of re-fetching it whole. |
+| `POST /job-note` | `?id=` — body is a job's published note (≤4KB). Returned by `/job-status` and relayed into the local bridge by `bridge-tail.sh`; see [notes](#notes-from-a-remote-worker-node). |
 | `POST /sweep-job` | `?id=` — removes a job's worktree. Runs automatically on successful (`exitCode === 0`) completion; call manually for a failed job once you're done inspecting it. |
 | `GET /ping` | Health check — returns `{ ok, port, hostname }`. |
 

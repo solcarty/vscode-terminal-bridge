@@ -34,6 +34,7 @@ case "$sub" in
   close)  bridge_close  "$@" ;;
   forget) bridge_forget "$@" ;;
   send)   bridge_send   "$@" ;;
+  nudge)  bridge_nudge  "$@" ;;
   status) bridge_status "$@" ;;
   rename) bridge_rename "$@" ;;
   sweep)  bridge_sweep  "$@" ;;
@@ -52,11 +53,12 @@ case "$sub" in
     fi
     ;;
   *)
-    echo "usage: bridgectl.sh {open|close|forget|send|status|rename|sweep|list|ping|hook-status|hook-output|bg-task|note|output|scaffold} [args...]" >&2
+    echo "usage: bridgectl.sh {open|close|forget|send|nudge|status|rename|sweep|list|ping|hook-status|hook-output|bg-task|note|output|scaffold} [args...]" >&2
     echo "       bridgectl.sh open <name> <cwd> [cmd] [icon] [color] [--node=<name>] [--ref=<ref>] [--cmd-file=<path>]" >&2
-    echo "       bridgectl.sh send <name> <text>|--text-file=<path> [--no-submit] [--force] [--mode=auto|paste|literal|join]" >&2
+    echo "       bridgectl.sh send <name> <text>|--text-file=<path> [--no-submit] [--force] [--mode=auto|paste|literal|join] [--submit-delay=<ms>]" >&2
     echo "         (send refuses when the target sits at an interactive prompt — injected text would answer it. --force overrides.)" >&2
     echo "         (exit 0 means delivered to the terminal, not read: confirm pickup by comparing lastSendAt vs lastHeartbeatAt in \`list\`.)" >&2
+    echo "       bridgectl.sh nudge <name> [--force]   # bare Enter — releases a multi-line paste stranded in the input box (delivery=submit-unverified)" >&2
     echo "       bridgectl.sh close <name>    # disposes the terminal AND removes its tracked row; prints outcome JSON" >&2
     echo "       bridgectl.sh forget <name>   # removes the tracked row only, never touches a process" >&2
     echo "       bridgectl.sh output <name> [--n=<1..3>]   # read back what the agent last said (needs the Stop hook-output hook)" >&2
@@ -66,6 +68,7 @@ case "$sub" in
     echo "       bridgectl.sh bg-task {start|end|clear} [--name=<name>]   # outstanding background work — a dimension of its own, not a status" >&2
     echo "       bridgectl.sh hook-status <status> [--name=<name>]   # reads Cline's stdin payload or Claude's env" >&2
     echo "       bridgectl.sh scaffold --backend {cline|claude} [--dir=<repo>] [--force]" >&2
+    echo "       bridgectl.sh scaffold --backend claude --apply [--settings=<path>]   # merge the hooks into settings.json instead of printing them" >&2
     echo "       bridgectl.sh ping --node <name>" >&2
     exit 2
     ;;

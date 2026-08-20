@@ -223,7 +223,7 @@ bridge_list() {
   echo "$out"
 }
 
-# bridge_send <name> [text] [--text-file=<path>] [--no-submit] [--force] [--mode=auto|paste|literal|join]
+# bridge_send <name> [text] [--text-file=<path>] [--no-submit] [--force] [--mode=auto|paste|literal|join] [--submit-delay=<ms>]
 #
 # Deliver text into an ALREADY-RUNNING tracked terminal (bridge v0.17.0+) —
 # the nudge/unblock path that doesn't restart the session the way a
@@ -249,20 +249,32 @@ bridge_list() {
 # a heartbeat NEWER than the send means the agent has acted since your text
 # landed. A status transition is not a substitute — hooks fire on tool calls,
 # so status lags pickup, and a transition can't be attributed to your send.
+#
+# `delivery` in the response (bridge v0.24.0+) says how much that exit 0 is
+# worth. `submitted` is the direct path — text and Enter written back to back,
+# no placeholder in between. `submit-unverified` is the bracketed-paste path:
+# the Enter was written after a delay (--submit-delay=<ms>, default 250) to let
+# the TUI register its `[Pasted text #N]` placeholder, but the bridge cannot
+# see whether the widget took it, and against a busy target it sometimes does
+# not (#48). submit-unverified plus a heartbeat older than lastSendAt is a
+# message stranded in the input box: `bridgectl nudge <name>` sends the bare
+# Enter that clears it. --mode=join avoids the placeholder path entirely at the
+# cost of collapsing the payload to one line.
 bridge_send() {
   if [ "$#" -lt 1 ]; then
-    echo '{"ok":false,"reason":"usage: bridgectl.sh send <name> <text>|--text-file=<path> [--no-submit] [--force] [--mode=auto|paste|literal|join]"}' >&2
+    echo '{"ok":false,"reason":"usage: bridgectl.sh send <name> <text>|--text-file=<path> [--no-submit] [--force] [--mode=auto|paste|literal|join] [--submit-delay=<ms>]"}' >&2
     return 2
   fi
   local name="$1"; shift
-  local text="" textFile="" submit=1 force=0 mode=""
+  local text="" textFile="" submit=1 force=0 mode="" submitDelay=""
   for arg in "$@"; do
     case "$arg" in
-      --text-file=*) textFile="${arg#--text-file=}" ;;
-      --mode=*)      mode="${arg#--mode=}" ;;
-      --no-submit)   submit=0 ;;
-      --force)       force=1 ;;
-      *)             text="$arg" ;;
+      --text-file=*)    textFile="${arg#--text-file=}" ;;
+      --mode=*)         mode="${arg#--mode=}" ;;
+      --submit-delay=*) submitDelay="${arg#--submit-delay=}" ;;
+      --no-submit)      submit=0 ;;
+      --force)          force=1 ;;
+      *)                text="$arg" ;;
     esac
   done
 
@@ -293,6 +305,7 @@ bridge_send() {
   [ -n "$textFile" ] && set -- "$@" --data-urlencode "textFile=$textFile"
   [ -z "$textFile" ] && set -- "$@" --data-urlencode "text=$text"
   [ -n "$mode" ]     && set -- "$@" --data-urlencode "mode=$mode"
+  [ -n "$submitDelay" ] && set -- "$@" --data-urlencode "submitDelayMs=$submitDelay"
   [ "$submit" = "0" ] && set -- "$@" --data-urlencode "submit=0"
   [ "$force" = "1" ]  && set -- "$@" --data-urlencode "force=1"
 
@@ -305,6 +318,51 @@ bridge_send() {
     return 1
   fi
   echo "$out"
+  case "$out" in
+    *'"ok":true'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# bridge_nudge <name> [--force] — send a bare Enter into a tracked terminal.
+#
+# The recovery half of #48. A multi-line send to a busy target can leave its
+# payload parked in the input box as a collapsed `[Pasted text #N]` placeholder
+# that no amount of waiting consumes; one Enter releases it. Re-sending the
+# text instead would duplicate the message if the paste HAD landed, which is
+# why this exists as its own verb.
+#
+# Loud like bridge_send: an unreachable bridge, an unknown name, or a refusal
+# at a prompt state all exit non-zero with the reason on stdout. Refused at
+# needs-input/permission because a bare Enter there picks the highlighted
+# menu option; --force overrides.
+bridge_nudge() {
+  local name="${1:-}"; shift || true
+  local force=0
+  for arg in "$@"; do
+    case "$arg" in
+      --force) force=1 ;;
+      *)       : ;;
+    esac
+  done
+  if [ -z "$name" ]; then
+    echo '{"ok":false,"reason":"usage: bridgectl.sh nudge <name> [--force]"}' >&2
+    return 2
+  fi
+
+  if ! _bridge_active; then
+    echo '{"ok":false,"reason":"bridge-unreachable"}'
+    return 1
+  fi
+  local port out
+  port=$(_bridge_port)
+  set -- --data-urlencode "name=$name"
+  [ "$force" = "1" ] && set -- "$@" --data-urlencode "force=1"
+  if ! out=$(curl -sS -m 5 --get "$@" "http://127.0.0.1:${port}/nudge-terminal" 2>/dev/null); then
+    echo '{"ok":false,"reason":"bridge-unreachable"}'
+    return 1
+  fi
+  _bridge_emit_json "$out"
   case "$out" in
     *'"ok":true'*) return 0 ;;
     *) return 1 ;;
@@ -721,7 +779,158 @@ bridge_hook_status() {
   bridge_status "$name" "$state"
 }
 
-# bridge_scaffold --backend cline [--dir=<repo>] [--force]
+# _bridge_claude_hook_spec <ctl> — the canonical Claude Code hook wiring, one
+# `EVENT<TAB>command` line per hook, in the order they should appear.
+#
+# Single source of truth for both the printed snippet and --apply's merge, so
+# the two can't drift into disagreeing about what a correct install looks like
+# — which is the whole failure the printed-snippet-only path invited.
+_bridge_claude_hook_spec() {
+  local ctl="$1"
+  printf '%s\t%s\n' \
+    PreToolUse    "bash $ctl hook-status working" \
+    Notification  "bash $ctl hook-status needs-input" \
+    Stop          "bash $ctl hook-status idle" \
+    Stop          "bash $ctl hook-output" \
+    SubagentStart "bash $ctl hook-status subagent" \
+    SubagentStop  "bash $ctl hook-status working" \
+    TaskCreated   "bash $ctl bg-task start" \
+    TaskCompleted "bash $ctl bg-task end"
+}
+
+# _bridge_claude_hook_json <ctl> — render the spec as the settings.json shape.
+_bridge_claude_hook_json() {
+  _bridge_claude_hook_spec "$1" | awk -F'\t' '
+    { if (!($1 in seen)) { order[++n] = $1; seen[$1] = 1 }
+      cmds[$1] = (cmds[$1] == "" ? "" : cmds[$1] "\n") $2 }
+    END {
+      print "{"
+      print "  \"hooks\": {"
+      for (i = 1; i <= n; i++) {
+        ev = order[i]
+        printf "    \"%s\": [{ \"hooks\": [", ev
+        c = split(cmds[ev], parts, "\n")
+        for (j = 1; j <= c; j++) {
+          if (j > 1) printf ",\n%*s", length(ev) + 21, ""
+          printf "{ \"type\": \"command\", \"command\": \"%s\" }", parts[j]
+        }
+        printf "] }]%s\n", (i < n ? "," : "")
+      }
+      print "  }"
+      print "}"
+    }'
+}
+
+# _bridge_scaffold_claude_apply <ctl> [settings-path] — merge the spec into a
+# Claude Code settings.json (bridge v0.24.0+, #47).
+#
+# Safe enough to run against a live install, which is the only version worth
+# shipping: existing hooks are never replaced or reordered, only appended
+# alongside; a command already present is left alone so a second run is a
+# no-op; and malformed JSON aborts before anything is written. The file is
+# backed up to <settings>.bak before the first modifying write.
+#
+# Reports per event — added / already-present — because the point of --apply
+# over the printed snippet is knowing what your install was MISSING.
+_bridge_scaffold_claude_apply() {
+  local ctl="$1" settings="${2:-}"
+  [ -n "$settings" ] || settings="$HOME/.claude/settings.json"
+  case "$settings" in
+    /*) : ;;
+    *)  settings="$PWD/$settings" ;;
+  esac
+
+  if ! command -v node >/dev/null 2>&1; then
+    echo "scaffold --apply: needs node to merge JSON safely; falling back to the printed snippet" >&2
+    return 1
+  fi
+
+  _bridge_claude_hook_spec "$ctl" | node -e '
+    const fs = require("fs");
+    const path = require("path");
+    const settings = process.argv[1];
+
+    let spec = "";
+    process.stdin.on("data", d => spec += d);
+    process.stdin.on("end", () => {
+      const wanted = spec.split("\n").filter(Boolean).map(l => {
+        const i = l.indexOf("\t");
+        return { event: l.slice(0, i), command: l.slice(i + 1) };
+      });
+
+      let raw = null;
+      try { raw = fs.readFileSync(settings, "utf8"); } catch { /* new file */ }
+
+      let cfg = {};
+      if (raw !== null && raw.trim() !== "") {
+        try {
+          cfg = JSON.parse(raw);
+        } catch (err) {
+          // A settings.json that does not parse disables every setting in it.
+          // Rewriting one would turn a hook gap into a config outage.
+          console.error(`scaffold --apply: ${settings} is not valid JSON (${err.message}) — refusing to rewrite it`);
+          process.exit(1);
+        }
+        if (cfg === null || typeof cfg !== "object" || Array.isArray(cfg)) {
+          console.error(`scaffold --apply: ${settings} is not a JSON object — refusing to rewrite it`);
+          process.exit(1);
+        }
+      }
+
+      if (cfg.hooks !== undefined && (typeof cfg.hooks !== "object" || cfg.hooks === null || Array.isArray(cfg.hooks))) {
+        console.error(`scaffold --apply: ${settings} has a "hooks" key that is not an object — refusing to rewrite it`);
+        process.exit(1);
+      }
+      const hooks = cfg.hooks || {};
+
+      let added = 0;
+      const report = [];
+      for (const { event, command } of wanted) {
+        const groups = Array.isArray(hooks[event]) ? hooks[event] : (hooks[event] === undefined ? [] : null);
+        if (groups === null) {
+          console.error(`scaffold --apply: hooks.${event} is not an array — refusing to rewrite it`);
+          process.exit(1);
+        }
+        const present = groups.some(g =>
+          g && Array.isArray(g.hooks) && g.hooks.some(h => h && h.command === command));
+        if (present) {
+          report.push(`  already-present  ${event}  ${command}`);
+          continue;
+        }
+        // Appended as its own group rather than pushed into an existing one:
+        // an existing group may carry a matcher we do not understand, and
+        // inheriting it would silently narrow when our hook fires.
+        groups.push({ hooks: [{ type: "command", command }] });
+        hooks[event] = groups;
+        report.push(`  added            ${event}  ${command}`);
+        added++;
+      }
+
+      if (added === 0) {
+        console.log(report.join("\n"));
+        console.log(`scaffold --apply: ${settings} already has all 8 hooks — nothing to do`);
+        return;
+      }
+
+      cfg.hooks = hooks;
+      try {
+        fs.mkdirSync(path.dirname(settings), { recursive: true });
+        if (raw !== null) fs.writeFileSync(settings + ".bak", raw, "utf8");
+        fs.writeFileSync(settings, JSON.stringify(cfg, null, 2) + "\n", "utf8");
+      } catch (err) {
+        console.error(`scaffold --apply: could not write ${settings}: ${err.message}`);
+        process.exit(1);
+      }
+
+      console.log(report.join("\n"));
+      console.log(`scaffold --apply: added ${added} hook(s) to ${settings}` +
+        (raw !== null ? ` (previous contents saved to ${settings}.bak)` : " (created)"));
+    });
+  ' "$settings"
+}
+
+# bridge_scaffold --backend {cline|claude} [--dir=<repo>] [--force]
+#                 [--apply [--settings=<path>]]      # claude only
 #
 # Write the per-backend hook scripts that drive a bridge terminal's status icon
 # (v0.17.0+). Each generated script is a one-line call into bridge_hook_status,
@@ -732,14 +941,24 @@ bridge_hook_status() {
 # Cline's hooks are matched by filename against its event names (no
 # registration step), which is what makes this scaffoldable at all. Claude Code
 # hooks live in settings.json under a `hooks` key, so --backend claude prints
-# the snippet to stdout for you to merge rather than editing that file.
+# the snippet by default — and with --apply, merges it (bridge v0.24.0+, #47).
+#
+# The printed snippet documents the TARGET state; an upgrade needs the DELTA,
+# which is the difference between reading a settings file carefully and running
+# one command. --apply computes it: additive per event (an existing Stop group
+# keeps every hook it has and the scaffolded command is appended alongside),
+# idempotent by exact command string, and refusing outright on malformed JSON
+# rather than rewriting it — a broken settings.json silently disables every
+# setting in the file, so a partial write is strictly worse than no write.
 bridge_scaffold() {
-  local backend="" dir="$PWD" force=0
+  local backend="" dir="$PWD" force=0 apply=0 settings=""
   for arg in "$@"; do
     case "$arg" in
       --backend=*) backend="${arg#--backend=}" ;;
       --backend)   : ;;   # tolerate `--backend cline` (space form), handled below
       --dir=*)     dir="${arg#--dir=}" ;;
+      --settings=*) settings="${arg#--settings=}" ;;
+      --apply)     apply=1 ;;
       --force)     force=1 ;;
       cline|claude) [ -z "$backend" ] && backend="$arg" ;;
       *)           : ;;
@@ -777,33 +996,33 @@ EOF
       echo "scaffold: wrote $written hook(s) to $hooks_dir (skipped $skipped existing; --force to overwrite)"
       ;;
     claude)
+      if [ "$apply" = "1" ]; then
+        _bridge_scaffold_claude_apply "$ctl" "$settings"
+        return $?
+      fi
       cat <<EOF
-# Claude Code hooks live in settings.json, so merge this into
-# $dir/.claude/settings.json (or ~/.claude/settings.json) by hand:
+# Claude Code hooks live in settings.json. Merge this into
+# $dir/.claude/settings.json (or ~/.claude/settings.json) by hand — or let
+# \`bridgectl scaffold --backend claude --apply\` merge it for you (additive,
+# idempotent, refuses on malformed JSON):
 
-{
-  "hooks": {
-    "PreToolUse":        [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status working" }] }],
-    "Notification":      [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status needs-input" }] }],
-    "Stop":              [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status idle" },
-                                      { "type": "command", "command": "bash $ctl hook-output" }] }],
-    "SubagentStart":     [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status subagent" }] }],
-    "SubagentStop":      [{ "hooks": [{ "type": "command", "command": "bash $ctl hook-status working" }] }],
-
-    "TaskCreated":       [{ "hooks": [{ "type": "command", "command": "bash $ctl bg-task start" }] }],
-    "TaskCompleted":     [{ "hooks": [{ "type": "command", "command": "bash $ctl bg-task end" }] }]
-  }
-}
+$(_bridge_claude_hook_json "$ctl")
 
 # TaskCreated/TaskCompleted drive a SEPARATE dimension from the status hooks
 # above, deliberately: an agent that starts a background task and then ends its
 # turn would otherwise have its bg-task status overwritten by Stop/Notification
 # and read as needs-input while nothing needed a human. Keep the pair wired
 # together — a start with no matching end leaves the count stuck above zero.
+#
+# Note the Stop entry carries TWO hooks: the status write and the read-back
+# publisher. Merging by hand with an existing Stop hook, it is easy to see the
+# first one and miss that only the second is new — which is exactly the read
+# --apply does for you.
 EOF
       ;;
     *)
       echo "usage: bridgectl.sh scaffold --backend {cline|claude} [--dir=<repo>] [--force]" >&2
+      echo "       bridgectl.sh scaffold --backend claude --apply [--settings=<path>]" >&2
       return 2
       ;;
   esac

@@ -56,7 +56,19 @@ Now `close` reconciles the row in every case and reports which one it hit: `outc
 
 Exit 0 means *written to the terminal*, not *read and acted on* — `sendText` queues when the target is mid-execution.
 
-Confirm pickup by comparing `lastSendAt` (stamped on a submitted send, v0.20.0+) against `lastHeartbeatAt` in `list`: heartbeat older than send means delivered-but-not-picked-up, heartbeat newer means the agent has acted since your text landed. A status transition is not a substitute — hooks fire on tool calls, so an agent that reasons before acting still reads `needs-input` well after your text arrived, and a transition that does happen can't be attributed to your send. `send` deliberately does *not* flip status itself: that would assert a transition the bridge hasn't observed, and it breaks worst at a permission prompt, where injected text is consumed as an answer that may not unblock anything. Reading a terminal's output back is a separate, unsolved problem (issue #32).
+Confirm pickup by comparing `lastSendAt` (stamped on a submitted send, v0.20.0+) — and read `lastSendDelivery` alongside it (v0.24.0+, below) — against `lastHeartbeatAt` in `list`: heartbeat older than send means delivered-but-not-picked-up, heartbeat newer means the agent has acted since your text landed. A status transition is not a substitute — hooks fire on tool calls, so an agent that reasons before acting still reads `needs-input` well after your text arrived, and a transition that does happen can't be attributed to your send. `send` deliberately does *not* flip status itself: that would assert a transition the bridge hasn't observed, and it breaks worst at a permission prompt, where injected text is consumed as an answer that may not unblock anything. Reading a terminal's output back is a separate, unsolved problem (issue #32).
+
+## `submitted` was a claim the bridge couldn't back (v0.24.0+)
+
+A multi-line send to a *busy* target frequently didn't submit: the TUI collapses a large paste into a `[Pasted text #N +M lines]` placeholder, registering it is asynchronous, and an Enter written in the same tick against a mid-turn agent is discarded rather than buffered. The message parks in the input box, where waiting never consumes it — and the response said `submitted: true` (#48). That's worse than the documented delivered≠read gap: an orchestrator polling `lastHeartbeatAt` sees a healthy working agent the entire time a message it considers sent will never be read.
+
+Three changes, none of which pretend the bridge can see the terminal (VS Code exposes no read side):
+
+- **The submit is separated from the paste in time** — `submitDelayMs`, default 250ms on the paste path, 0 elsewhere, overridable per call. This is the actual fix if the race theory holds.
+- **`delivery` replaces the claim.** `submitted` (direct path — text and Enter back to back), `submit-unverified` (paste path — Enter written, consumption unobservable), `staged` (`submit=0`), `nudge`. The old `submitted` boolean stays for existing callers but only ever meant "an Enter was written".
+- **`list` carries it** as `lastSendDelivery`. `submit-unverified` + a heartbeat older than `lastSendAt` is the stranded signature, and it's the first form in which "stranded" is distinguishable from "busy" in a single poll. The bridge reports the pair and calls neither, the same way it never derives status from staleness.
+
+`nudge <name>` sends the bare Enter that releases it. Deliberately caller-driven: a blind second Enter on a target that *did* consume the first is an empty submit, which most TUIs ignore and none promise to — and re-sending the text instead would duplicate the message. Refused at `needs-input`/`permission` like `send`, because Enter at a menu picks the highlighted option. `--mode=join` avoids the placeholder path entirely, at the cost of one line.
 
 ## `note` is the worker's half of the loop (v0.22.0+)
 
@@ -93,6 +105,7 @@ All endpoints are GET with query-string params (not POST/JSON — see `extension
 | `/list` | Query tracked terminals (name, cwd, status, pid, live, timestamps, background work) |
 | `/bg-task` | Report outstanding background work (`op=start|end|clear`) — a dimension of its own, not a status |
 | `/send-text` | Inject text into an already-running tracked terminal (`text=` or `textFile=`) |
+| `/nudge-terminal` | Bare Enter — releases a paste left staged in the target's input box |
 | `/set-note` · `/note` · `/clear-note` | A worker's short handoff for its orchestrator (`text=` / `textFile=`) |
 | `/set-output` · `/output` · `/clear-output` | Read-back: the turn's final assistant text, pushed in by a Stop hook |
 | `/sweep` | Dispose terminals whose cwd no longer maps to a live `git worktree` |
@@ -107,7 +120,8 @@ Don't hand-roll curl calls. The extension bundles `bin/vscode-bridge.sh` + `bin/
 ```bash
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open <name> <cwd> [cmd] [icon] [color]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh status <name> <state>
-bash ~/.vscode-terminal-bridge/bin/bridgectl.sh send <name> <text>|--text-file=<path>
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh send <name> <text>|--text-file=<path> [--submit-delay=<ms>]
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh nudge <name> [--force]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh close <name>
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh forget <name>
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note set <text>|--text-file=<path> [--name=<name>]
@@ -116,9 +130,16 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh output <name> [--n=<1..3>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh bg-task {start|end|clear} [--name=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status <status> [--name=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend {cline|claude} [--dir=<repo>]
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend claude --apply [--settings=<path>]
 ```
 
 Source of these scripts is `bin/` in this repo — edit there, not the installed copy under `~/.vscode-terminal-bridge/`.
+
+## Scaffolding Claude hooks: `--apply` merges, printing documents (v0.24.0+)
+
+`scaffold --backend claude` prints the target state; `--apply` computes the delta and merges it into `settings.json` (default `~/.claude/settings.json`, `--settings=` for a project one). Upgrading a real install came down to one missing `Stop` entry, found by hand-reading a file whose existing hooks were pre-v0.13 inline curl — mechanical work, and every step a chance to clobber something working (#47).
+
+Additive per event (an existing group keeps its hooks; ours is appended as its own group, never inheriting a `matcher` we don't understand), idempotent on the exact command string, reporting added/already-present per event, backing up to `<settings>.bak`, and **refusing outright on malformed JSON** — a `settings.json` that doesn't parse disables every setting in it, so a partial write is worse than no write. Both paths render from one spec (`_bridge_claude_hook_spec`) so they can't drift.
 
 ## Status icons (for rename-terminal `status=` param)
 

@@ -164,11 +164,15 @@ async function touchHeartbeat(context, name) {
 // permission dialog is consumed as an answer to that dialog, and if the answer
 // doesn't unblock the agent the terminal is still waiting while the registry
 // claims otherwise. Facts, not verdicts.
-async function touchLastSend(context, name) {
+//
+// `delivery` (v0.24.0+) records HOW the last write ended, because the three
+// outcomes are not equally trustworthy and an orchestrator can only act on the
+// difference if it's stored: see DELIVERY_* below.
+async function touchLastSend(context, name, delivery = null) {
   const meta = loadMetadata(context);
   if (!meta[name]) return null;  // never conjure an entry for an untracked name
   const now = new Date().toISOString();
-  meta[name] = { ...meta[name], lastSendAt: now };
+  meta[name] = { ...meta[name], lastSendAt: now, lastSendDelivery: delivery };
   await context.workspaceState.update(METADATA_KEY, meta);
   return now;
 }
@@ -766,6 +770,22 @@ async function forgetTerminal(context, name) {
 //      dialog or a numbered question is consumed as an answer to that menu,
 //      not read as a message. We refuse when the last known status says the
 //      terminal is waiting on input, unless force=1.
+//
+//   3. Submit timing (v0.24.0+, issue #48). A TUI collapses a large paste into
+//      a `[Pasted text #N +M lines]` placeholder, and registering that
+//      placeholder is asynchronous. An Enter written in the same tick races it
+//      and — against a target that's mid-turn — gets discarded rather than
+//      buffered, so the message parks in the input box forever and no amount
+//      of waiting consumes it. We separate the submit from the paste by
+//      SUBMIT_DELAY_MS (overridable per call) to let the placeholder land.
+//
+// What we still cannot do is OBSERVE the submit. VS Code exposes no read side
+// for a terminal, so `submitted: true` only ever meant "an Enter was written"
+// — and against the paste path that was a claim strong enough to be read as
+// "the agent has it". So the outcome is reported as `delivery` instead, which
+// distinguishes the reliable path from the racy one, and is persisted so
+// /list can carry it. The honest reading of `submit-unverified` + a heartbeat
+// older than lastSendAt is "possibly stranded" — /nudge-terminal is the fix.
 // ---------------------------------------------------------------------------
 
 // Statuses where injected text would be eaten by an interactive prompt rather
@@ -775,8 +795,31 @@ const PROMPT_STATES = new Set(['needs-input', 'permission']);
 const PASTE_START = '\x1b[200~';
 const PASTE_END   = '\x1b[201~';
 
+// How long to wait between a bracketed paste and its submit keystroke. Long
+// enough for a TUI to register the paste placeholder, short enough that a
+// caller doesn't notice; overridable per call via submitDelayMs=.
+const SUBMIT_DELAY_MS = 250;
+const MAX_SUBMIT_DELAY_MS = 10000;
+
+// Delivery outcomes, in descending order of how much a caller may trust them:
+//   submitted         — text and Enter written back to back on the direct
+//                       (single-line / literal / join) path. No placeholder,
+//                       no race; the target consumes it as typed input.
+//   submit-unverified — bracketed paste plus a delayed Enter. The Enter was
+//                       written, but the bridge cannot see whether the input
+//                       widget took it. This is the #48 failure mode's home.
+//   staged            — submit=0. Text is in the box by request; nothing was
+//                       submitted and nothing is expected to be.
+//   nudge             — a bare Enter with no text (see /nudge-terminal).
+const DELIVERY_SUBMITTED   = 'submitted';
+const DELIVERY_UNVERIFIED  = 'submit-unverified';
+const DELIVERY_STAGED      = 'staged';
+const DELIVERY_NUDGE       = 'nudge';
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
 async function sendTextToTerminal(context, name, text, opts = {}) {
-  const { submit = true, force = false, mode = 'auto' } = opts;
+  const { submit = true, force = false, mode = 'auto', submitDelayMs } = opts;
 
   let terminal = terminals.get(name);
   if (!terminal || !vscode.window.terminals.includes(terminal)) {
@@ -816,21 +859,77 @@ async function sendTextToTerminal(context, name, text, opts = {}) {
   }
 
   // Submit as a separate write so the newline lands outside the paste bracket —
-  // inside it, it's just pasted content and never submits.
-  if (submit) terminal.sendText('', true);
+  // inside it, it's just pasted content and never submits. On the paste path
+  // the gap is also a real wait, not just a separate call: see #48 above.
+  const delay = usePaste
+    ? Math.min(MAX_SUBMIT_DELAY_MS, Math.max(0, Number(submitDelayMs ?? SUBMIT_DELAY_MS) || 0))
+    : Math.min(MAX_SUBMIT_DELAY_MS, Math.max(0, Number(submitDelayMs ?? 0) || 0));
+  if (submit) {
+    if (delay > 0) await sleep(delay);
+    terminal.sendText('', true);
+  }
+
+  const delivery = !submit ? DELIVERY_STAGED
+    : usePaste ? DELIVERY_UNVERIFIED
+    : DELIVERY_SUBMITTED;
 
   // Stamp only on an actual submit. Staged-but-unsent text (submit=0) hasn't
   // been delivered to the agent, so recording it as a send would manufacture
   // the exact false positive lastSendAt exists to remove — a caller would
   // compare a heartbeat against a send that never happened.
-  const lastSendAt = submit ? await touchLastSend(context, name) : null;
+  const lastSendAt = submit ? await touchLastSend(context, name, delivery) : null;
 
   return {
-    ok: true, name, status, submitted: submit,
+    ok: true, name, status,
+    // Kept for callers written against v0.17.0–v0.23.0, but read `delivery`:
+    // this only ever meant "an Enter was written", which on the paste path is
+    // not the same as "the input was consumed".
+    submitted: submit,
+    delivery,
+    submitDelayMs: submit ? delay : null,
     mode: mode === 'join' ? 'join' : (usePaste ? 'paste' : 'literal'),
     bytes: Buffer.byteLength(delivered, 'utf8'),
     lastSendAt,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Nudge: a bare Enter into a tracked terminal, no text.
+//
+// The escape hatch for #48's stranded paste. When a caller sees
+// lastSendDelivery=submit-unverified with a heartbeat older than lastSendAt,
+// the message may be sitting in the input box needing one keystroke — and
+// re-sending the text would duplicate it if the paste actually did land.
+//
+// Deliberately not automatic. A blind second Enter on a target that consumed
+// the first one is an empty submit, which most TUIs ignore but none promise
+// to; whether that risk is worth taking depends on what was sent, which is the
+// caller's knowledge, not the bridge's. Refused at a prompt state like a send,
+// for the same reason: Enter at a menu picks the highlighted option.
+// ---------------------------------------------------------------------------
+async function nudgeTerminal(context, name, opts = {}) {
+  const { force = false } = opts;
+
+  let terminal = terminals.get(name);
+  if (!terminal || !vscode.window.terminals.includes(terminal)) {
+    await reindexTerminals(context);
+    terminal = terminals.get(name) ?? vscode.window.terminals.find(t => t.name === name);
+  }
+  if (!terminal || !vscode.window.terminals.includes(terminal)) {
+    return { ok: false, code: 404, error: 'Terminal not found or not live', name };
+  }
+
+  const status = loadMetadata(context)[name]?.status ?? null;
+  if (!force && PROMPT_STATES.has(status)) {
+    return {
+      ok: false, code: 409, name, status,
+      error: `Terminal is at an interactive prompt (status=${status}); a bare Enter would select whatever it has highlighted. Re-send with force=1 if that's intended.`,
+    };
+  }
+
+  terminal.sendText('', true);
+  const lastSendAt = await touchLastSend(context, name, DELIVERY_NUDGE);
+  return { ok: true, name, status, delivery: DELIVERY_NUDGE, lastSendAt };
 }
 
 // ---------------------------------------------------------------------------
@@ -1466,6 +1565,8 @@ function activate(context) {
       //   submit=0   stage the text without sending a newline
       //   force=1    send even when the terminal is at an interactive prompt
       //   mode=      auto (default) | paste | literal | join
+      //   submitDelayMs= ms to wait between a paste and its Enter (#48);
+      //              defaults to 250 on the paste path, 0 otherwise
       const name     = url.searchParams.get('name');
       const textFile = url.searchParams.get('textFile') || undefined;
       let text       = url.searchParams.get('text');
@@ -1497,10 +1598,37 @@ function activate(context) {
         return;
       }
 
+      const delayParam = url.searchParams.get('submitDelayMs');
+      if (delayParam !== null && !/^\d+$/.test(delayParam)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'submitDelayMs must be a non-negative integer (ms)' }));
+        return;
+      }
+
       const result = await sendTextToTerminal(context, name, text, {
         submit: url.searchParams.get('submit') !== '0',
         force:  url.searchParams.get('force') === '1',
         mode:   modeParam,
+        submitDelayMs: delayParam === null ? undefined : Number(delayParam),
+      });
+
+      const { code, ...body } = result;
+      res.writeHead(result.ok ? 200 : code, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+
+    } else if (url.pathname === '/nudge-terminal') {
+      // A bare Enter into a tracked terminal — the recovery path for a paste
+      // that never got submitted (#48). See nudgeTerminal() for why this is a
+      // separate, caller-initiated verb rather than an automatic retry.
+      const name = url.searchParams.get('name');
+      if (!name) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'name param required' }));
+        return;
+      }
+
+      const result = await nudgeTerminal(context, name, {
+        force: url.searchParams.get('force') === '1',
       });
 
       const { code, ...body } = result;
@@ -1609,6 +1737,15 @@ function activate(context) {
         // lastHeartbeatAt to tell "delivered but not picked up" from
         // "picked up"; see touchLastSend().
         lastSendAt: meta.lastSendAt ?? null,
+        // v0.24.0+ — how that last write ended: submitted | submit-unverified
+        // | nudge (#48). `submit-unverified` is the paste path, where an Enter
+        // was written but the bridge cannot see whether the input widget took
+        // it; paired with a heartbeat older than lastSendAt it's the signature
+        // of a message stranded in the target's input box, which /nudge-terminal
+        // clears. Reported raw — the bridge doesn't call the stranding, the
+        // same way it doesn't derive status from staleness. null on rows that
+        // predate this or were last written by an older bridge.
+        lastSendDelivery: meta.lastSendDelivery ?? null,
         // v0.21.0+ — the background-work dimension, tracked separately from
         // status so "waiting on a job I started" stops being reported as
         // "waiting on a human" (issue #40). displayStatus is what the tab

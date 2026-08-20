@@ -82,7 +82,8 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open   <name> <cwd> [cmd] [icon]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh status <name> <state>   # working|idle|needs-input|pr-open|merged|...
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh close  <name>   # disposes the tab AND removes its tracked row
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh forget <name>   # removes the tracked row only, never touches a process
-bash ~/.vscode-terminal-bridge/bin/bridgectl.sh send   <name> <text>|--text-file=<path> [--no-submit] [--force] [--mode=...]
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh send   <name> <text>|--text-file=<path> [--no-submit] [--force] [--mode=...] [--submit-delay=<ms>]
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh nudge  <name> [--force]   # bare Enter — releases a paste left staged in the input box
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh list
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh bg-task {start|end|clear} [--name=<name>]   # outstanding background work
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note set <text>|--text-file=<path>          # publish a handoff
@@ -92,6 +93,7 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh sweep
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh ping
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status <status> [--name=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend {cline|claude} [--dir=<repo>] [--force]
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend claude --apply [--settings=<path>]   # merge the hooks, don't print them
 ```
 
 Or source the functions directly:
@@ -247,6 +249,7 @@ curl "http://127.0.0.1:${PORT}/list"
       "statusChangedAt": "2026-08-05T09:14:11.226Z",
       "lastHeartbeatAt": "2026-08-05T11:52:04.019Z",
       "lastSendAt": "2026-08-05T11:51:58.004Z",
+      "lastSendDelivery": "submitted",
       "pendingTasks": 1, "bgTask": true,
       "bgTaskStartedAt": "2026-08-05T11:44:30.007Z",
       "displayStatus": "bg-task",
@@ -268,7 +271,8 @@ Status alone answers "what state is this in". The question an orchestrator actua
 | `updatedAt` | Any metadata write — status, rename, pid, color. |
 | `statusChangedAt` | The status **value** changes. A `PreToolUse` hook firing `status=working` every few seconds does *not* reset it, or "how long has this been working" becomes unanswerable. |
 | `lastHeartbeatAt` | **Any** `/rename-terminal` call lands, including the idempotent no-ops. |
-| `lastSendAt` | A `/send-text` call **submits** text into this terminal (v0.20.0+). Staged text (`submit=0`) and refused sends don't stamp. |
+| `lastSendAt` | A `/send-text` call **submits** text into this terminal (v0.20.0+), or a `/nudge-terminal` lands (v0.24.0+). Staged text (`submit=0`) and refused sends don't stamp. |
+| `lastSendDelivery` | Written alongside `lastSendAt` (v0.24.0+): `submitted` \| `submit-unverified` \| `nudge`. Not a timestamp — it's *how much* the last write can be trusted; see [below](#lastsenddelivery-tells-you-how-much-lastsendat-is-worth-v0240). |
 | `bgTaskStartedAt` | `pendingTasks` goes from 0 to 1 (v0.21.0+). Cleared when the count returns to 0, so it can't outlive the work it described. |
 | `lastOutputAt` | A Stop hook publishes the turn's final assistant text (v0.23.0+). Bodies come from [`/output`](#get-set-output--get-output--get-clear-output), never from `/list`. |
 | `noteUpdatedAt` | A worker publishes a note via `/set-note` (v0.22.0+). The **body is not in `/list`** — fetch it from [`/note`](#get-set-note--get-note--get-clear-note) for the entries whose timestamp moved. |
@@ -293,7 +297,17 @@ Status alone answers "what state is this in". The question an orchestrator actua
 
 Watching for a status *transition* instead doesn't work: hooks fire on tool calls, so an agent that reasons for a while before acting still reads `needs-input` long after your text landed — and a transition that does happen can't be attributed to your send rather than to the agent acting on its own. A heartbeat *after* your send is attributable in a way a bare status change never is.
 
-**Entries predating a field's release report `null`** rather than a fabricated value — the four v0.18.0 timestamps on older entries, and `lastSendAt` on any terminal that hasn't been sent to. Treat `null` as unknown, not as zero.
+**`lastSendDelivery` tells you how much `lastSendAt` is worth (v0.24.0+).** The comparison above assumes the text was actually submitted. On the bracketed-paste path that isn't a safe assumption — a TUI collapses a large paste into a `[Pasted text #N +M lines]` placeholder, and against a busy target the Enter can be discarded rather than buffered, leaving the message parked in the input box where waiting will never consume it ([#48](https://github.com/solcarty/vscode-terminal-bridge/issues/48)). VS Code exposes no read side for a terminal, so the bridge cannot see which happened — it records which path was taken and lets you act on that:
+
+| `lastSendDelivery` | Meaning |
+|---|---|
+| `submitted` | Direct path (single-line / `literal` / `join`): text and Enter written back to back, no placeholder in between. |
+| `submit-unverified` | Paste path: the Enter was written after a delay, but whether the input widget took it is unobservable. |
+| `nudge` | The last write was a bare Enter from [`/nudge-terminal`](#get-nudge-terminal), not a message. |
+
+**`submit-unverified` + `lastHeartbeatAt` older than `lastSendAt` is the stranded-message signature** — and it's distinguishable from an agent that is merely busy, which was the gap: both look identical through `status` and the heartbeat alone. `/nudge-terminal` is the fix; re-sending the text would duplicate it if the paste did in fact land.
+
+**Entries predating a field's release report `null`** rather than a fabricated value — the four v0.18.0 timestamps on older entries, `lastSendAt` on any terminal that hasn't been sent to, and `lastSendDelivery` on rows last written by a pre-v0.24.0 bridge. Treat `null` as unknown, not as zero.
 
 Or via the bundled client: `bash ~/.vscode-terminal-bridge/bin/bridgectl.sh list`.
 
@@ -311,6 +325,7 @@ Or via the bundled client: `bash ~/.vscode-terminal-bridge/bin/bridgectl.sh list
 | `submit` | `1` | `0` stages the text without sending a newline |
 | `force` | `0` | `1` sends even when the terminal is at an interactive prompt |
 | `mode` | `auto` | `auto` \| `paste` \| `literal` \| `join` |
+| `submitDelayMs` | `250` on the paste path, `0` otherwise | ms to wait between the paste and its Enter (v0.24.0+) |
 
 ```bash
 # Short nudge
@@ -324,7 +339,9 @@ curl -G "http://127.0.0.1:${PORT}/send-text" \
 ```
 
 ```json
-{ "ok": true, "name": "my-task", "status": "working", "submitted": true, "mode": "paste", "bytes": 412 }
+{ "ok": true, "name": "my-task", "status": "working", "submitted": true,
+  "delivery": "submit-unverified", "submitDelayMs": 250, "mode": "paste", "bytes": 412,
+  "lastSendAt": "2026-08-05T11:51:58.004Z" }
 ```
 
 **`textFile` is not `/open-terminal`'s `cmdFile`.** `cmdFile` turns into `bash <file>` — it *runs* the file, which is meaningful against a fresh shell prompt and meaningless against a live TUI. `textFile` reads the file and injects its contents as typed text. Use it for anything multi-line, quote-heavy, or long enough to strain an inline GET URL. Trailing newlines are stripped so the payload doesn't submit itself before `submit` does.
@@ -340,6 +357,13 @@ curl -G "http://127.0.0.1:${PORT}/send-text" \
 
 **Exit 0 means delivered, not received.** `sendText` queues in the terminal buffer when the target is mid-execution, so a successful response says the text was written — not that the agent read it or acted on it. To confirm pickup, compare `lastHeartbeatAt` against `lastSendAt` in `/list`: a heartbeat *after* your send means the agent has acted since your text landed (v0.20.0+). Don't watch for a status transition instead — hooks fire on tool calls, so a status can lag a pickup by minutes, and a transition that does occur can't be attributed to your send.
 
+**`delivery` says which of those two things "written" means (v0.24.0+).** `submitted: true` only ever meant *an Enter was written*, and on the paste path that is weaker than it reads: the TUI collapses a large paste into a `[Pasted text #N +M lines]` placeholder, registering the placeholder is asynchronous, and an Enter that arrives mid-turn can be dropped rather than buffered — so the message sits in the input box indefinitely and no amount of patience moves it ([#48](https://github.com/solcarty/vscode-terminal-bridge/issues/48)). Two changes follow:
+
+- The submit is now written `submitDelayMs` after the paste (default 250ms) so the placeholder has time to register. Raise it for a slow target; `submitDelayMs=0` restores the pre-v0.24.0 timing.
+- The response reports `delivery` — `submitted` on the direct path, `submit-unverified` on the paste path, `staged` for `submit=0`. `submitted` is kept for older callers but read `delivery` instead. It is also persisted to `/list` as `lastSendDelivery`, so an orchestrator polling one endpoint sees the difference.
+
+If a `submit-unverified` send is followed by no heartbeat, the message is probably stranded — send a bare Enter with [`/nudge-terminal`](#get-nudge-terminal) rather than re-sending the text, which would duplicate it if the paste did land. `mode=join` sidesteps the placeholder path entirely, at the cost of collapsing the payload onto one line.
+
 Or via the bundled client:
 
 ```bash
@@ -348,6 +372,31 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh send my-task --text-file=/tmp/ms
 ```
 
 Note this closes only the orchestrator→agent half of the loop. Reading a terminal's output back is a separate problem with no stable VS Code API — tracked in [#32](https://github.com/solcarty/vscode-terminal-bridge/issues/32).
+
+---
+
+### `GET /nudge-terminal`
+
+*v0.24.0+.* Sends a **bare Enter** into a tracked terminal — no text. The recovery path for a `submit-unverified` send whose payload is sitting unread in the target's input box ([#48](https://github.com/solcarty/vscode-terminal-bridge/issues/48)).
+
+| Param | Default | Meaning |
+|-------|---------|---------|
+| `name` | — | Tracked terminal name (required) |
+| `force` | `0` | `1` sends even when the terminal is at an interactive prompt |
+
+```bash
+curl -G "http://127.0.0.1:${PORT}/nudge-terminal" --data-urlencode "name=my-task"
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh nudge my-task
+```
+
+```json
+{ "ok": true, "name": "my-task", "status": "working", "delivery": "nudge",
+  "lastSendAt": "2026-08-05T11:57:10.221Z" }
+```
+
+**Why this isn't automatic.** A blind second Enter on a target that *did* consume the first one is an empty submit — harmless in most TUIs, promised by none. Whether that risk beats leaving a message stranded depends on what was sent, which is the caller's knowledge and not the bridge's. Same 409 refusal as `/send-text` when the tracked status is `needs-input` or `permission`, for a sharper reason: Enter at a menu selects whatever is highlighted.
+
+It stamps `lastSendAt` and sets `lastSendDelivery` to `nudge`, so the pickup comparison keeps working after a nudge — a heartbeat later than the nudge is the agent acting on the message it just released.
 
 ---
 
@@ -939,6 +988,27 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status working
 It resolves the terminal name from, in order: `--name=<name>` (or a two-arg `<name> <status>` form), `$CLAUDE_TAB_NAME` (exported into every bridge-opened terminal), a `"rootPath"` in a JSON payload on stdin (how Cline passes context — see below), and finally the basename of `$PWD`. It always drains stdin when stdin isn't a tty, so a hook runner writing a payload never blocks on a reader that isn't there. Like `status`, it no-ops silently outside VS Code.
 
 Because it lives in the version-matched copy under `~/.vscode-terminal-bridge/bin/`, the conventions stay current instead of being frozen into each repo's hook scripts at whatever they were on the day those were written. `bridgectl scaffold --backend claude` prints a ready-to-merge `settings.json` snippet using it.
+
+### `scaffold --backend claude --apply` — merge instead of print (v0.24.0+)
+
+The printed snippet documents the **target** state. What an upgrade needs is the **delta** — which of those hooks your `settings.json` is missing — and that is a careful read of a file whose existing hooks may be hand-rolled, matcher-scoped, and working. Getting it wrong either duplicates a status write or silently drops one; upgrading a real install to v0.23.0 came down to a single missing `Stop` entry ([#47](https://github.com/solcarty/vscode-terminal-bridge/issues/47)).
+
+```bash
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend claude --apply
+#   already-present  PreToolUse     bash .../bridgectl.sh hook-status working
+#   added            Stop           bash .../bridgectl.sh hook-output
+#   ...
+# scaffold --apply: added 1 hook(s) to /Users/you/.claude/settings.json (previous contents saved to ...bak)
+```
+
+Defaults to `~/.claude/settings.json` — where this wiring usually lives — with `--settings=<path>` for a project one. What makes it safe to point at a live install:
+
+- **Additive, never replacing.** An existing `Stop` group keeps every hook it has; the scaffolded command is appended as its own group alongside. A group carrying a `matcher` is never inherited into, so the new hook can't be silently narrowed to one tool.
+- **Idempotent**, matched on the exact command string — a second run adds nothing and says `already-present` for all 8.
+- **Reports per event**, so an unattended upgrade path can log what was actually missing.
+- **Refuses on malformed JSON** (and on a `hooks` key of the wrong shape) rather than rewriting it. A `settings.json` that doesn't parse disables every setting in the file, so a partial write is strictly worse than no write. The previous contents are saved to `<settings>.bak` before any modifying write.
+
+The printed snippet and `--apply` render from the same spec, so they can't drift into disagreeing about what a correct install looks like.
 
 Use `matcher` to scope a hook to a specific tool name (e.g. `"matcher": "Bash"` fires only when Claude calls Bash):
 

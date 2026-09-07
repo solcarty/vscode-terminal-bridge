@@ -1719,6 +1719,35 @@ function activate(context) {
       // and what state it's tracked in, instead of guessing from silence.
       const metadata = loadMetadata(context);
       const liveNames = new Set(vscode.window.terminals.map(t => t.name));
+
+      // #54 — re-resolve each tracked terminal's own shell pid on read, rather
+      // than trusting the one persisted at creation. That pid can be a transient
+      // child captured before the shell settled, and once it exits `pidAlive`
+      // reports false forever for a terminal whose shell and agent are both fine.
+      // That is a false positive for a crash, and the documented reaction to it
+      // is to relaunch the agent — which starts a second one on a worktree that
+      // already has one (the #53 shape, reached by following the docs).
+      //
+      // Resolution is best-effort and time-boxed: a slow processId must not hang
+      // the read path, and an unresolved pid is reported as unknown, never dead.
+      const livePids = new Map();
+      await Promise.all([...terminals.entries()].map(async ([name, term]) => {
+        try {
+          const pid = await Promise.race([
+            term.processId,
+            new Promise(resolve => setTimeout(() => resolve(undefined), 250)),
+          ]);
+          if (pid) livePids.set(name, pid);
+        } catch { /* terminal disposed mid-read — treated as unresolved */ }
+      }));
+      // Persist a corrected pid so cleanup paths (close, sweep) stop aiming at a
+      // pid that was never the shell's.
+      for (const [name, pid] of livePids) {
+        if (metadata[name] && metadata[name].pid !== pid) {
+          metadata[name].pid = pid;
+          persistMetadata(context, name, { pid });
+        }
+      }
       //
       // Timestamps (v0.18.0+) answer the question status alone can't: not
       // "what state is this in" but "does it need me right now". A terminal at
@@ -1737,7 +1766,11 @@ function activate(context) {
         jobId: meta.jobId ?? null,
         pid: meta.pid ?? null,
         live: terminals.has(name) || liveNames.has(name),
-        pidAlive: isPidAlive(meta.pid),
+        // null means unknown, not dead. A tracked terminal whose pid would not
+        // resolve is exactly the case where asserting death is unsafe, so it
+        // fails closed: acting on "unknown" costs a second look, acting on
+        // "dead" costs a duplicate agent.
+        pidAlive: terminals.has(name) && !livePids.has(name) ? null : isPidAlive(meta.pid),
         createdAt: meta.createdAt ?? null,
         updatedAt: meta.updatedAt ?? null,
         statusChangedAt: meta.statusChangedAt ?? null,

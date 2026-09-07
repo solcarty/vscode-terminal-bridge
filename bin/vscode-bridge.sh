@@ -631,6 +631,26 @@ bridge_note() {
   esac
 }
 
+# bridge_pr <name> <url>
+#
+# Records a PR url against a tracked terminal (bridge v0.25.0+, #50). Data
+# plumbing only — idempotent by name, last write wins. The bridge never polls
+# GitHub or asserts the PR's current state; treat the value as advisory,
+# since it may have been merged, closed, or force-pushed since it was set.
+bridge_pr() {
+  _bridge_active || return 0
+  local name="${1:-}" url="${2:-}"
+  if [ -z "$name" ] || [ -z "$url" ]; then
+    echo "usage: bridgectl.sh pr <name> <url>" >&2
+    return 2
+  fi
+  local port
+  port=$(_bridge_port)
+  curl -fsS -m 2 --get \
+    --data-urlencode "name=$name" --data-urlencode "url=$url" \
+    "http://127.0.0.1:${port}/set-pr" >/dev/null 2>&1 || true
+}
+
 # bridge_bg_task <start|end|clear> [--name=<name>]
 #
 # Report OUTSTANDING BACKGROUND WORK (bridge v0.21.0+) — a dimension of its

@@ -89,6 +89,7 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh bg-task {start|end|clear} [--nam
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note set <text>|--text-file=<path>          # publish a handoff
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note get <name>                             # read one back
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh output <name> [--n=<1..3>]                  # read back what it last said
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh pr <name> <url>                             # record a PR url (advisory, last write wins)
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh sweep
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh ping
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status <status> [--name=<name>]
@@ -213,10 +214,25 @@ curl "http://127.0.0.1:${PORT}/open-terminal?name=my-tab&cwd=${CWD}&cmd=${CMD}"
 Response:
 
 ```json
-{ "ok": true, "name": "my-tab", "cwd": "/path/to/dir", "cmd": "echo hello", "color": null, "icon": null }
+{ "ok": true, "name": "my-tab", "cwd": "/path/to/dir", "cmd": "echo hello", "color": null, "icon": null, "reused": false, "delivery": "pending" }
 ```
 
 The bundled `bridgectl.sh open` client checks this response and returns a non-zero exit code (printing the error to stderr) if the bridge couldn't be reached or reported failure — it no longer swallows every error with a blind `|| true`.
+
+#### `open` is idempotent by name, and the response is not a delivery claim (v0.25.0+)
+
+**Idempotent by name (#53).** A client that times out (`curl`'s own timeout is shorter than the shell-integration fallback below) and retries used to leave **two** tabs against **one** registry row — the first an orphan `list` can't see and `close`/`sweep` can't target, and if the timed-out attempt also ran `cmd`, two agents on one worktree branch. Now, if `name` is already tracked *and* its terminal is still live in the window, `open` hands back the existing tab and runs nothing further: `reused: true`, `delivery: "skipped-reused"` — the command is deliberately **not** re-run, since an agent may already be working in a reused tab and relaunching over it is exactly the destructive shape this exists to prevent. A tracked name whose terminal is gone (a stale row) still creates fresh, as before.
+
+**The response is not a claim the command ran (#52).** `open` used to answer `ok: true` before `cmd` had even been attempted, so a caller couldn't tell a launch that ran its command from one that left a bare shell — every field on the tab (`live`, `pidAlive`) looks healthy either way, because the shell really is running. The immediate response's `delivery` is one of `pending` (a fresh tab — outcome not known yet), `skipped-reused` (see above), or `none` (no `cmd` given). The real outcome lands on the `/list` row as `cmdDelivery` / `cmdDeliveredAt`:
+
+| `cmdDelivery` | Meaning |
+|---|---|
+| `shell-integration` | The shell reported ready, then the command was written. Confirmed. |
+| `timeout` | The ready signal never arrived; written blind after a fallback delay. The write happened — whether the shell consumed it is unknown. |
+| `none` | Nothing to deliver. |
+| `null` | Rows from before v0.25.0, or a tab that hasn't reached either outcome yet. |
+
+`open` still answers immediately rather than blocking on delivery — the blind fallback is longer than the client timeout that caused #53 in the first place, so waiting would trade one bug for the other. Poll `/list`'s `cmdDelivery` when certainty matters.
 
 **Large or quote-heavy commands:** write the command to a file and pass `--cmd-file` instead of a positional `cmd`:
 
@@ -248,6 +264,8 @@ curl "http://127.0.0.1:${PORT}/list"
       "updatedAt": "2026-08-05T11:52:04.019Z",
       "statusChangedAt": "2026-08-05T09:14:11.226Z",
       "lastHeartbeatAt": "2026-08-05T11:52:04.019Z",
+      "cmdDelivery": "shell-integration",
+      "cmdDeliveredAt": "2026-08-05T09:14:03.302Z",
       "lastSendAt": "2026-08-05T11:51:58.004Z",
       "lastSendDelivery": "submitted",
       "pendingTasks": 1, "bgTask": true,
@@ -255,7 +273,9 @@ curl "http://127.0.0.1:${PORT}/list"
       "displayStatus": "bg-task",
       "noteUpdatedAt": "2026-08-05T11:50:12.771Z",
       "noteBytes": 128, "noteTruncated": false,
-      "lastOutputAt": "2026-08-05T11:51:02.310Z", "outputCount": 3
+      "lastOutputAt": "2026-08-05T11:51:02.310Z", "outputCount": 3,
+      "prUrl": "https://github.com/solcarty/vscode-terminal-bridge/pull/50",
+      "prSetAt": "2026-08-05T11:53:00.001Z"
     }
   ]
 }
@@ -271,11 +291,13 @@ Status alone answers "what state is this in". The question an orchestrator actua
 | `updatedAt` | Any metadata write — status, rename, pid, color. |
 | `statusChangedAt` | The status **value** changes. A `PreToolUse` hook firing `status=working` every few seconds does *not* reset it, or "how long has this been working" becomes unanswerable. |
 | `lastHeartbeatAt` | **Any** `/rename-terminal` call lands, including the idempotent no-ops. |
+| `cmdDeliveredAt` | `open`'s startup command is actually written to the shell — see [`cmdDelivery`](#open-is-idempotent-by-name-and-the-response-is-not-a-delivery-claim-v0250) (v0.25.0+). |
 | `lastSendAt` | A `/send-text` call **submits** text into this terminal (v0.20.0+), or a `/nudge-terminal` lands (v0.24.0+). Staged text (`submit=0`) and refused sends don't stamp. |
 | `lastSendDelivery` | Written alongside `lastSendAt` (v0.24.0+): `submitted` \| `submit-unverified` \| `nudge`. Not a timestamp — it's *how much* the last write can be trusted; see [below](#lastsenddelivery-tells-you-how-much-lastsendat-is-worth-v0240). |
 | `bgTaskStartedAt` | `pendingTasks` goes from 0 to 1 (v0.21.0+). Cleared when the count returns to 0, so it can't outlive the work it described. |
 | `lastOutputAt` | A Stop hook publishes the turn's final assistant text (v0.23.0+). Bodies come from [`/output`](#get-set-output--get-output--get-clear-output), never from `/list`. |
 | `noteUpdatedAt` | A worker publishes a note via `/set-note` (v0.22.0+). The **body is not in `/list`** — fetch it from [`/note`](#get-set-note--get-note--get-clear-note) for the entries whose timestamp moved. |
+| `prSetAt` | A caller sets `prUrl` via [`/set-pr`](#get-set-pr) (v0.25.0+). Last write wins. |
 
 `pendingTasks` / `bgTask` / `displayStatus` (v0.21.0+) carry the background-work dimension — see [`/bg-task`](#get-bg-task) for why that is separate from `status`. `status` remains the raw turn state; `displayStatus` is what the tab renders.
 
@@ -285,7 +307,9 @@ Status alone answers "what state is this in". The question an orchestrator actua
 
 **The bridge never derives status from staleness.** No auto-flip to `error` after N minutes — a build legitimately runs quiet for 20. Only the caller knows where its threshold sits, so this reports facts and stops there.
 
-**`pidAlive` is narrower than it looks.** The tracked pid is the terminal's *shell*, not the agent inside it, and a crashed `claude` usually drops back to a live shell prompt — so `pidAlive` stays `true`. It catches the tab-is-gone case cheaply; `lastHeartbeatAt` is what distinguishes wedged from working. `null` means no pid was ever recorded.
+**`pidAlive` is narrower than it looks.** The tracked pid is the terminal's *shell*, not the agent inside it, and a crashed `claude` usually drops back to a live shell prompt — so `pidAlive` stays `true`. It catches the tab-is-gone case cheaply; `lastHeartbeatAt` is what distinguishes wedged from working.
+
+**`pidAlive: null` means unknown, never dead (#54, v0.25.0+).** Every `/list` call now re-resolves each tracked terminal's own shell pid live, rather than trusting the value persisted at creation — that persisted pid can be a transient child captured before the shell settled, and once *that* process exits, `pidAlive` used to read `false` forever for a terminal whose shell (and agent) were both fine. A caller following the obvious reaction to "dead" — relaunch — would then start a second agent on a worktree that already had one, which is the exact #53 shape #52/#53 exist to prevent. Resolution is best-effort and time-boxed (250ms) so a slow read never blocks `/list`; an unresolved pid reports `pidAlive: null`, not `false`. **Any consumer doing a bare `if (!pidAlive)` truthiness check now treats "unknown" the same as "dead" — check for `=== false` explicitly.** A corrected pid is persisted as a side effect, so `close`/`sweep` stop aiming at a pid that was never the shell's.
 
 **`lastSendAt` is how you confirm a send was picked up (v0.20.0+).** `/send-text` returning 200 means the text was *written* to the terminal, not read — `sendText` queues in the buffer. Comparing the two timestamps answers what the exit code can't:
 
@@ -751,6 +775,31 @@ Response:
 when the row was dropped — `true` means you have just untracked a tab that is
 still open on screen, which is legal but rarely what you meant. Unknown names
 return `404` with `"outcome": "not-tracked"`.
+
+---
+
+### `GET /set-pr`
+
+Records a PR url against a tracked terminal (#50, v0.25.0+). Data plumbing only.
+
+| Parameter | Required | Description |
+| --------- | -------- | ----------- |
+| `name` | Yes | Registry name |
+| `url` | Yes | The PR url to store |
+
+```bash
+curl "http://127.0.0.1:${PORT}/set-pr?name=my-tab&url=https%3A%2F%2Fgithub.com%2Fowner%2Frepo%2Fpull%2F42"
+```
+
+Response:
+
+```json
+{ "ok": true, "name": "my-tab", "prUrl": "https://github.com/owner/repo/pull/42", "prSetAt": "2026-08-05T11:53:00.001Z" }
+```
+
+`list` reports it back as `prUrl` / `prSetAt`, `null` on rows where it was never set. Idempotent by name: a second call with a different url overwrites (last write wins), same as every other field on the record — no dedicated version-check machinery.
+
+**This is advisory, not a GitHub client.** The bridge does not poll, does not hold a token, and never asserts the PR is still open — `prUrl` may point at something already merged, closed, or force-pushed since it was set. Whoever needs the PR's live state checks it independently; the bridge only remembers what it was told. Unknown `name` → `404`; missing `url` → `400`.
 
 ---
 

@@ -404,6 +404,21 @@ async function clearNote(context, name) {
 }
 
 // ---------------------------------------------------------------------------
+// prUrl (#50, v0.25.0+): data plumbing only. The bridge stores a URL a caller
+// hands it and hands it back — no polling, no GitHub credentials, no CI
+// knowledge inside the extension. Whoever wants to know if that PR merged,
+// closed, or got force-pushed stays outside and checks; this is advisory.
+// Idempotent by construction: persistMetadata is last-write-wins, same as
+// every other field on the record, so a second /set-pr just overwrites.
+async function setPrUrl(context, name, prUrl) {
+  const meta = loadMetadata(context);
+  if (!meta[name]) return null;  // never conjure an entry for an untracked name
+  const now = new Date().toISOString();
+  await persistMetadata(context, name, { prUrl, prSetAt: now });
+  return { prUrl, prSetAt: now };
+}
+
+// ---------------------------------------------------------------------------
 // Read-back: what the agent last SAID, pushed in by its own Stop hook (#32).
 //
 // The blocker on reading a terminal was never the wanting — it's that VS Code
@@ -1445,6 +1460,37 @@ function activate(context) {
         bytes: meta.noteBytes ?? 0,
       }));
 
+    } else if (url.pathname === '/set-pr') {
+      // #50 (v0.25.0+) — data plumbing only. Whoever polls the PR's actual
+      // state (merged/closed/force-pushed) stays outside the bridge; this
+      // just stores the last url a caller told it about.
+      const name = url.searchParams.get('name');
+      const prUrl = url.searchParams.get('url');
+      if (!name) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'name param required' }));
+        return;
+      }
+      if (!prUrl) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'url param required' }));
+        return;
+      }
+
+      const stored = await setPrUrl(context, name, prUrl);
+      if (!stored) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Terminal not found', name }));
+        return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true, name,
+        prUrl: stored.prUrl,
+        prSetAt: stored.prSetAt,
+      }));
+
     } else if (url.pathname === '/set-output' || url.pathname === '/clear-output') {
       // Write path for read-back. Called by a Stop/SubagentStop hook with the
       // turn's final assistant text; same parameter shape as /send-text and
@@ -1885,6 +1931,12 @@ function activate(context) {
         // reasoning as noteUpdatedAt: a triage poll must not carry payloads.
         lastOutputAt: meta.lastOutputAt ?? null,
         outputCount: Array.isArray(meta.outputs) ? meta.outputs.length : 0,
+        // v0.25.0+ (#50) — set by /set-pr, last-write-wins. Advisory: the
+        // bridge never checks whether the PR is still open, merged, closed,
+        // or force-pushed since this was set — it only remembers what it
+        // was told.
+        prUrl: meta.prUrl ?? null,
+        prSetAt: meta.prSetAt ?? null,
       }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, now: new Date().toISOString(), terminals: list }));

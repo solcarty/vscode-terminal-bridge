@@ -117,6 +117,12 @@ Bounded by construction: a ring of the last 3 messages, 4KB each, keeping the **
 
 It degrades to silence, never an error: nothing published reads as an empty list, a quiet turn as `stored: false`, and a malformed payload / missing field / missing `node` as a no-op that still exits 0 — a hook on every Stop must never fail the turn. Two limits worth knowing: it captures only the turn's final text (not tool output or intermediate reasoning), and remote worker nodes aren't covered — a remote job publishes a `note` instead.
 
+## `prUrl` is data plumbing, not a GitHub client (#50, v0.25.0+)
+
+`bridgectl pr <name> <url>` stores a PR url against a tracked terminal; `list` reports it back as `prUrl` / `prSetAt`, `null` when unset. Idempotent by name, last write wins — the same `persistMetadata` merge every other field uses, so no special-case guard was needed.
+
+That's the whole feature. The bridge does not poll GitHub, does not know a token, and does not assert the PR is still open — treat the value as advisory: it may have been merged, closed, or force-pushed since it was set. Whoever needs the PR's actual current state polls it themselves, outside the bridge, the same way background-job status and note bodies are left to the caller.
+
 ## Key endpoints
 
 All endpoints are GET with query-string params (not POST/JSON — see `extension.js`).
@@ -133,6 +139,7 @@ All endpoints are GET with query-string params (not POST/JSON — see `extension
 | `/nudge-terminal` | Bare Enter — releases a paste left staged in the target's input box |
 | `/set-note` · `/note` · `/clear-note` | A worker's short handoff for its orchestrator (`text=` / `textFile=`) |
 | `/set-output` · `/output` · `/clear-output` | Read-back: the turn's final assistant text, pushed in by a Stop hook |
+| `/set-pr` | Record a PR url on a tracked terminal (`name=`, `url=`) — advisory, last write wins |
 | `/sweep` | Dispose terminals whose cwd no longer maps to a live `git worktree` |
 | `/add-folder` / `/remove-folder` | Attach/detach a workspace folder |
 | `/reindex` | Re-link open terminals to persisted metadata |
@@ -153,6 +160,7 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note set <text>|--text-file=<pat
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note get <name>
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh output <name> [--n=<1..3>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh bg-task {start|end|clear} [--name=<name>]
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh pr <name> <url>
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status <status> [--name=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend {cline|claude} [--dir=<repo>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend claude --apply [--settings=<path>]

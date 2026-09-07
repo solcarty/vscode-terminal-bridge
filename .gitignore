@@ -3,3 +3,10 @@ node_modules/
 # Written by the extension into every workspace folder on activation — a
 # per-window runtime artifact, never a repo file.
 .vscode-bridge-port
+
+# Consumer status log. The extension appends here when a caller POSTs /api/status,
+# and this repo is now itself a folder in a workspace whose other roots use it — so
+# an unfixed fan-out lands a stray log in this tree. Ignored so it can never enter
+# version control. The path is a consumer convention the extension should not be
+# hardcoding at all; see #57.
+.sdo/

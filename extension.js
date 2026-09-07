@@ -795,6 +795,16 @@ const PROMPT_STATES = new Set(['needs-input', 'permission']);
 const PASTE_START = '\x1b[200~';
 const PASTE_END   = '\x1b[201~';
 
+// #52 — how long to wait for a shell to report ready before writing the startup
+// command blind. Only reached when shell integration never fires; when it does,
+// the write happens immediately and this is cancelled.
+//
+// Was 1500ms, which demonstrably lost under load: five observed launches created
+// the tab and never ran the command, always with other builds and terminals
+// already running. A longer blind wait costs nothing in the common case and
+// gives a loaded machine room to finish starting the shell.
+const CMD_BLIND_FALLBACK_MS = Number(process.env.VSCODE_BRIDGE_CMD_FALLBACK_MS) || 5000;
+
 // How long to wait between a bracketed paste and its submit keystroke. Long
 // enough for a TUI to register the paste placeholder, short enough that a
 // caller doesn't notice; overridable per call via submitDelayMs=.
@@ -1084,6 +1094,35 @@ function activate(context) {
         effectiveCmd = `bash ${CLI_INSTALL_DIR}/bridge-tail.sh ${node} ${jobId}`;
       }
 
+      // #53 — open is idempotent by name. A client that times out (curl gave up
+      // at ~2s while the server went on to create the tab) retries, and an
+      // unconditional createTerminal then leaves TWO tabs against ONE registry
+      // row: the first is an orphan `list` cannot see, `close` cannot target and
+      // `sweep` will not reap. Worse, if the timed-out attempt also ran the
+      // command, the retry produces two agents on one worktree branch.
+      //
+      // So if the name is already tracked AND its terminal is still present in
+      // the window, hand back the existing one and run nothing further.
+      if (name && terminals.has(name)) {
+        const existing = terminals.get(name);
+        if (vscode.window.terminals.includes(existing)) {
+          existing.show(!stealFocus);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: true, name, cwd, cmd, color: colorId, icon: iconId, node, jobId,
+            reused: true,
+            // The command is NOT re-run against a reused tab: an agent may
+            // already be working in it, and relaunching over the top is the
+            // destructive shape this guard exists to prevent.
+            delivery: effectiveCmd ? 'skipped-reused' : 'none',
+          }));
+          return;
+        }
+        // Tracked but the terminal is gone — a stale row. Fall through and
+        // create, which is the existing reuse-the-name behaviour.
+        terminals.delete(name);
+      }
+
       const options = { cwd, name };
       if (colorId) options.color    = new vscode.ThemeColor(colorId);
       if (iconId)  options.iconPath = new vscode.ThemeIcon(iconId);
@@ -1109,19 +1148,47 @@ function activate(context) {
         terminal.sendText(`export VSCODE_BRIDGE_PORT=${activePort}`);
         if (effectiveCmd) terminal.sendText(effectiveCmd);
       };
+      // #52 — open used to answer ok:true before sendDeferred had even been
+      // attempted, so a caller could not tell a launch that ran its command from
+      // one that left a bare shell. The tab is healthy by every field list
+      // exposes (live, pidAlive) because the shell really is running; only the
+      // command is missing, and an unattended agent that never launched is
+      // silently stranded.
+      //
+      // Delivery is now recorded on the terminal record as it happens, and
+      // surfaced by /list as cmdDelivery/cmdDeliveredAt:
+      //
+      //   shell-integration  the shell reported ready, then we wrote. Confirmed.
+      //   timeout            the ready signal never came; written blind after
+      //                      the fallback. This is the #52 shape — the write
+      //                      happened, whether the shell consumed it is unknown.
+      //   none               nothing to send.
+      //
+      // open still answers immediately rather than waiting for delivery: the
+      // blind fallback is longer than the 2s client timeout that caused #53, so
+      // blocking on it would trade one bug for the other. Callers that need
+      // certainty poll /list.
+      const noteDelivery = (how) => {
+        if (name) persistMetadata(context, name, {
+          cmdDelivery: how, cmdDeliveredAt: new Date().toISOString(),
+        });
+      };
       if ((name || effectiveCmd) && typeof vscode.window.onDidChangeTerminalShellIntegration === 'function') {
         let sent = false;
-        const fallback = setTimeout(() => { if (!sent) { sent = true; sendDeferred(); } }, 1500);
+        const fallback = setTimeout(() => {
+          if (!sent) { sent = true; sendDeferred(); noteDelivery(effectiveCmd ? 'timeout' : 'none'); }
+        }, CMD_BLIND_FALLBACK_MS);
         const sub = vscode.window.onDidChangeTerminalShellIntegration(e => {
           if (e.terminal === terminal && !sent) {
             sent = true;
             clearTimeout(fallback);
             sub.dispose();
             sendDeferred();
+            noteDelivery(effectiveCmd ? 'shell-integration' : 'none');
           }
         });
       } else if (name || effectiveCmd) {
-        setTimeout(sendDeferred, 1500);
+        setTimeout(() => { sendDeferred(); noteDelivery(effectiveCmd ? 'timeout' : 'none'); }, 1500);
       }
 
       if (name) {
@@ -1145,7 +1212,13 @@ function activate(context) {
       }
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, name, cwd, cmd, color: colorId, icon: iconId, node, jobId }));
+      res.end(JSON.stringify({
+        ok: true, name, cwd, cmd, color: colorId, icon: iconId, node, jobId,
+        reused: false,
+        // Not a claim that the command ran — see noteDelivery above. Poll
+        // /list's cmdDelivery for the outcome.
+        delivery: effectiveCmd ? 'pending' : 'none',
+      }));
 
     } else if (url.pathname === '/rename-terminal') {
       // Rename a terminal tab via VS Code API — no OSC sequences needed.
@@ -1778,6 +1851,12 @@ function activate(context) {
         // v0.20.0+ — set by /send-text on a submitted send. Compare against
         // lastHeartbeatAt to tell "delivered but not picked up" from
         // "picked up"; see touchLastSend().
+        // v0.25.0+ (#52) — how the startup command was delivered, and when.
+        // `timeout` means it was written blind because the shell never reported
+        // ready: the tab may be sitting at a bare prompt. `null` on rows that
+        // predate this or that never had a command.
+        cmdDelivery: meta.cmdDelivery ?? null,
+        cmdDeliveredAt: meta.cmdDeliveredAt ?? null,
         lastSendAt: meta.lastSendAt ?? null,
         // v0.24.0+ — how that last write ended: submitted | submit-unverified
         // | nudge (#48). `submit-unverified` is the paste path, where an Enter

@@ -28,6 +28,31 @@ Two things the bridge deliberately does not do: it never derives status from sta
 
 `pidAlive` tracks the terminal's **shell**, not the agent inside it. A crashed `claude` usually leaves a live shell prompt behind, so `pidAlive` stays true — it catches the tab-is-gone case, nothing more.
 
+## `needs-input` means a human is required — not "quiet for a minute"
+
+Claude Code fires its `Notification` hook for two unrelated things: a real permission/input request,
+and the "waiting for your input" nudge that arrives after ~60s of quiet. The hook command is a fixed
+string (`hook-status needs-input`), so both landed as `needs-input` — the one status asserting a
+human is required, and the one `send`/`nudge` refuse on. Any agent that finished its turn and sat
+quiet therefore falsely claimed to need a human, and an orchestrator reading `list` could not tell a
+blocked worktree from a finished one.
+
+Observed 2026-09-04: five worktree terminals, all correctly stopped after being told to hold, all
+reading `needs-input`; every subsequent `send` needed `--force` to get past a guard that should never
+have been armed.
+
+`bridge_hook_status` now disambiguates on the payload it already drains, so the `settings.json`
+one-liner is unchanged and no reinstall is needed. The idle nudge is really end-of-turn, which is
+exactly `idle` — what the `Stop` hook already writes. **Fail-safe by construction:** only the known
+idle phrasings are downgraded, so an unrecognized or absent message still asserts `needs-input`, and
+a real permission prompt is never silently demoted. `test/hook-status-notification.test.js` pins all
+six cases.
+
+Note this is the same failure shape as the `bg-task` collapse below — a single scalar carrying two
+independent meanings — but the fix is different, because here the two meanings genuinely *are*
+mutually exclusive turn states. Only the source was ambiguous, so disambiguating at the source is
+enough; a new status value would have re-created the collapse.
+
 ## Background work is a second dimension, not a status (v0.21.0+)
 
 `status` is last-writer-wins, and the states written into it aren't mutually exclusive. Turn state (`working`/`idle`/`needs-input`, from `PreToolUse`/`Notification`/`Stop`) and outstanding background work (`bg-task`, from `TaskCreated`) were sharing one field. An agent that started a background task and then ended its turn wrote `bg-task` and had it overwritten moments later — so the tab read `needs-input`, the one status asserting a human is required, for exactly the interval the work was in flight. An orchestrator reading `list` sent attention to a tab that needed nothing.

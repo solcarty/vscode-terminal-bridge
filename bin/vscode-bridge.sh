@@ -776,6 +776,32 @@ bridge_hook_status() {
   fi
   if [ -z "$name" ]; then name="${PWD##*/}"; fi
 
+  # `needs-input` is the one status asserting a HUMAN IS REQUIRED — `send`/`nudge`
+  # refuse on it, and an orchestrator reading `list` routes attention to it. But
+  # Claude Code fires its `Notification` hook for two unrelated things: a real
+  # permission/input request, and the "waiting for your input" nudge that arrives
+  # after ~60s of quiet. The hook command is a fixed string, so both landed as
+  # `needs-input` — meaning ANY agent that finished its turn and sat idle for a
+  # minute falsely claimed to need a human. Observed 2026-09-04: five worktree
+  # terminals, all correctly stopped after being told to hold, all reading
+  # `needs-input`; every subsequent `send` needed `--force` to get past a guard
+  # that should never have been armed.
+  #
+  # So disambiguate at the payload, not the call site: the idle nudge is really
+  # end-of-turn, which is exactly `idle` (what the `Stop` hook already writes).
+  # Fail-safe by construction — only the known idle phrasings are downgraded, so
+  # an unrecognized or absent message still asserts `needs-input` and a real
+  # permission prompt is never silently demoted.
+  if [ "$state" = "needs-input" ] && [ -n "$payload" ]; then
+    local msg
+    msg=$(printf '%s' "$payload" \
+      | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    case "$msg" in
+      *[Ww]aiting\ for\ your\ input*|*[Ww]aiting\ for\ user\ input*|*[Hh]as\ been\ idle*)
+        state="idle" ;;
+    esac
+  fi
+
   bridge_status "$name" "$state"
 }
 

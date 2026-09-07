@@ -404,6 +404,21 @@ async function clearNote(context, name) {
 }
 
 // ---------------------------------------------------------------------------
+// prUrl (#50, v0.25.0+): data plumbing only. The bridge stores a URL a caller
+// hands it and hands it back — no polling, no GitHub credentials, no CI
+// knowledge inside the extension. Whoever wants to know if that PR merged,
+// closed, or got force-pushed stays outside and checks; this is advisory.
+// Idempotent by construction: persistMetadata is last-write-wins, same as
+// every other field on the record, so a second /set-pr just overwrites.
+async function setPrUrl(context, name, prUrl) {
+  const meta = loadMetadata(context);
+  if (!meta[name]) return null;  // never conjure an entry for an untracked name
+  const now = new Date().toISOString();
+  await persistMetadata(context, name, { prUrl, prSetAt: now });
+  return { prUrl, prSetAt: now };
+}
+
+// ---------------------------------------------------------------------------
 // Read-back: what the agent last SAID, pushed in by its own Stop hook (#32).
 //
 // The blocker on reading a terminal was never the wanting — it's that VS Code
@@ -795,6 +810,16 @@ const PROMPT_STATES = new Set(['needs-input', 'permission']);
 const PASTE_START = '\x1b[200~';
 const PASTE_END   = '\x1b[201~';
 
+// #52 — how long to wait for a shell to report ready before writing the startup
+// command blind. Only reached when shell integration never fires; when it does,
+// the write happens immediately and this is cancelled.
+//
+// Was 1500ms, which demonstrably lost under load: five observed launches created
+// the tab and never ran the command, always with other builds and terminals
+// already running. A longer blind wait costs nothing in the common case and
+// gives a loaded machine room to finish starting the shell.
+const CMD_BLIND_FALLBACK_MS = Number(process.env.VSCODE_BRIDGE_CMD_FALLBACK_MS) || 5000;
+
 // How long to wait between a bracketed paste and its submit keystroke. Long
 // enough for a TUI to register the paste placeholder, short enough that a
 // caller doesn't notice; overridable per call via submitDelayMs=.
@@ -1084,6 +1109,35 @@ function activate(context) {
         effectiveCmd = `bash ${CLI_INSTALL_DIR}/bridge-tail.sh ${node} ${jobId}`;
       }
 
+      // #53 — open is idempotent by name. A client that times out (curl gave up
+      // at ~2s while the server went on to create the tab) retries, and an
+      // unconditional createTerminal then leaves TWO tabs against ONE registry
+      // row: the first is an orphan `list` cannot see, `close` cannot target and
+      // `sweep` will not reap. Worse, if the timed-out attempt also ran the
+      // command, the retry produces two agents on one worktree branch.
+      //
+      // So if the name is already tracked AND its terminal is still present in
+      // the window, hand back the existing one and run nothing further.
+      if (name && terminals.has(name)) {
+        const existing = terminals.get(name);
+        if (vscode.window.terminals.includes(existing)) {
+          existing.show(!stealFocus);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: true, name, cwd, cmd, color: colorId, icon: iconId, node, jobId,
+            reused: true,
+            // The command is NOT re-run against a reused tab: an agent may
+            // already be working in it, and relaunching over the top is the
+            // destructive shape this guard exists to prevent.
+            delivery: effectiveCmd ? 'skipped-reused' : 'none',
+          }));
+          return;
+        }
+        // Tracked but the terminal is gone — a stale row. Fall through and
+        // create, which is the existing reuse-the-name behaviour.
+        terminals.delete(name);
+      }
+
       const options = { cwd, name };
       if (colorId) options.color    = new vscode.ThemeColor(colorId);
       if (iconId)  options.iconPath = new vscode.ThemeIcon(iconId);
@@ -1109,19 +1163,47 @@ function activate(context) {
         terminal.sendText(`export VSCODE_BRIDGE_PORT=${activePort}`);
         if (effectiveCmd) terminal.sendText(effectiveCmd);
       };
+      // #52 — open used to answer ok:true before sendDeferred had even been
+      // attempted, so a caller could not tell a launch that ran its command from
+      // one that left a bare shell. The tab is healthy by every field list
+      // exposes (live, pidAlive) because the shell really is running; only the
+      // command is missing, and an unattended agent that never launched is
+      // silently stranded.
+      //
+      // Delivery is now recorded on the terminal record as it happens, and
+      // surfaced by /list as cmdDelivery/cmdDeliveredAt:
+      //
+      //   shell-integration  the shell reported ready, then we wrote. Confirmed.
+      //   timeout            the ready signal never came; written blind after
+      //                      the fallback. This is the #52 shape — the write
+      //                      happened, whether the shell consumed it is unknown.
+      //   none               nothing to send.
+      //
+      // open still answers immediately rather than waiting for delivery: the
+      // blind fallback is longer than the 2s client timeout that caused #53, so
+      // blocking on it would trade one bug for the other. Callers that need
+      // certainty poll /list.
+      const noteDelivery = (how) => {
+        if (name) persistMetadata(context, name, {
+          cmdDelivery: how, cmdDeliveredAt: new Date().toISOString(),
+        });
+      };
       if ((name || effectiveCmd) && typeof vscode.window.onDidChangeTerminalShellIntegration === 'function') {
         let sent = false;
-        const fallback = setTimeout(() => { if (!sent) { sent = true; sendDeferred(); } }, 1500);
+        const fallback = setTimeout(() => {
+          if (!sent) { sent = true; sendDeferred(); noteDelivery(effectiveCmd ? 'timeout' : 'none'); }
+        }, CMD_BLIND_FALLBACK_MS);
         const sub = vscode.window.onDidChangeTerminalShellIntegration(e => {
           if (e.terminal === terminal && !sent) {
             sent = true;
             clearTimeout(fallback);
             sub.dispose();
             sendDeferred();
+            noteDelivery(effectiveCmd ? 'shell-integration' : 'none');
           }
         });
       } else if (name || effectiveCmd) {
-        setTimeout(sendDeferred, 1500);
+        setTimeout(() => { sendDeferred(); noteDelivery(effectiveCmd ? 'timeout' : 'none'); }, 1500);
       }
 
       if (name) {
@@ -1145,7 +1227,13 @@ function activate(context) {
       }
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, name, cwd, cmd, color: colorId, icon: iconId, node, jobId }));
+      res.end(JSON.stringify({
+        ok: true, name, cwd, cmd, color: colorId, icon: iconId, node, jobId,
+        reused: false,
+        // Not a claim that the command ran — see noteDelivery above. Poll
+        // /list's cmdDelivery for the outcome.
+        delivery: effectiveCmd ? 'pending' : 'none',
+      }));
 
     } else if (url.pathname === '/rename-terminal') {
       // Rename a terminal tab via VS Code API — no OSC sequences needed.
@@ -1370,6 +1458,37 @@ function activate(context) {
         noteUpdatedAt: meta.noteUpdatedAt ?? null,
         truncated: meta.noteTruncated ?? false,
         bytes: meta.noteBytes ?? 0,
+      }));
+
+    } else if (url.pathname === '/set-pr') {
+      // #50 (v0.25.0+) — data plumbing only. Whoever polls the PR's actual
+      // state (merged/closed/force-pushed) stays outside the bridge; this
+      // just stores the last url a caller told it about.
+      const name = url.searchParams.get('name');
+      const prUrl = url.searchParams.get('url');
+      if (!name) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'name param required' }));
+        return;
+      }
+      if (!prUrl) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'url param required' }));
+        return;
+      }
+
+      const stored = await setPrUrl(context, name, prUrl);
+      if (!stored) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Terminal not found', name }));
+        return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true, name,
+        prUrl: stored.prUrl,
+        prSetAt: stored.prSetAt,
       }));
 
     } else if (url.pathname === '/set-output' || url.pathname === '/clear-output') {
@@ -1719,6 +1838,35 @@ function activate(context) {
       // and what state it's tracked in, instead of guessing from silence.
       const metadata = loadMetadata(context);
       const liveNames = new Set(vscode.window.terminals.map(t => t.name));
+
+      // #54 — re-resolve each tracked terminal's own shell pid on read, rather
+      // than trusting the one persisted at creation. That pid can be a transient
+      // child captured before the shell settled, and once it exits `pidAlive`
+      // reports false forever for a terminal whose shell and agent are both fine.
+      // That is a false positive for a crash, and the documented reaction to it
+      // is to relaunch the agent — which starts a second one on a worktree that
+      // already has one (the #53 shape, reached by following the docs).
+      //
+      // Resolution is best-effort and time-boxed: a slow processId must not hang
+      // the read path, and an unresolved pid is reported as unknown, never dead.
+      const livePids = new Map();
+      await Promise.all([...terminals.entries()].map(async ([name, term]) => {
+        try {
+          const pid = await Promise.race([
+            term.processId,
+            new Promise(resolve => setTimeout(() => resolve(undefined), 250)),
+          ]);
+          if (pid) livePids.set(name, pid);
+        } catch { /* terminal disposed mid-read — treated as unresolved */ }
+      }));
+      // Persist a corrected pid so cleanup paths (close, sweep) stop aiming at a
+      // pid that was never the shell's.
+      for (const [name, pid] of livePids) {
+        if (metadata[name] && metadata[name].pid !== pid) {
+          metadata[name].pid = pid;
+          persistMetadata(context, name, { pid });
+        }
+      }
       //
       // Timestamps (v0.18.0+) answer the question status alone can't: not
       // "what state is this in" but "does it need me right now". A terminal at
@@ -1737,7 +1885,11 @@ function activate(context) {
         jobId: meta.jobId ?? null,
         pid: meta.pid ?? null,
         live: terminals.has(name) || liveNames.has(name),
-        pidAlive: isPidAlive(meta.pid),
+        // null means unknown, not dead. A tracked terminal whose pid would not
+        // resolve is exactly the case where asserting death is unsafe, so it
+        // fails closed: acting on "unknown" costs a second look, acting on
+        // "dead" costs a duplicate agent.
+        pidAlive: terminals.has(name) && !livePids.has(name) ? null : isPidAlive(meta.pid),
         createdAt: meta.createdAt ?? null,
         updatedAt: meta.updatedAt ?? null,
         statusChangedAt: meta.statusChangedAt ?? null,
@@ -1745,6 +1897,12 @@ function activate(context) {
         // v0.20.0+ — set by /send-text on a submitted send. Compare against
         // lastHeartbeatAt to tell "delivered but not picked up" from
         // "picked up"; see touchLastSend().
+        // v0.25.0+ (#52) — how the startup command was delivered, and when.
+        // `timeout` means it was written blind because the shell never reported
+        // ready: the tab may be sitting at a bare prompt. `null` on rows that
+        // predate this or that never had a command.
+        cmdDelivery: meta.cmdDelivery ?? null,
+        cmdDeliveredAt: meta.cmdDeliveredAt ?? null,
         lastSendAt: meta.lastSendAt ?? null,
         // v0.24.0+ — how that last write ended: submitted | submit-unverified
         // | nudge (#48). `submit-unverified` is the paste path, where an Enter
@@ -1773,6 +1931,12 @@ function activate(context) {
         // reasoning as noteUpdatedAt: a triage poll must not carry payloads.
         lastOutputAt: meta.lastOutputAt ?? null,
         outputCount: Array.isArray(meta.outputs) ? meta.outputs.length : 0,
+        // v0.25.0+ (#50) — set by /set-pr, last-write-wins. Advisory: the
+        // bridge never checks whether the PR is still open, merged, closed,
+        // or force-pushed since this was set — it only remembers what it
+        // was told.
+        prUrl: meta.prUrl ?? null,
+        prSetAt: meta.prSetAt ?? null,
       }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, now: new Date().toISOString(), terminals: list }));

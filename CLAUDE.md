@@ -28,6 +28,31 @@ Two things the bridge deliberately does not do: it never derives status from sta
 
 `pidAlive` tracks the terminal's **shell**, not the agent inside it. A crashed `claude` usually leaves a live shell prompt behind, so `pidAlive` stays true — it catches the tab-is-gone case, nothing more.
 
+## `needs-input` means a human is required — not "quiet for a minute"
+
+Claude Code fires its `Notification` hook for two unrelated things: a real permission/input request,
+and the "waiting for your input" nudge that arrives after ~60s of quiet. The hook command is a fixed
+string (`hook-status needs-input`), so both landed as `needs-input` — the one status asserting a
+human is required, and the one `send`/`nudge` refuse on. Any agent that finished its turn and sat
+quiet therefore falsely claimed to need a human, and an orchestrator reading `list` could not tell a
+blocked worktree from a finished one.
+
+Observed 2026-09-04: five worktree terminals, all correctly stopped after being told to hold, all
+reading `needs-input`; every subsequent `send` needed `--force` to get past a guard that should never
+have been armed.
+
+`bridge_hook_status` now disambiguates on the payload it already drains, so the `settings.json`
+one-liner is unchanged and no reinstall is needed. The idle nudge is really end-of-turn, which is
+exactly `idle` — what the `Stop` hook already writes. **Fail-safe by construction:** only the known
+idle phrasings are downgraded, so an unrecognized or absent message still asserts `needs-input`, and
+a real permission prompt is never silently demoted. `test/hook-status-notification.test.js` pins all
+six cases.
+
+Note this is the same failure shape as the `bg-task` collapse below — a single scalar carrying two
+independent meanings — but the fix is different, because here the two meanings genuinely *are*
+mutually exclusive turn states. Only the source was ambiguous, so disambiguating at the source is
+enough; a new status value would have re-created the collapse.
+
 ## Background work is a second dimension, not a status (v0.21.0+)
 
 `status` is last-writer-wins, and the states written into it aren't mutually exclusive. Turn state (`working`/`idle`/`needs-input`, from `PreToolUse`/`Notification`/`Stop`) and outstanding background work (`bg-task`, from `TaskCreated`) were sharing one field. An agent that started a background task and then ended its turn wrote `bg-task` and had it overwritten moments later — so the tab read `needs-input`, the one status asserting a human is required, for exactly the interval the work was in flight. An orchestrator reading `list` sent attention to a tab that needed nothing.
@@ -92,6 +117,12 @@ Bounded by construction: a ring of the last 3 messages, 4KB each, keeping the **
 
 It degrades to silence, never an error: nothing published reads as an empty list, a quiet turn as `stored: false`, and a malformed payload / missing field / missing `node` as a no-op that still exits 0 — a hook on every Stop must never fail the turn. Two limits worth knowing: it captures only the turn's final text (not tool output or intermediate reasoning), and remote worker nodes aren't covered — a remote job publishes a `note` instead.
 
+## `prUrl` is data plumbing, not a GitHub client (#50, v0.25.0+)
+
+`bridgectl pr <name> <url>` stores a PR url against a tracked terminal; `list` reports it back as `prUrl` / `prSetAt`, `null` when unset. Idempotent by name, last write wins — the same `persistMetadata` merge every other field uses, so no special-case guard was needed.
+
+That's the whole feature. The bridge does not poll GitHub, does not know a token, and does not assert the PR is still open — treat the value as advisory: it may have been merged, closed, or force-pushed since it was set. Whoever needs the PR's actual current state polls it themselves, outside the bridge, the same way background-job status and note bodies are left to the caller.
+
 ## Key endpoints
 
 All endpoints are GET with query-string params (not POST/JSON — see `extension.js`).
@@ -108,6 +139,7 @@ All endpoints are GET with query-string params (not POST/JSON — see `extension
 | `/nudge-terminal` | Bare Enter — releases a paste left staged in the target's input box |
 | `/set-note` · `/note` · `/clear-note` | A worker's short handoff for its orchestrator (`text=` / `textFile=`) |
 | `/set-output` · `/output` · `/clear-output` | Read-back: the turn's final assistant text, pushed in by a Stop hook |
+| `/set-pr` | Record a PR url on a tracked terminal (`name=`, `url=`) — advisory, last write wins |
 | `/sweep` | Dispose terminals whose cwd no longer maps to a live `git worktree` |
 | `/add-folder` / `/remove-folder` | Attach/detach a workspace folder |
 | `/reindex` | Re-link open terminals to persisted metadata |
@@ -128,6 +160,7 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note set <text>|--text-file=<pat
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note get <name>
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh output <name> [--n=<1..3>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh bg-task {start|end|clear} [--name=<name>]
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh pr <name> <url>
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status <status> [--name=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend {cline|claude} [--dir=<repo>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend claude --apply [--settings=<path>]

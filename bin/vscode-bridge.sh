@@ -631,6 +631,26 @@ bridge_note() {
   esac
 }
 
+# bridge_pr <name> <url>
+#
+# Records a PR url against a tracked terminal (bridge v0.25.0+, #50). Data
+# plumbing only — idempotent by name, last write wins. The bridge never polls
+# GitHub or asserts the PR's current state; treat the value as advisory,
+# since it may have been merged, closed, or force-pushed since it was set.
+bridge_pr() {
+  _bridge_active || return 0
+  local name="${1:-}" url="${2:-}"
+  if [ -z "$name" ] || [ -z "$url" ]; then
+    echo "usage: bridgectl.sh pr <name> <url>" >&2
+    return 2
+  fi
+  local port
+  port=$(_bridge_port)
+  curl -fsS -m 2 --get \
+    --data-urlencode "name=$name" --data-urlencode "url=$url" \
+    "http://127.0.0.1:${port}/set-pr" >/dev/null 2>&1 || true
+}
+
 # bridge_bg_task <start|end|clear> [--name=<name>]
 #
 # Report OUTSTANDING BACKGROUND WORK (bridge v0.21.0+) — a dimension of its
@@ -775,6 +795,32 @@ bridge_hook_status() {
     [ -n "$root" ] && name="${root##*/}"
   fi
   if [ -z "$name" ]; then name="${PWD##*/}"; fi
+
+  # `needs-input` is the one status asserting a HUMAN IS REQUIRED — `send`/`nudge`
+  # refuse on it, and an orchestrator reading `list` routes attention to it. But
+  # Claude Code fires its `Notification` hook for two unrelated things: a real
+  # permission/input request, and the "waiting for your input" nudge that arrives
+  # after ~60s of quiet. The hook command is a fixed string, so both landed as
+  # `needs-input` — meaning ANY agent that finished its turn and sat idle for a
+  # minute falsely claimed to need a human. Observed 2026-09-04: five worktree
+  # terminals, all correctly stopped after being told to hold, all reading
+  # `needs-input`; every subsequent `send` needed `--force` to get past a guard
+  # that should never have been armed.
+  #
+  # So disambiguate at the payload, not the call site: the idle nudge is really
+  # end-of-turn, which is exactly `idle` (what the `Stop` hook already writes).
+  # Fail-safe by construction — only the known idle phrasings are downgraded, so
+  # an unrecognized or absent message still asserts `needs-input` and a real
+  # permission prompt is never silently demoted.
+  if [ "$state" = "needs-input" ] && [ -n "$payload" ]; then
+    local msg
+    msg=$(printf '%s' "$payload" \
+      | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    case "$msg" in
+      *[Ww]aiting\ for\ your\ input*|*[Ww]aiting\ for\ user\ input*|*[Hh]as\ been\ idle*)
+        state="idle" ;;
+    esac
+  fi
 
   bridge_status "$name" "$state"
 }

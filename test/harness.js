@@ -27,6 +27,7 @@ let terminalsInWindow = [];
 
 const renames = [];
 let activeTerminal = null;
+let shellIntegrationCbs = [];
 
 const vscodeMock = {
   commands: {
@@ -43,8 +44,19 @@ const vscodeMock = {
   window: {
     get terminals() { return terminalsInWindow; },
     get activeTerminal() { return activeTerminal; },
-    createTerminal: () => makeTerminal('x'),
+    // Faithful to VS Code: the created terminal takes the requested name and
+    // joins window.terminals. #53's idempotency guard reads both, so a mock that
+    // returns a detached 'x' would let a duplicate-tab regression pass.
+    createTerminal: (options) => {
+      const t = makeTerminal((options && options.name) || 'x');
+      terminalsInWindow.push(t);
+      return t;
+    },
     onDidCloseTerminal: () => ({ dispose() {} }),
+    onDidChangeTerminalShellIntegration: (cb) => {
+      shellIntegrationCbs.push(cb);
+      return { dispose() { shellIntegrationCbs = shellIntegrationCbs.filter(c => c !== cb); } };
+    },
     onDidChangeWindowState: () => ({ dispose() {} }),
     showErrorMessage: () => {},
   },
@@ -90,6 +102,10 @@ const context = {
 
 module.exports = { ext, context, state, vscodeMock, makeTerminal, renames,
   addTerminal: t => { terminalsInWindow.push(t); return t; },
+  // Drive the shell-integration-ready path that /open-terminal waits on.
+  fireShellIntegration: terminal => shellIntegrationCbs.forEach(cb => cb({ terminal })),
+  findTerminal: name => terminalsInWindow.find(t => t.name === name),
+  countTerminals: name => terminalsInWindow.filter(t => t.name === name).length,
   get disposed() { return disposed; },
   portFile: path.join(process.env.HOME, '.vscode-terminal-bridge', 'port'),
 };

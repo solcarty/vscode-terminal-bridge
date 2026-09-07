@@ -1000,8 +1000,17 @@ function activate(context) {
           return;
         }
 
-        const entry = JSON.stringify({ ...payload, ts: new Date().toISOString() });
-        const folders = vscode.workspace.workspaceFolders || [];
+        // `repo` names the repo root a status line belongs to. Without it this fanned out
+        // to every workspace folder, so in a multi-root workspace one project's CI status was
+        // appended to `.sdo/pipeline-state.json` in unrelated sibling repos — including ones
+        // the caller does not own. Match it when given; fall back to the first folder, and
+        // never write to all of them.
+        const { repo, ...rest } = payload;
+        const entry = JSON.stringify({ ...rest, ts: new Date().toISOString() });
+        const allFolders = vscode.workspace.workspaceFolders || [];
+        const norm = (p) => path.resolve(p).replace(/\/+$/, '');
+        const matched = repo ? allFolders.filter((f) => norm(f.uri.fsPath) === norm(repo)) : [];
+        const folders = matched.length ? matched : allFolders.slice(0, 1);
         const written = [];
         for (const folder of folders) {
           try {

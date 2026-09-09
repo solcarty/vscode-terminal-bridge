@@ -743,6 +743,83 @@ bridge_status() {
     "http://127.0.0.1:${port}/rename-terminal" >/dev/null 2>&1 || true
 }
 
+# ---------------------------------------------------------------------------
+# Note-before-exit guard (house.health#4589)
+#
+# Two 2026-09-09 sessions ended a turn `idle` with no note — the second one
+# after being explicitly told not to — and in both cases real findings were
+# nearly lost. A prompt-level instruction was tried twice and held neither
+# time, so the guarantee has to live here instead: structural, not requested.
+#
+# The mechanism is a local, per-terminal "when did this turn start" mark,
+# updated only on the transition INTO `working`/`subagent` from something
+# else — not on every `PreToolUse`, which fires repeatedly within a single
+# turn and would keep sliding the mark forward, defeating the comparison
+# below. When the Stop hook then asks for `idle`, the terminal's note
+# timestamp is compared against that mark: a note older than the turn, or
+# missing outright, means this turn's output was never handed off, and the
+# exit is promoted to `needs-input` instead — the one status that asserts a
+# human is required, which is exactly true of a turn that ended without a
+# handoff. A note newer than the mark proves the turn spoke for itself, and
+# idle is left alone.
+#
+# Fails open by construction, matching hook-output's rule that a hook firing
+# on every Stop must never fail the turn: an unreadable local cache, an
+# unreachable bridge, or any other read failure falls through to the
+# requested state unchanged — this only ever narrows `idle` to
+# `needs-input`, never blocks, never errors, never invents a note.
+# ---------------------------------------------------------------------------
+
+_bridge_turn_state_dir() {
+  local dir="$HOME/.vscode-terminal-bridge/turn-state"
+  mkdir -p "$dir" 2>/dev/null || true
+  echo "$dir"
+}
+
+# _bridge_turn_track <name> <state> — updates the local turn-start mark for
+# <name>. Called on every hook_status state (not just `working`), so the
+# cache always reflects the last state actually seen.
+_bridge_turn_track() {
+  local name="$1" state="$2"
+  local file
+  file="$(_bridge_turn_state_dir)/$name"
+  local prev_state="" turn_start=""
+  if [ -r "$file" ]; then
+    IFS=$'\t' read -r prev_state turn_start < "$file" 2>/dev/null || true
+  fi
+  case "$state" in
+    working|subagent)
+      case "$prev_state" in
+        working|subagent) : ;;  # still inside the same turn — leave the mark
+        *) turn_start="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" ;;
+      esac
+      ;;
+  esac
+  printf '%s\t%s\n' "$state" "$turn_start" > "$file" 2>/dev/null || true
+}
+
+# _bridge_idle_needs_note <name> — true (exit 0) if <name>'s note predates
+# the current turn's start mark, or no note exists at all. False (exit 1),
+# including every "can't tell" case, since this must fail open.
+_bridge_idle_needs_note() {
+  local name="$1"
+  local file turn_start=""
+  file="$(_bridge_turn_state_dir)/$name"
+  [ -r "$file" ] || return 1
+  IFS=$'\t' read -r _ turn_start < "$file" 2>/dev/null || return 1
+  [ -n "$turn_start" ] || return 1
+
+  local port note_json note_at
+  port=$(_bridge_port) || return 1
+  note_json=$(curl -fsS -m 2 --get --data-urlencode "name=$name" \
+    "http://127.0.0.1:${port}/note" 2>/dev/null) || return 1
+  note_at=$(printf '%s' "$note_json" \
+    | sed -n 's/.*"noteUpdatedAt"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  [ -n "$note_at" ] || return 0
+  [[ "$note_at" < "$turn_start" ]] && return 0
+  return 1
+}
+
 # bridge_hook_status <status> [--name=<name>]
 # bridge_hook_status <name> <status>
 #
@@ -822,6 +899,13 @@ bridge_hook_status() {
     esac
   fi
 
+  # house.health#4589 — an `idle` Stop can't be trusted at face value; see the
+  # guard's own comment above _bridge_turn_state_dir for why.
+  if [ "$state" = "idle" ] && _bridge_idle_needs_note "$name" 2>/dev/null; then
+    state="needs-input"
+  fi
+
+  _bridge_turn_track "$name" "$state" 2>/dev/null || true
   bridge_status "$name" "$state"
 }
 

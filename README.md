@@ -259,7 +259,7 @@ curl "http://127.0.0.1:${PORT}/list"
     {
       "name": "my-task", "cwd": "/path/to/dir", "label": "my-task",
       "status": "working", "node": null, "jobId": null,
-      "pid": 12345, "live": true, "pidAlive": true,
+      "pid": 12345, "live": true, "pidAlive": true, "agentAlive": true,
       "createdAt": "2026-08-05T09:14:02.881Z",
       "updatedAt": "2026-08-05T11:52:04.019Z",
       "statusChangedAt": "2026-08-05T09:14:11.226Z",
@@ -310,6 +310,8 @@ Status alone answers "what state is this in". The question an orchestrator actua
 **`pidAlive` is narrower than it looks.** The tracked pid is the terminal's *shell*, not the agent inside it, and a crashed `claude` usually drops back to a live shell prompt — so `pidAlive` stays `true`. It catches the tab-is-gone case cheaply; `lastHeartbeatAt` is what distinguishes wedged from working.
 
 **`pidAlive: null` means unknown, never dead (#54, v0.25.0+).** Every `/list` call now re-resolves each tracked terminal's own shell pid live, rather than trusting the value persisted at creation — that persisted pid can be a transient child captured before the shell settled, and once *that* process exits, `pidAlive` used to read `false` forever for a terminal whose shell (and agent) were both fine. A caller following the obvious reaction to "dead" — relaunch — would then start a second agent on a worktree that already had one, which is the exact #53 shape #52/#53 exist to prevent. Resolution is best-effort and time-boxed (250ms) so a slow read never blocks `/list`; an unresolved pid reports `pidAlive: null`, not `false`. **Any consumer doing a bare `if (!pidAlive)` truthiness check now treats "unknown" the same as "dead" — check for `=== false` explicitly.** A corrected pid is persisted as a side effect, so `close`/`sweep` stop aiming at a pid that was never the shell's.
+
+**`agentAlive` answers what `pidAlive` structurally cannot (house.health#4589).** A finished worker, a worker blocked on a question, and a bare shell left behind by a crashed agent all read `pidAlive: true`, because that field only proves the *shell* exists. `agentAlive` checks whether that shell has a live descendant process whose command matches `claude` — the same `pgrep -P <pid>` triage a caller would otherwise reimplement by hand (and the one worth getting right: on the tracked shell pid alone, `ps -p <pid> -o command=` always reads `/bin/zsh -il` for a healthy tab, agent alive or not — check the *child*, not the tracked pid). Same fail-closed contract as `pidAlive`: `null` means unknown, not dead, and only ever appears for a shell that couldn't be resolved or a `pgrep`/`ps` read that timed out (also time-boxed at 250ms). A shell already confirmed dead reports `agentAlive: false` directly, without spending a child-process check on it. **This does not prove the agent is doing anything** — a wedged agent's process is still alive, so pair `agentAlive` with `lastHeartbeatAt` the same way `pidAlive` needs it.
 
 **`lastSendAt` is how you confirm a send was picked up (v0.20.0+).** `/send-text` returning 200 means the text was *written* to the terminal, not read — `sendText` queues in the buffer. Comparing the two timestamps answers what the exit code can't:
 

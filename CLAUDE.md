@@ -20,13 +20,65 @@ The reason: an empty stdout with exit 0 is indistinguishable from "bridge is up,
 
 ## `list` reports age and liveness, never a verdict (v0.18.0+)
 
-Each row carries `createdAt`, `updatedAt`, `statusChangedAt`, `lastHeartbeatAt` and `pidAlive`, plus a top-level `now` to compute ages against.
+Each row carries `createdAt`, `updatedAt`, `statusChangedAt`, `lastHeartbeatAt`, `pidAlive`, and `agentAlive` (house.health#4589), plus a top-level `now` to compute ages against.
 
 `statusChangedAt` moves only when the status **value** changes — repeat `status=working` calls from hooks don't reset it, so "how long has this been working" stays answerable. `lastHeartbeatAt` moves on *every* `/rename-terminal` call including idempotent no-ops, and that's the point: status is self-reported, so a wedged agent and a busy one both say `working` forever. `working` with a 40-minute-old heartbeat is wedged.
 
 Two things the bridge deliberately does not do: it never derives status from staleness (a build legitimately runs quiet for 20 minutes — pick your own threshold), and it never fabricates a timestamp for an entry that predates v0.18.0. `null` means unknown.
 
 `pidAlive` tracks the terminal's **shell**, not the agent inside it. A crashed `claude` usually leaves a live shell prompt behind, so `pidAlive` stays true — it catches the tab-is-gone case, nothing more.
+
+## `agentAlive` is the answer to the question every caller was reimplementing (house.health#4589)
+
+A finished worker, a worker blocked on a real question, and a bare shell left behind by a crashed
+agent all read `pidAlive: true` — that field only ever proved the shell was there, by design (see
+above). house.health#4589 recorded a live incident: a session ended mid-turn with the tab reporting
+`status=idle live=true pidAlive=true`, and `ps -p <pid> -o command` read `/bin/zsh -il` — which is
+exactly what a *healthy* tab also reads, because the tracked pid is the shell either way. Two
+orchestrator actions (`send`, `nudge`) were spent on the corpse before a human checked by hand. The
+correct check was always `pgrep -P <pid>` for a live `claude` descendant, not the tracked pid's own
+name — every caller doing this by hand was one `ps -p` typo away from the same false read.
+
+`agentAlive` runs that check inside `/list` so nobody has to. It reports whether the tracked shell
+has a live child process whose command matches `claude`. Same fail-closed contract as `pidAlive`:
+`null` means unknown, never dead, and is the only thing an unresolved pid or a timed-out `pgrep`/`ps`
+read (time-boxed at 250ms, same box as `pidAlive`) is allowed to report. A shell already confirmed
+dead (`pidAlive: false`) reports `agentAlive: false` directly without spending a child-process read
+on it — a dead shell cannot have a live child.
+
+`agentAlive` does not prove the agent is *doing* anything — a wedged agent's process is still alive.
+Pair it with `lastHeartbeatAt` for that, the same way `pidAlive` always needed to be.
+
+## A Stop hook that refuses to let `idle` lie (house.health#4589)
+
+Two 2026-09-09 sessions ended a turn `idle` with no note — the second one after an explicit
+in-prompt instruction not to — and in both cases real findings were nearly lost. That is direct
+evidence a prompt-level instruction does not hold under a long turn: it was tried twice, once
+explicitly, and failed both times. The fix had to move out of the prompt and into the hook wiring,
+which is the one thing that runs unconditionally on every `Stop`.
+
+`bridge_hook_status` (in `bin/vscode-bridge.sh`, called by the same `Stop → hook-status idle` entry
+this file has always scaffolded — no settings.json change needed) now tracks, locally and per
+terminal, when the current turn actually started: the first transition into `working`/`subagent`
+after anything else. When a `Stop` hook then asks for `idle`, that mark is compared against the
+terminal's own `noteUpdatedAt` (fetched via `/note`, the same endpoint `note get` uses). A note that
+predates the turn — or doesn't exist — means this turn's output was never handed off, and the status
+actually written is `needs-input` instead of `idle`: the one status that asserts a human is required,
+which is precisely true of a turn that ended without a handoff. A note newer than the mark proves the
+turn spoke for itself, and `idle` is left alone.
+
+This is an auto-promotion, not a block. A block (the Stop hook exiting non-zero to force the turn to
+keep going) was considered and rejected: it bets the model responds correctly to being forced back
+in, which is the same class of failure this fix exists to route around, and risks a loop with no
+backstop. Auto-promoting to `needs-input` needs nothing from the model at all — it's a fact the
+bridge asserts about what actually happened, the same way `agentAlive` above is a fact rather than a
+request.
+
+Fails open, not closed, matching this file's `hook-output` rule that a hook firing on every `Stop`
+must never fail the turn: an unreadable local cache, an unreachable bridge, or any other read failure
+falls through to the requested state unchanged. This only ever narrows `idle` to `needs-input` — it
+never blocks, never errors, and never invents a note that wasn't written. The local turn-start cache
+lives at `~/.vscode-terminal-bridge/turn-state/<name>`, one file per tracked terminal name.
 
 ## `needs-input` means a human is required — not "quiet for a minute"
 

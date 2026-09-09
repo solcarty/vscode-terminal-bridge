@@ -196,6 +196,40 @@ function isPidAlive(pid) {
   }
 }
 
+// #4589 — pidAlive proves the SHELL is there, and by this file's own design
+// that's never enough: a crashed agent leaves a live shell prompt behind, so
+// a finished worker, a worker stuck on a question, and a bare dead-agent
+// shell all read pidAlive:true. Every caller was reimplementing the same
+// `pgrep -P <pid>` triage step by hand (and the batch skill got it wrong —
+// see house.health#4589) to answer "is there actually an agent under this
+// shell". Answer it once, here.
+//
+// Same fail-closed contract as isPidAlive: null means unknown, never dead,
+// and the read is time-boxed so a hung pgrep/ps can't block /list. Only
+// meaningful for a pid already confirmed alive — callers pass null/false
+// straight through rather than invoking this.
+async function hasAgentChild(pid) {
+  if (!pid) return null;
+  try {
+    const childPids = await Promise.race([
+      execAsync(`pgrep -P ${pid}`)
+        .then(({ stdout }) => stdout.split('\n').map(s => s.trim()).filter(Boolean))
+        // pgrep exits 1 with empty stdout when the pid has no children — that
+        // is a legitimate "no agent here", not a failed read.
+        .catch(err => (err && err.code === 1) ? [] : Promise.reject(err)),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 250)),
+    ]);
+    if (childPids.length === 0) return false;
+    const cmds = await Promise.all(childPids.map(cpid =>
+      execAsync(`ps -p ${cpid} -o command=`).then(({ stdout }) => stdout.trim()).catch(() => '')
+    ));
+    return cmds.some(cmd => /claude/i.test(cmd));
+  } catch {
+    // pgrep/ps missing, timed out, or otherwise unreadable — unknown, not dead.
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Remote node registry — laptop-side config for offloading jobs to workers
 // (bin/worker.js, running headless on e.g. a Mac Mini). Lives outside any
@@ -1867,6 +1901,22 @@ function activate(context) {
           persistMetadata(context, name, { pid });
         }
       }
+      // #4589 — resolve pidAlive per row first, then only pay for the child-
+      // process check (pgrep + ps, up to 250ms each) on rows whose shell is
+      // actually confirmed alive. A dead or unknown shell can't have a live
+      // agent child, so those pass straight through as false/null.
+      const pidAliveByName = new Map();
+      for (const name of Object.keys(metadata)) {
+        pidAliveByName.set(
+          name,
+          terminals.has(name) && !livePids.has(name) ? null : isPidAlive(metadata[name].pid)
+        );
+      }
+      const agentAliveByName = new Map();
+      await Promise.all(Object.keys(metadata).map(async (name) => {
+        const alive = pidAliveByName.get(name);
+        agentAliveByName.set(name, alive === true ? await hasAgentChild(metadata[name].pid) : alive);
+      }));
       //
       // Timestamps (v0.18.0+) answer the question status alone can't: not
       // "what state is this in" but "does it need me right now". A terminal at
@@ -1889,7 +1939,17 @@ function activate(context) {
         // resolve is exactly the case where asserting death is unsafe, so it
         // fails closed: acting on "unknown" costs a second look, acting on
         // "dead" costs a duplicate agent.
-        pidAlive: terminals.has(name) && !livePids.has(name) ? null : isPidAlive(meta.pid),
+        pidAlive: pidAliveByName.get(name) ?? null,
+        // #4589 — whether the tracked shell has a live descendant process
+        // whose command matches `claude`. This is what pidAlive cannot tell
+        // you: pidAlive is true for a healthy tab AND for one whose agent
+        // crashed back to a bare shell prompt. Same null-means-unknown
+        // contract as pidAlive — a shell confirmed dead or unresolved makes
+        // this null/false without ever running the child-process check, and
+        // a hung pgrep/ps times out to null rather than asserting death.
+        // This does NOT prove the agent is doing anything (a wedged agent's
+        // process is still alive) — pair it with lastHeartbeatAt for that.
+        agentAlive: agentAliveByName.get(name) ?? null,
         createdAt: meta.createdAt ?? null,
         updatedAt: meta.updatedAt ?? null,
         statusChangedAt: meta.statusChangedAt ?? null,

@@ -26,7 +26,7 @@ const PORT_FALLBACK_PATH = path.join(PORT_FALLBACK_DIR, 'port');
 function writeBundledCli(context) {
   try {
     fs.mkdirSync(CLI_INSTALL_DIR, { recursive: true });
-    for (const name of ['vscode-bridge.sh', 'bridgectl.sh', 'bridge-tail.sh']) {
+    for (const name of ['vscode-bridge.sh', 'bridgectl.sh', 'bridge-tail.sh', 'bridge-worker.js']) {
       const src = path.join(context.extensionPath, 'bin', name);
       const dest = path.join(CLI_INSTALL_DIR, name);
       fs.copyFileSync(src, dest);
@@ -874,8 +874,104 @@ const DELIVERY_SUBMITTED   = 'submitted';
 const DELIVERY_UNVERIFIED  = 'submit-unverified';
 const DELIVERY_STAGED      = 'staged';
 const DELIVERY_NUDGE       = 'nudge';
+//   inbox             — a whole message handed to a headless worker's inbox
+//                       (#59). The wrapper wrote it to the agent's stdin as a
+//                       structured message; there is no input box to strand in.
+const DELIVERY_INBOX       = 'inbox';
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ---------------------------------------------------------------------------
+// Headless workers (#59)
+//
+// `bridgectl worker` runs an agent over stream-json inside a tracked terminal
+// and owns an inbox at <cwd>/.bridge-worker/inbox.sock. A terminal whose cwd
+// holds a live worker lock is headless: text goes to the inbox as a message,
+// never typed into the tab — the wrapper doesn't read typed input, and it is
+// the only writer to the agent's stdin.
+//
+// Detection reads the lock, not a registration call, so it holds even when
+// the wrapper's reporting never reached the bridge. A lock whose pid is gone
+// is stale and the terminal reads as an ordinary one again.
+// ---------------------------------------------------------------------------
+const net = require('net');
+const WORKER_DIR = '.bridge-worker';
+const WORKER_REQUEST_TIMEOUT_MS = 3000;
+
+function readWorker(cwd) {
+  if (!cwd) return null;
+  try {
+    const lock = JSON.parse(fs.readFileSync(path.join(cwd, WORKER_DIR, 'lock'), 'utf8'));
+    if (isPidAlive(lock.pid) !== true || !lock.socket || !fs.existsSync(lock.socket)) return null;
+    return lock;
+  } catch {
+    return null;
+  }
+}
+
+// One newline-terminated JSON request, one JSON reply — the inbox protocol in
+// bin/bridge-worker.js. Rejects on connect failure or timeout.
+function workerRequest(socket, payload) {
+  return new Promise((resolve, reject) => {
+    const conn = net.createConnection(socket);
+    let buf = '';
+    const timer = setTimeout(() => { conn.destroy(); reject(new Error('timed out')); }, WORKER_REQUEST_TIMEOUT_MS);
+    conn.setEncoding('utf8');
+    conn.on('connect', () => conn.write(`${JSON.stringify(payload)}\n`));
+    conn.on('data', chunk => { buf += chunk; });
+    conn.on('end', () => {
+      clearTimeout(timer);
+      try { resolve(JSON.parse(buf)); } catch { reject(new Error('malformed reply')); }
+    });
+    conn.on('error', err => { clearTimeout(timer); reject(err); });
+  });
+}
+
+function workerFields(cwd) {
+  const worker = readWorker(cwd);
+  return {
+    mode: worker ? 'headless' : 'terminal',
+    workerPid: worker?.pid ?? null,
+    sessionId: worker?.sessionId ?? null,
+  };
+}
+
+// The inbox half of /send-text. No 409 on status: nothing typed can be read
+// as an answer to a menu here. The one refusal left is the worker's own — a
+// permission request it escalated and is still waiting on, which the caller
+// should answer (/worker-permission) before piling more work behind it.
+async function sendToWorkerInbox(context, name, worker, text, { submit, force, status }) {
+  if (!submit) {
+    return { ok: false, code: 400, name, status, mode: 'headless',
+      error: 'submit=0 has no meaning for a headless worker: its inbox takes whole messages, there is no input box to stage into.' };
+  }
+  const payload = text.replace(/\n+$/, '');
+  let reply;
+  try {
+    reply = await workerRequest(worker.socket, { op: 'send', text: payload, force });
+  } catch (err) {
+    // Not falling back to paste: the tab is running the wrapper, and typed
+    // text would go nowhere while this response claimed it was delivered.
+    return { ok: false, code: 503, name, status, mode: 'headless',
+      error: `Headless worker inbox unreachable (${err.message})` };
+  }
+  if (!reply.ok) {
+    return { ok: false, code: reply.code || 502, name, status, mode: 'headless', error: reply.reason,
+      ...(reply.pending ? { pending: reply.pending } : {}) };
+  }
+  const lastSendAt = await touchLastSend(context, name, DELIVERY_INBOX);
+  return {
+    ok: true, name, status,
+    submitted: true,
+    delivery: DELIVERY_INBOX,
+    mode: 'inbox',
+    // true when the agent was mid-turn: the message waits in the agent's own
+    // input queue and is read without interrupting the running tool.
+    queued: !!reply.queued,
+    bytes: Buffer.byteLength(payload, 'utf8'),
+    lastSendAt,
+  };
+}
 
 async function sendTextToTerminal(context, name, text, opts = {}) {
   const { submit = true, force = false, mode = 'auto', submitDelayMs } = opts;
@@ -891,7 +987,12 @@ async function sendTextToTerminal(context, name, text, opts = {}) {
     return { ok: false, code: 404, error: 'Terminal not found or not live', name };
   }
 
-  const status = loadMetadata(context)[name]?.status ?? null;
+  const meta = loadMetadata(context)[name] ?? {};
+  const status = meta.status ?? null;
+
+  const worker = readWorker(meta.cwd);
+  if (worker) return sendToWorkerInbox(context, name, worker, text, { submit, force, status });
+
   if (!force && PROMPT_STATES.has(status)) {
     return {
       ok: false, code: 409, name, status,
@@ -978,7 +1079,14 @@ async function nudgeTerminal(context, name, opts = {}) {
     return { ok: false, code: 404, error: 'Terminal not found or not live', name };
   }
 
-  const status = loadMetadata(context)[name]?.status ?? null;
+  const meta = loadMetadata(context)[name] ?? {};
+  const status = meta.status ?? null;
+  // Refused rather than reported as delivered: a headless worker has no input
+  // box, so an Enter releases nothing, and inbox sends never strand.
+  if (readWorker(meta.cwd)) {
+    return { ok: false, code: 400, name, status, mode: 'headless',
+      error: 'Headless worker: there is no input box to nudge. Inbox sends are delivered whole (delivery=inbox) and never strand.' };
+  }
   if (!force && PROMPT_STATES.has(status)) {
     return {
       ok: false, code: 409, name, status,
@@ -1797,6 +1905,73 @@ function activate(context) {
       res.writeHead(result.ok ? 200 : code, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(body));
 
+    } else if (url.pathname === '/heartbeat') {
+      // #59 — liveness with no other side effect. A headless worker stamps it
+      // from its agent's event stream: a silent stream is a wedged agent, and
+      // unlike /rename-terminal this never re-renders the tab.
+      const name = url.searchParams.get('name');
+      if (!name) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'name param required' }));
+        return;
+      }
+      if (!loadMetadata(context)[name]) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Terminal not found', name }));
+        return;
+      }
+      await touchHeartbeat(context, name);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, name, lastHeartbeatAt: loadMetadata(context)[name].lastHeartbeatAt }));
+
+    } else if (url.pathname === '/worker-permission') {
+      // #59 — the answer side of a headless worker's escalated permission
+      // prompt. Without behavior= it reads what is pending; with it, it answers.
+      //   behavior=  allow | deny
+      //   message=   reason handed to the agent on deny
+      //   requestId= which request, when more than one is pending
+      const name = url.searchParams.get('name');
+      const behavior = url.searchParams.get('behavior');
+      if (!name) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'name param required' }));
+        return;
+      }
+      if (behavior !== null && !['allow', 'deny'].includes(behavior)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'behavior must be allow or deny' }));
+        return;
+      }
+      const meta = loadMetadata(context)[name];
+      if (!meta) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Terminal not found', name }));
+        return;
+      }
+      const worker = readWorker(meta.cwd);
+      if (!worker) {
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, name, error: 'Not a headless worker (no live .bridge-worker lock in its cwd)' }));
+        return;
+      }
+      let reply;
+      try {
+        reply = await workerRequest(worker.socket, behavior === null
+          ? { op: 'status' }
+          : { op: 'permission', behavior,
+              message: url.searchParams.get('message') || undefined,
+              requestId: url.searchParams.get('requestId') || undefined });
+      } catch (err) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, name, error: `Headless worker inbox unreachable (${err.message})` }));
+        return;
+      }
+      const { code, ...body } = reply;
+      res.writeHead(reply.ok ? 200 : (code || 502), { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(behavior === null
+        ? { ok: reply.ok, name, pending: reply.pending ?? [], busy: reply.busy ?? null }
+        : { ...body, name }));
+
     } else if (url.pathname === '/sweep') {
       // Cross-reference persisted terminals against ground-truth git worktrees
       // and dispose anything whose worktree no longer exists. Self-healing
@@ -1997,6 +2172,11 @@ function activate(context) {
         // was told.
         prUrl: meta.prUrl ?? null,
         prSetAt: meta.prSetAt ?? null,
+        // #59 — `headless` when a live `bridgectl worker` holds the lock in
+        // this row's cwd: send goes to its inbox, status comes from the
+        // agent's event stream, and sessionId is what a takeover resumes.
+        // `terminal` otherwise. workerPid is the wrapper's, not the agent's.
+        ...workerFields(meta.cwd),
       }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, now: new Date().toISOString(), terminals: list }));

@@ -424,6 +424,96 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh nudge my-task
 
 It stamps `lastSendAt` and sets `lastSendDelivery` to `nudge`, so the pickup comparison keeps working after a nudge — a heartbeat later than the nudge is the agent acting on the message it just released.
 
+Refused with **400** on a headless worker (below): it has no input box, and inbox sends never strand.
+
+---
+
+### Headless workers: `bridgectl worker`
+
+*v0.26.0+ ([#59](https://github.com/solcarty/vscode-terminal-bridge/issues/59)).* Most of `/send-text`'s machinery — bracketed paste, `submit-unverified`, `nudge`, the 409 at a prompt — exists because an orchestrator talks to a TUI by typing into it. When no human needs to type into the tab, `bridgectl worker` drives the agent over its structured stream-json channel instead, from **inside** a tracked terminal, so the tab, its icon and its `/list` row all stay:
+
+```bash
+# the tab's startup command (e.g. via open --cmd-file=<kickoff>)
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh worker \
+  --prompt-file=/path/to/kickoff.md --permission-mode=auto --permission-policy=/path/to/policy.json
+```
+
+which runs, for the `claude` backend:
+
+```
+claude -p --input-format stream-json --output-format stream-json --verbose \
+       --session-id <uuid> [--permission-mode <mode>] --permission-prompt-tool stdio [--model <m>]
+```
+
+| Option | Meaning |
+|--------|---------|
+| `--prompt=` / `--prompt-file=` | First message. Without one, the worker starts `idle` and waits for its inbox |
+| `--name=` | Tab to report to (default `$CLAUDE_TAB_NAME`, which the bridge sets on every tab it opens) |
+| `--cwd=` | Working directory (default: the shell's) |
+| `--permission-mode=`, `--model=` | Passed to the agent |
+| `--permission-policy=` | Allowlist file, below. Without one, every prompt the agent's own settings don't decide is escalated |
+| `--resume` | Resume the session in `.bridge-worker/session` instead of starting a new one |
+| `--backend=` | Agent backend (`claude`). Pluggable, like `scaffold --backend` |
+| `--agent-cmd=` | Swap only the executable (a pinned binary, a wrapper script); the backend's arguments are kept |
+| `-- <args>` | Extra arguments appended to the agent's command line |
+
+**What it does.**
+
+- **One worker per cwd.** `<cwd>/.bridge-worker/lock` is created exclusively; a second `bridgectl worker` in the same cwd exits **3** naming the running one. A lock whose pid is gone (a wrapper killed with `-9`) is stale and the next worker takes it over. This closes the double-agent shape at the source rather than trusting every caller to check first.
+- **Inbox.** `<cwd>/.bridge-worker/inbox.sock`, a unix socket. Each message received is written to the agent's stdin as a stream-json `user` message. A message that arrives mid-turn is queued in the agent's own input and read without interrupting the running tool.
+- **The wrapper is the single writer to the agent's stdin.** Never run `claude -p --resume <id>` against a live worker's session: a second writer on the same session interrupts the worker's in-flight tool call.
+- **Reports from real events, not self-report.** A `tool_use` → `status=working`; a `result` event → `status=idle` and the result text published through [`/set-output`](#get-set-output--get-output--get-clear-output); every event stamps the heartbeat (via `/heartbeat`, at most once a second), so a silent stream is a wedged agent; the agent exiting on its own → `status=error` with the exit code and the takeover command in a note. A stop you asked for (Ctrl-C in the tab, `SIGTERM` to the wrapper) is reported as `idle` with a "stopped on request" note instead. The agent runs with `VSCODE_BRIDGE_WORKER=1`, which makes `hook-status` and `hook-output` stand down, so its own hooks don't write a second, self-reported status to the same row.
+- **Renders the stream** readably in the tab — assistant text, one line per tool call, turn ends, permission prompts. Read-only: the wrapper doesn't read typed input.
+- `.bridge-worker/` writes its own `.gitignore`.
+
+**`/send-text` and `/list`.** When a tracked terminal's cwd holds a live worker lock, `/list` reports it as `mode: "headless"` (with `workerPid` and `sessionId`; `mode: "terminal"` otherwise), and `/send-text` delivers to the inbox:
+
+```json
+{ "ok": true, "name": "my-task", "status": "working", "submitted": true,
+  "delivery": "inbox", "mode": "inbox", "queued": true, "bytes": 38,
+  "lastSendAt": "2026-09-11T14:02:11.418Z" }
+```
+
+`queued: true` means the agent was mid-turn. There is no 409 on status — nothing typed can be read as an answer to a menu — except while a permission request is outstanding (`error: "permission-pending"`, with the request in `pending`); answer it first, or pass `force=1` to queue the message behind it anyway. `submit=0` is refused (400): there is no input box to stage into. If the socket is unreachable the send fails (503) rather than falling back to typing into a tab that isn't listening. Terminals without a worker are untouched: same paste path, same responses.
+
+**Permission prompts.** With `--permission-prompt-tool stdio`, anything the agent's own settings don't already allow or deny arrives at the wrapper as a `control_request`/`can_use_tool` event and is answered on the agent's stdin. (The agent's settings are consulted first — a tool its `settings.json` allows never reaches the policy.) The wrapper checks the policy file; anything it doesn't decide sets `status=permission` and waits:
+
+```bash
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh worker pending my-task
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh worker answer my-task allow
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh worker answer my-task deny --message="use the staging db"
+# or: GET /worker-permission?name=my-task[&behavior=allow|deny][&message=...][&requestId=...]
+```
+
+`requestId` is only needed when more than one request is pending. Answering with nothing pending is a 404.
+
+**Policy file format.** JSON, re-read on every prompt so edits apply to a running worker:
+
+```json
+{
+  "allow": ["Read", "Grep", "Glob", "Bash(git status:*)", "Edit(/repo/src/*)", "mcp__github__*"],
+  "deny":  ["Bash(rm:*)"]
+}
+```
+
+- A rule is `Tool` or `Tool(spec)`. `Tool` may use `*` (`mcp__github__*`).
+- `spec` is matched against the tool's subject — the first of `command`, `file_path`, `notebook_path`, `path`, `url`, `pattern` in its input. `*` matches anything; a trailing `:*` means "this command, optionally followed by arguments".
+- `deny` is checked before `allow`. Neither → escalated.
+- **Bash is the one tool where a string match isn't a safety property.** An `allow` rule with a spec never matches a command containing shell operators (`; & | $ ( ) < >`, backticks, newlines) — `Bash(git status:*)` does not allow `git status; rm -rf ~`; that escalates. A bare `Bash` rule still allows everything, because that's what it says. `deny` rules match if any segment of a compound command matches.
+- An invalid file exits the worker with **2** at startup. A file that stops parsing mid-run fails closed: prompts escalate, never auto-allow.
+
+The bridge ships the mechanism only; what goes in the allowlist, and who answers escalations, belongs to the consumer.
+
+**Takeover.** Stop the wrapper (Ctrl-C in the tab), then in the same tab:
+
+```bash
+claude --resume "$(cat .bridge-worker/session)"
+```
+
+or restart it headless with `bridgectl worker --resume`. Never resume while the wrapper is still running.
+
+**Limits.** The inbox is a unix socket, and socket paths are capped near 104 bytes. When `<cwd>/.bridge-worker/inbox.sock` would be longer, the socket goes in the OS temp dir instead (`bridge-worker-<hash of cwd>.sock`); the lock records wherever it is, and that's what the bridge reads. Needs `node` on the PATH.
+
 ---
 
 ### `GET /rename-terminal`

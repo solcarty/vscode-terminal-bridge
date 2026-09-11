@@ -369,6 +369,70 @@ bridge_nudge() {
   esac
 }
 
+# bridge_worker [options] — run an agent headless inside this terminal (#59).
+#
+# Drives the agent over stream-json instead of a TUI, owns an inbox at
+# <cwd>/.bridge-worker/inbox.sock that `send` delivers to, reports status from
+# the agent's real events, and refuses to start a second worker in the same
+# cwd. Full contract: bin/bridge-worker.js and the README's "Headless workers".
+#
+# bridge_worker answer <name> allow|deny [--message=<text>] [--request-id=<id>]
+# bridge_worker pending <name>
+#   Answer, or look at, a permission prompt the worker escalated because its
+#   policy didn't decide it. Loud like bridge_send: failures exit non-zero
+#   with the reason on stdout.
+bridge_worker() {
+  case "${1:-}" in
+    answer|pending) _bridge_worker_permission "$@"; return ;;
+  esac
+  if ! command -v node >/dev/null 2>&1; then
+    echo "bridgectl worker: node is required" >&2
+    return 127
+  fi
+  local here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  node "$here/bridge-worker.js" "$@"
+}
+
+_bridge_worker_permission() {
+  local verb="$1"; shift
+  local name="${1:-}" behavior="" message="" requestId=""
+  [ "$#" -gt 0 ] && shift
+  for arg in "$@"; do
+    case "$arg" in
+      --message=*)    message="${arg#--message=}" ;;
+      --request-id=*) requestId="${arg#--request-id=}" ;;
+      allow|deny)     behavior="$arg" ;;
+      *)              echo '{"ok":false,"reason":"unexpected-argument"}'; return 2 ;;
+    esac
+  done
+  if [ -z "$name" ] || { [ "$verb" = "answer" ] && [ -z "$behavior" ]; }; then
+    echo '{"ok":false,"reason":"usage: bridgectl.sh worker answer <name> allow|deny [--message=<text>] [--request-id=<id>] | worker pending <name>"}' >&2
+    return 2
+  fi
+  [ "$verb" = "pending" ] && behavior=""
+
+  if ! _bridge_active; then
+    echo '{"ok":false,"reason":"bridge-unreachable"}'
+    return 1
+  fi
+  local port out
+  port=$(_bridge_port)
+  set -- --data-urlencode "name=$name"
+  [ -n "$behavior" ]  && set -- "$@" --data-urlencode "behavior=$behavior"
+  [ -n "$message" ]   && set -- "$@" --data-urlencode "message=$message"
+  [ -n "$requestId" ] && set -- "$@" --data-urlencode "requestId=$requestId"
+  if ! out=$(curl -sS -m 5 --get "$@" "http://127.0.0.1:${port}/worker-permission" 2>/dev/null); then
+    echo '{"ok":false,"reason":"bridge-unreachable"}'
+    return 1
+  fi
+  _bridge_emit_json "$out"
+  case "$out" in
+    *'"ok":true'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # _bridge_emit_json <body> — print a bridge response, or a structured stand-in
 # when the running bridge is older than the endpoint we just called (unknown
 # routes answer with a bare `Not found` text body). Callers that parse stdout
@@ -455,6 +519,8 @@ bridge_hook_output() {
     payload="$payload$line"
   done
   [ -z "$payload" ] && return 0
+  # #59 — a headless worker publishes each turn's result itself.
+  [ -n "${VSCODE_BRIDGE_WORKER:-}" ] && return 0
 
   command -v node >/dev/null 2>&1 || return 0
 
@@ -863,6 +929,12 @@ bridge_hook_status() {
       payload="$payload$line"
     done
   fi
+
+  # #59 — under `bridgectl worker` the wrapper reports status from the agent's
+  # real event stream. The agent's own hooks would be a second, self-reported
+  # writer to the same row (and the idle guard would promote a finished turn
+  # to needs-input), so they stand down. Stdin is already drained above.
+  [ -n "${VSCODE_BRIDGE_WORKER:-}" ] && return 0
 
   if [ -z "$name" ]; then name="${CLAUDE_TAB_NAME:-}"; fi
   if [ -z "$name" ] && [ -n "$payload" ]; then

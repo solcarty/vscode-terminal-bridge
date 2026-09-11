@@ -46,6 +46,7 @@ case "$sub" in
   list)   bridge_list   "$@" ;;
   hook-status) bridge_hook_status "$@" ;;
   scaffold)    bridge_scaffold    "$@" ;;
+  worker)      bridge_worker      "$@" ;;
   ping)
     if [ "${1:-}" = "--node" ]; then
       bridge_ping_node "$2" && echo "reachable" || { echo "unreachable"; exit 1; }
@@ -54,7 +55,7 @@ case "$sub" in
     fi
     ;;
   *)
-    echo "usage: bridgectl.sh {open|close|forget|send|nudge|status|rename|sweep|list|ping|hook-status|hook-output|bg-task|note|output|pr|scaffold} [args...]" >&2
+    echo "usage: bridgectl.sh {open|close|forget|send|nudge|status|rename|sweep|list|ping|hook-status|hook-output|bg-task|note|output|pr|scaffold|worker} [args...]" >&2
     echo "       bridgectl.sh open <name> <cwd> [cmd] [icon] [color] [--node=<name>] [--ref=<ref>] [--cmd-file=<path>]" >&2
     echo "       bridgectl.sh send <name> <text>|--text-file=<path> [--no-submit] [--force] [--mode=auto|paste|literal|join] [--submit-delay=<ms>]" >&2
     echo "         (send refuses when the target sits at an interactive prompt — injected text would answer it. --force overrides.)" >&2
@@ -71,6 +72,9 @@ case "$sub" in
     echo "       bridgectl.sh hook-status <status> [--name=<name>]   # reads Cline's stdin payload or Claude's env" >&2
     echo "       bridgectl.sh scaffold --backend {cline|claude} [--dir=<repo>] [--force]" >&2
     echo "       bridgectl.sh scaffold --backend claude --apply [--settings=<path>]   # merge the hooks into settings.json instead of printing them" >&2
+    echo "       bridgectl.sh worker [--prompt=<text>|--prompt-file=<path>] [--permission-mode=<mode>] [--permission-policy=<path>] [--model=<m>] [--resume] [-- <agent args>]" >&2
+    echo "         (runs the agent headless in this tab: send goes to its inbox, status comes from its event stream, one worker per cwd)" >&2
+    echo "       bridgectl.sh worker answer <name> allow|deny [--message=<text>] [--request-id=<id>] | worker pending <name>" >&2
     echo "       bridgectl.sh ping --node <name>" >&2
     exit 2
     ;;

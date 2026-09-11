@@ -187,8 +187,10 @@ All endpoints are GET with query-string params (not POST/JSON — see `extension
 | `/rename-terminal` | Rename / set status icon via `status=` (or `label=`, or `quiet=1`) |
 | `/list` | Query tracked terminals (name, cwd, status, pid, live, timestamps, background work) |
 | `/bg-task` | Report outstanding background work (`op=start|end|clear`) — a dimension of its own, not a status |
-| `/send-text` | Inject text into an already-running tracked terminal (`text=` or `textFile=`) |
-| `/nudge-terminal` | Bare Enter — releases a paste left staged in the target's input box |
+| `/send-text` | Inject text into an already-running tracked terminal (`text=` or `textFile=`); a headless worker (`bridgectl worker`, `mode:"headless"` on `/list`) gets it in its inbox instead (`delivery:"inbox"`) |
+| `/nudge-terminal` | Bare Enter — releases a paste left staged in the target's input box (refused on a headless worker) |
+| `/heartbeat` | Stamp `lastHeartbeatAt` and nothing else — a headless worker calls it from its agent's event stream |
+| `/worker-permission` | A headless worker's escalated permission prompt: read it (no `behavior=`), or answer with `behavior=allow` or `behavior=deny` |
 | `/set-note` · `/note` · `/clear-note` | A worker's short handoff for its orchestrator (`text=` / `textFile=`) |
 | `/set-output` · `/output` · `/clear-output` | Read-back: the turn's final assistant text, pushed in by a Stop hook |
 | `/set-pr` | Record a PR url on a tracked terminal (`name=`, `url=`) — advisory, last write wins |

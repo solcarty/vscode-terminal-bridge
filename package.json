@@ -22,6 +22,11 @@
           "type": "string",
           "default": ".sdo",
           "description": "Directory (relative to each workspace folder) that /api/status appends pipeline-state.json into."
+        },
+        "terminalBridge.agentId": {
+          "type": "string",
+          "default": "",
+          "description": "Identity this window's main agent announces to the presence registry (/announce, /api/bridges). Falls back to the workspace name, then the first folder's name, when unset."
         }
       }
     }

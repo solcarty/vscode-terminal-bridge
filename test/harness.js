@@ -64,8 +64,16 @@ const vscodeMock = {
     workspaceFolders: [],
     onDidChangeWorkspaceFolders: () => ({ dispose() {} }),
     updateWorkspaceFolders: () => true,
-    getConfiguration: () => ({ get: () => undefined }),
+    // Real vscode.workspace.getConfiguration(section).get(key, default) returns
+    // `default` when nothing is configured — mirror that rather than always
+    // returning undefined, or every setting read in extension.js would need a
+    // per-test override just to get its documented default behavior. Tests
+    // that need a configured value can set `vscodeMock._config[key] = value`.
+    getConfiguration: () => ({
+      get: (key, def) => (key in vscodeMock._config ? vscodeMock._config[key] : def),
+    }),
   },
+  _config: {},
   ThemeIcon: class { constructor(id) { this.id = id; } },
   ThemeColor: class { constructor(id) { this.id = id; } },
   Uri: { file: p => ({ fsPath: p, path: p }) },

@@ -1,7 +1,7 @@
 {
   "name": "terminal-bridge",
   "displayName": "SDO Terminal Bridge",
-  "description": "Opens named terminal tabs via HTTP — used by /worktree-start",
+  "description": "Opens, renames, and closes VS Code terminal tabs via a local HTTP API",
   "version": "0.26.0",
   "scripts": {
     "test": "node test/run.js"
@@ -14,5 +14,16 @@
   "engines": { "vscode": "^1.70.0" },
   "activationEvents": ["onStartupFinished"],
   "main": "./extension.js",
-  "contributes": {}
+  "contributes": {
+    "configuration": {
+      "title": "Terminal Bridge",
+      "properties": {
+        "terminalBridge.pipelineStateDir": {
+          "type": "string",
+          "default": ".sdo",
+          "description": "Directory (relative to each workspace folder) that /api/status appends pipeline-state.json into."
+        }
+      }
+    }
+  }
 }

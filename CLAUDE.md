@@ -6,6 +6,8 @@ A VS Code extension that exposes a local HTTP API for managing terminal tabs pro
 
 Application-agnostic — any repo or process can call it via HTTP. Not coupled to any specific consuming project.
 
+**This file is the design record; [`README.md`](README.md) is the contract.** Endpoints, fields, settings, the CLI surface and the composition patterns belong there — a caller should never have to read this file to use the extension. What belongs here is the *why*: which incident forced a field's shape, what a contract deliberately refuses to do, and which alternative was rejected. A change that alters behaviour updates both — the reference there, the reasoning here. v0.27.0 shipped documented only in this file, which is the failure this note exists to prevent.
+
 ## How it works
 
 - On activation: starts an HTTP server on `127.0.0.1:31415` (increments port if taken)

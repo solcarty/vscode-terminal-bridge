@@ -4,10 +4,13 @@ A tiny VS Code extension that exposes a local HTTP API for managing terminal tab
 
 Built to solve a real problem: VS Code extensions and external scripts **cannot** reliably open terminals using AppleScript, keystrokes, or CLI flags. This extension uses the native `vscode.window.createTerminal` API, exposed via a local-only HTTP server.
 
+It has since grown into the substrate for running **agents** in terminals — spawning them, telling a working one from a wedged one, reading results back, and supervising several at once. If that is what you're here for, the [API](#api) is the reference and [Implementation patterns](#implementation-patterns) is how the pieces compose.
+
+> **Where things are documented.** This README is the contract: every endpoint, field, setting and pattern a caller needs. [`CLAUDE.md`](CLAUDE.md) is the design record — why a field is shaped the way it is, and which incident made it necessary. When behaviour changes, both change: the reference here, the reasoning there.
+
 ## How it works
 
 On activation, the extension starts an HTTP server on `127.0.0.1`. It tries port **31415** first; if that port is already taken (e.g. a second VS Code window is open), it increments until it finds a free port (`31416`, `31417`, …), giving up after 32 attempts.
-(Before v0.19.0 the retry re-tried `31416` forever, so a **third** window never bound at all and never wrote a port file — its shells fell back to another window's bridge.)
 
 Once bound, the extension writes the active port to a `.vscode-bridge-port` file in **every workspace folder**. Scripts discover their window's port by reading this file from the repo root — no hardcoded port, no guessing which window is which.
 
@@ -90,9 +93,14 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note set <text>|--text-file=<pat
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note get <name>                             # read one back
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh output <name> [--n=<1..3>]                  # read back what it last said
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh pr <name> <url>                             # record a PR url (advisory, last write wins)
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh rename <name> <label> [icon] [color]   # prefer `status` — it owns icon+color
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh announce <status>                           # this window's own agent, not a tab
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh agents                                      # every live window — cwd-independent
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh worker --prompt-file=<path> [--permission-mode=<m>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh sweep
-bash ~/.vscode-terminal-bridge/bin/bridgectl.sh ping
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh ping [--node=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status <status> [--name=<name>]
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-output                                 # Stop hook: publish the turn's final text
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend {cline|claude} [--dir=<repo>] [--force]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend claude --apply [--settings=<path>]   # merge the hooks, don't print them
 ```
@@ -107,15 +115,15 @@ bridge_status "$NAME" working
 
 Both handle port discovery (walking up for `.vscode-bridge-port`, preferring `$VSCODE_BRIDGE_PORT` when set — see [Multi-window setup](#multi-window-setup)), falling back to `~/.vscode-terminal-bridge/port` when the caller's cwd sits outside every workspace folder. `bridge_open` and `bridge_status` return a non-zero exit code and print an error to stderr on real failures (bridge unreachable, malformed args, bridge-reported error) rather than swallowing them. Source: `bin/` in this repo.
 
-**Mutating vs. query commands (v0.16.0+).** `open`/`close`/`status`/`rename`/`sweep` no-op silently when the bridge isn't reachable — hooks call them outside VS Code and shouldn't fail under `set -e`. **`list` is different:** it prints `{"ok":false,"reason":"bridge-unreachable"}` and exits non-zero, because an empty result with exit 0 is indistinguishable from "bridge is up, tracking zero terminals". Anything polling `list` to decide whether a terminal is still alive would read that silence as fact and conclude a dead tab was simply an empty list. **If you consume `list`, check the exit code** rather than treating empty output as "no terminals".
+**Mutating vs. query commands.** `open`/`close`/`status`/`rename`/`sweep` no-op silently when the bridge isn't reachable — hooks call them outside VS Code and shouldn't fail under `set -e`. **`list` is different:** it prints `{"ok":false,"reason":"bridge-unreachable"}` and exits non-zero, because an empty result with exit 0 is indistinguishable from "bridge is up, tracking zero terminals". Anything polling `list` to decide whether a terminal is still alive would read that silence as fact and conclude a dead tab was simply an empty list. **If you consume `list`, check the exit code** rather than treating empty output as "no terminals".
 
-`send` (v0.17.0+) follows `list`, not the mutating commands: a message you believe was delivered but wasn't is worse than a loud failure, so an unreachable bridge, an unknown name, or a dead terminal all exit non-zero with a JSON reason.
+`send` follows `list`, not the mutating commands: a message you believe was delivered but wasn't is worse than a loud failure, so an unreachable bridge, an unknown name, or a dead terminal all exit non-zero with a JSON reason.
 
 ## Workspace requirement
 
 The `.vscode-bridge-port` file is written to each **workspace folder** — a path that VS Code has open as a root in the Explorer. If you open a loose file or a folder that isn't part of a workspace, no per-folder port file is written there.
 
-Since v0.16.0 the extension also writes the active port to `~/.vscode-terminal-bridge/port`, which the shell helpers consult when walking up from `$PWD` finds nothing. This matters for **agent-spawned shells**: they inherit neither `$TERM_PROGRAM` nor `$VSCODE_BRIDGE_PORT`, so the walk-up was previously their only discovery path — and a shell that had `cd`'d to `/tmp` or a scratch directory would conclude "no bridge" while the server was running perfectly well. A caller's working directory is not evidence about whether a local HTTP server exists. Port discovery still falls back to `31415` if neither file is present.
+The extension also writes the active port to `~/.vscode-terminal-bridge/port`, which the shell helpers consult when walking up from `$PWD` finds nothing. This matters for **agent-spawned shells**: they inherit neither `$TERM_PROGRAM` nor `$VSCODE_BRIDGE_PORT`, so the walk-up was previously their only discovery path — and a shell that had `cd`'d to `/tmp` or a scratch directory would conclude "no bridge" while the server was running perfectly well. A caller's working directory is not evidence about whether a local HTTP server exists. Port discovery still falls back to `31415` if neither file is present.
 
 For the port file to work correctly, your repo root must be open as a workspace folder (the normal case when you open a folder with `code .` or `code-insiders .`). When you add worktrees with `/add-folder`, the extension writes the port file there too, so hooks and scripts running inside a worktree terminal always find the right port.
 
@@ -134,6 +142,27 @@ This gives you:
 - `${rootWorkspaceFolderName}` — always shows the workspace folder name on the right
 - `${sequence}` — shows any OSC title sequences emitted by the shell on the left
 - Once a terminal is renamed via `/rename-terminal` (e.g. with `status=working`), its static label replaces this computed format entirely — that's how bridge-managed status icons actually show up in the tab
+
+## Settings
+
+Two, both per-window (set them in `.vscode/settings.json` for a workspace, or in user settings):
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `terminalBridge.agentId` | unset | Names the agent driving this window, for [presence](#get-announce--get-apibridges). Falls back to the workspace name VS Code shows in its title bar, then the first workspace folder's basename, then `null` — never fabricated. Set it when the folder name isn't the identity you want other windows to see. |
+| `terminalBridge.pipelineStateDir` | `.sdo` | Directory, relative to the matched workspace folder, where [`/api/status`](#post-apistatus) appends `pipeline-state.json`. The default is a private consumer's convention kept for compatibility; point it somewhere of your own. |
+
+## What the extension injects into every terminal it opens
+
+`/open-terminal` exports three variables into the shell it creates. Anything running in that tab — hooks, subshells, scripts — inherits them, which is how a hook fired deep inside an agent's tool call still knows which window and which tab it belongs to:
+
+| Variable | Value |
+| --- | --- |
+| `VSCODE_BRIDGE_PORT` | The exact port of the window that spawned this terminal. Preferred over any port file, and the reason a bridge-spawned tab is immune to the [multi-window race](#multi-window-setup). |
+| `VSCODE_BRIDGE_ORCHESTRATOR_ID` | The tab's tracked `name` — what `hook-status` and `note set` resolve themselves to without being told. |
+| `VSCODE_BRIDGE_STATUS_URL` | Fully-formed `http://127.0.0.1:<port>/api/status` for this window. |
+
+*v0.27.0+ ([#57](https://github.com/solcarty/vscode-terminal-bridge/issues/57)).* The last two were previously `HH_ORCHESTRATOR_ID` and `HH_BRIDGE_STATUS_URL` — named after one private consumer, in a general-purpose extension's public contract. **This release exports both the old and the new names**, so nothing that reads either breaks; the `HH_`-prefixed pair is deprecated and will be dropped in a later release. Update your scripts to the `VSCODE_BRIDGE_` names now.
 
 ## API
 
@@ -167,6 +196,59 @@ curl http://127.0.0.1:$PORT/ping
 ```
 
 `workspaceFolders` lets you confirm you're talking to the right window — each window's bridge lists only its own workspace roots.
+
+---
+
+### `GET /announce` · `GET /api/bridges`
+
+*v0.27.0+ ([#55](https://github.com/solcarty/vscode-terminal-bridge/issues/55)).* Presence for the agent **driving** a window, as opposed to the tabs it spawns.
+
+Everything else in this API describes bridge-managed terminals. The main agent is not one of them — it is the session you talk to, which opens those tabs. It cannot be observed the way a tab is, so it announces itself:
+
+```bash
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh announce working
+# or: curl "http://127.0.0.1:${PORT}/announce?status=working"
+```
+
+`status` reuses the [status vocabulary](#status-values) and the same discipline as terminal status: `statusChangedAt` moves only on a value *change*, `lastHeartbeatAt` moves on every call. Same honesty caveat as everywhere else here — it is what was last announced, not what is true now.
+
+Read every live window back:
+
+```bash
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh agents
+# or: curl "http://127.0.0.1:${PORT}/api/bridges"
+```
+
+```json
+{
+  "ok": true,
+  "now": "2026-09-12T10:44:31Z",
+  "bridges": [
+    {
+      "id": "6f1c…", "port": 31415, "pid": 12345,
+      "self": true, "pidAlive": true,
+      "agentId": "house.health", "status": "working",
+      "startedAt": "2026-09-12T10:00:00Z",
+      "statusChangedAt": "2026-09-12T10:31:02Z",
+      "lastHeartbeatAt": "2026-09-12T10:44:17Z",
+      "workspaceName": "house.health",
+      "workspaceFolders": ["/Users/you/Workspace/house.health"]
+    }
+  ]
+}
+```
+
+(`bridgectl agents` returns the same rows under an `agents` key rather than `bridges`, since it never talks to a bridge to produce them.)
+
+**`agents` is the one command that does not go through any bridge's HTTP server.** It reads `~/.vscode-terminal-bridge/bridges/` off disk directly, because reaching a bridge over HTTP means already knowing a port — the exact thing cross-window discovery cannot assume. So it works from any cwd, with zero live bridges, and with no bridge reachable at all. This is also why it is the answer to `list`'s cwd-dependence: an empty `list` means "cwd outside a known workspace", an empty `agents` means "no windows are up".
+
+One file per live window is written at `~/.vscode-terminal-bridge/bridges/<id>.json` on activation (rewritten when workspace folders change) and removed on clean deactivation. `id` is a fresh UUID per activation, deliberately not persisted across reloads: a reloaded window is a new process with a new pid, and a reused id would let a stale entry's pid check pass by accident.
+
+**Reaping is fail-closed**, matching [`pidAlive`/`agentAlive`](#timestamps-and-liveness): an entry is removed only on a *confirmed*-dead pid, never on a stale heartbeat. An unresolvable pid is reported and left in place. The bridge does not derive "abandoned" from heartbeat age — it reports the timestamps and lets you pick a threshold, the same rule that applies to terminals.
+
+The legacy single `~/.vscode-terminal-bridge/port` file is still written alongside the registry for existing callers. It is deprecated for cross-window discovery, not removed.
+
+**Presence only — agent-to-agent messaging is deliberately out of scope.** `send`/`nudge` still target bridge-managed terminals within the calling window's own bridge. Knowing another window is up is not a channel into it.
 
 ---
 
@@ -219,7 +301,7 @@ Response:
 
 The bundled `bridgectl.sh open` client checks this response and returns a non-zero exit code (printing the error to stderr) if the bridge couldn't be reached or reported failure — it no longer swallows every error with a blind `|| true`.
 
-#### `open` is idempotent by name, and the response is not a delivery claim (v0.25.0+)
+#### `open` is idempotent by name, and the response is not a delivery claim
 
 **Idempotent by name (#53).** A client that times out (`curl`'s own timeout is shorter than the shell-integration fallback below) and retries used to leave **two** tabs against **one** registry row — the first an orphan `list` can't see and `close`/`sweep` can't target, and if the timed-out attempt also ran `cmd`, two agents on one worktree branch. Now, if `name` is already tracked *and* its terminal is still live in the window, `open` hands back the existing tab and runs nothing further: `reused: true`, `delivery: "skipped-reused"` — the command is deliberately **not** re-run, since an agent may already be working in a reused tab and relaunching over it is exactly the destructive shape this exists to prevent. A tracked name whose terminal is gone (a stale row) still creates fresh, as before.
 
@@ -281,7 +363,7 @@ curl "http://127.0.0.1:${PORT}/list"
 }
 ```
 
-#### Timestamps and liveness (v0.18.0+)
+#### Timestamps and liveness
 
 Status alone answers "what state is this in". The question an orchestrator actually has is *does this need me right now* — and a terminal at `needs-input` for two minutes and one at `needs-input` for two hours are the same row without a clock.
 
@@ -291,15 +373,15 @@ Status alone answers "what state is this in". The question an orchestrator actua
 | `updatedAt` | Any metadata write — status, rename, pid, color. |
 | `statusChangedAt` | The status **value** changes. A `PreToolUse` hook firing `status=working` every few seconds does *not* reset it, or "how long has this been working" becomes unanswerable. |
 | `lastHeartbeatAt` | **Any** `/rename-terminal` call lands, including the idempotent no-ops. |
-| `cmdDeliveredAt` | `open`'s startup command is actually written to the shell — see [`cmdDelivery`](#open-is-idempotent-by-name-and-the-response-is-not-a-delivery-claim-v0250) (v0.25.0+). |
+| `cmdDeliveredAt` | `open`'s startup command is actually written to the shell — see [`cmdDelivery`](#open-is-idempotent-by-name-and-the-response-is-not-a-delivery-claim) (v0.25.0+). |
 | `lastSendAt` | A `/send-text` call **submits** text into this terminal (v0.20.0+), or a `/nudge-terminal` lands (v0.24.0+). Staged text (`submit=0`) and refused sends don't stamp. |
-| `lastSendDelivery` | Written alongside `lastSendAt` (v0.24.0+): `submitted` \| `submit-unverified` \| `nudge`. Not a timestamp — it's *how much* the last write can be trusted; see [below](#lastsenddelivery-tells-you-how-much-lastsendat-is-worth-v0240). |
+| `lastSendDelivery` | Written alongside `lastSendAt` (v0.24.0+): `submitted` \| `submit-unverified` \| `nudge`. Not a timestamp — it's *how much* the last write can be trusted; see [below](#get-list). |
 | `bgTaskStartedAt` | `pendingTasks` goes from 0 to 1 (v0.21.0+). Cleared when the count returns to 0, so it can't outlive the work it described. |
 | `lastOutputAt` | A Stop hook publishes the turn's final assistant text (v0.23.0+). Bodies come from [`/output`](#get-set-output--get-output--get-clear-output), never from `/list`. |
 | `noteUpdatedAt` | A worker publishes a note via `/set-note` (v0.22.0+). The **body is not in `/list`** — fetch it from [`/note`](#get-set-note--get-note--get-clear-note) for the entries whose timestamp moved. |
 | `prSetAt` | A caller sets `prUrl` via [`/set-pr`](#get-set-pr) (v0.25.0+). Last write wins. |
 
-`pendingTasks` / `bgTask` / `displayStatus` (v0.21.0+) carry the background-work dimension — see [`/bg-task`](#get-bg-task) for why that is separate from `status`. `status` remains the raw turn state; `displayStatus` is what the tab renders.
+`pendingTasks` / `bgTask` / `displayStatus` carry the background-work dimension — see [`/bg-task`](#get-bg-task) for why that is separate from `status`. `status` remains the raw turn state; `displayStatus` is what the tab renders.
 
 `now` is the bridge's clock at response time, so callers compute ages against it rather than their own.
 
@@ -313,7 +395,7 @@ Status alone answers "what state is this in". The question an orchestrator actua
 
 **`agentAlive` answers what `pidAlive` structurally cannot (house.health#4589).** A finished worker, a worker blocked on a question, and a bare shell left behind by a crashed agent all read `pidAlive: true`, because that field only proves the *shell* exists. `agentAlive` checks whether that shell has a live descendant process whose command matches `claude` — the same `pgrep -P <pid>` triage a caller would otherwise reimplement by hand (and the one worth getting right: on the tracked shell pid alone, `ps -p <pid> -o command=` always reads `/bin/zsh -il` for a healthy tab, agent alive or not — check the *child*, not the tracked pid). Same fail-closed contract as `pidAlive`: `null` means unknown, not dead, and only ever appears for a shell that couldn't be resolved or a `pgrep`/`ps` read that timed out (also time-boxed at 250ms). A shell already confirmed dead reports `agentAlive: false` directly, without spending a child-process check on it. **This does not prove the agent is doing anything** — a wedged agent's process is still alive, so pair `agentAlive` with `lastHeartbeatAt` the same way `pidAlive` needs it.
 
-**`lastSendAt` is how you confirm a send was picked up (v0.20.0+).** `/send-text` returning 200 means the text was *written* to the terminal, not read — `sendText` queues in the buffer. Comparing the two timestamps answers what the exit code can't:
+**`lastSendAt` is how you confirm a send was picked up.** `/send-text` returning 200 means the text was *written* to the terminal, not read — `sendText` queues in the buffer. Comparing the two timestamps answers what the exit code can't:
 
 | Observation | Means |
 |---|---|
@@ -323,7 +405,7 @@ Status alone answers "what state is this in". The question an orchestrator actua
 
 Watching for a status *transition* instead doesn't work: hooks fire on tool calls, so an agent that reasons for a while before acting still reads `needs-input` long after your text landed — and a transition that does happen can't be attributed to your send rather than to the agent acting on its own. A heartbeat *after* your send is attributable in a way a bare status change never is.
 
-**`lastSendDelivery` tells you how much `lastSendAt` is worth (v0.24.0+).** The comparison above assumes the text was actually submitted. On the bracketed-paste path that isn't a safe assumption — a TUI collapses a large paste into a `[Pasted text #N +M lines]` placeholder, and against a busy target the Enter can be discarded rather than buffered, leaving the message parked in the input box where waiting will never consume it ([#48](https://github.com/solcarty/vscode-terminal-bridge/issues/48)). VS Code exposes no read side for a terminal, so the bridge cannot see which happened — it records which path was taken and lets you act on that:
+**`lastSendDelivery` tells you how much `lastSendAt` is worth.** The comparison above assumes the text was actually submitted. On the bracketed-paste path that isn't a safe assumption — a TUI collapses a large paste into a `[Pasted text #N +M lines]` placeholder, and against a busy target the Enter can be discarded rather than buffered, leaving the message parked in the input box where waiting will never consume it ([#48](https://github.com/solcarty/vscode-terminal-bridge/issues/48)). VS Code exposes no read side for a terminal, so the bridge cannot see which happened — it records which path was taken and lets you act on that:
 
 | `lastSendDelivery` | Meaning |
 |---|---|
@@ -341,7 +423,7 @@ Or via the bundled client: `bash ~/.vscode-terminal-bridge/bin/bridgectl.sh list
 
 ### `GET /send-text`
 
-*v0.17.0+.* Injects text into an **already-running** tracked terminal. `/open-terminal`'s `cmd` only fires at spawn, so before this the only way to get a message into a live agent session was a close + re-open — which restarts it and loses its in-memory context. This delivers to the session that's already there.
+Injects text into an **already-running** tracked terminal. `/open-terminal`'s `cmd` only fires at spawn, so before this the only way to get a message into a live agent session was a close + re-open — which restarts it and loses its in-memory context. This delivers to the session that's already there.
 
 | Param | Default | Meaning |
 |-------|---------|---------|
@@ -383,7 +465,7 @@ curl -G "http://127.0.0.1:${PORT}/send-text" \
 
 **Exit 0 means delivered, not received.** `sendText` queues in the terminal buffer when the target is mid-execution, so a successful response says the text was written — not that the agent read it or acted on it. To confirm pickup, compare `lastHeartbeatAt` against `lastSendAt` in `/list`: a heartbeat *after* your send means the agent has acted since your text landed (v0.20.0+). Don't watch for a status transition instead — hooks fire on tool calls, so a status can lag a pickup by minutes, and a transition that does occur can't be attributed to your send.
 
-**`delivery` says which of those two things "written" means (v0.24.0+).** `submitted: true` only ever meant *an Enter was written*, and on the paste path that is weaker than it reads: the TUI collapses a large paste into a `[Pasted text #N +M lines]` placeholder, registering the placeholder is asynchronous, and an Enter that arrives mid-turn can be dropped rather than buffered — so the message sits in the input box indefinitely and no amount of patience moves it ([#48](https://github.com/solcarty/vscode-terminal-bridge/issues/48)). Two changes follow:
+**`delivery` says which of those two things "written" means.** `submitted: true` only ever meant *an Enter was written*, and on the paste path that is weaker than it reads: the TUI collapses a large paste into a `[Pasted text #N +M lines]` placeholder, registering the placeholder is asynchronous, and an Enter that arrives mid-turn can be dropped rather than buffered — so the message sits in the input box indefinitely and no amount of patience moves it ([#48](https://github.com/solcarty/vscode-terminal-bridge/issues/48)). Two changes follow:
 
 - The submit is now written `submitDelayMs` after the paste (default 250ms) so the placeholder has time to register. Raise it for a slow target; `submitDelayMs=0` restores the pre-v0.24.0 timing.
 - The response reports `delivery` — `submitted` on the direct path, `submit-unverified` on the paste path, `staged` for `submit=0`. `submitted` is kept for older callers but read `delivery` instead. It is also persisted to `/list` as `lastSendDelivery`, so an orchestrator polling one endpoint sees the difference.
@@ -403,7 +485,7 @@ Note this closes only the orchestrator→agent half of the loop. Reading a termi
 
 ### `GET /nudge-terminal`
 
-*v0.24.0+.* Sends a **bare Enter** into a tracked terminal — no text. The recovery path for a `submit-unverified` send whose payload is sitting unread in the target's input box ([#48](https://github.com/solcarty/vscode-terminal-bridge/issues/48)).
+Sends a **bare Enter** into a tracked terminal — no text. The recovery path for a `submit-unverified` send whose payload is sitting unread in the target's input box ([#48](https://github.com/solcarty/vscode-terminal-bridge/issues/48)).
 
 | Param | Default | Meaning |
 |-------|---------|---------|
@@ -546,8 +628,8 @@ Renames a tracked terminal tab and optionally updates its icon and color. Suppor
 | `error` | `$(error)` | red | `PostToolUseFailure` / `StopFailure` — needs human eyes |
 | `compacting` | `$(archive)` | blue | `PreCompact` — auto-compaction running |
 | `subagent` | `$(symbol-array)` | magenta | `SubagentStart` — parallel sub-agent active |
-| `bg-task` | `$(server-process)` | blue | `TaskCreated` — **routed to the background-work dimension** (v0.21.0+), see below. Prefer `/bg-task?op=start` |
-| `task-done` | `$(check-all)` | green | `TaskCompleted` — decrements the background count when work is outstanding (v0.21.0+); otherwise a sticky "go look at this" badge |
+| `bg-task` | `$(server-process)` | blue | `TaskCreated` — **routed to the background-work dimension**, see below. Prefer `/bg-task?op=start` |
+| `task-done` | `$(check-all)` | green | `TaskCompleted` — decrements the background count when work is outstanding; otherwise a sticky "go look at this" badge |
 | `pr-open` | `$(pass-filled)` | green | After `gh pr create` |
 | `merged` | `$(git-merge)` | magenta | After merge |
 | `none` | *(strip prefix)* | *(unchanged)* | Manual reset |
@@ -605,7 +687,7 @@ Returns `404` if the terminal is not in the registry (e.g. opened before the las
 
 ### `GET /set-output` · `GET /output` · `GET /clear-output`
 
-Read-back: what the agent in a tracked terminal last **said**, so an orchestrating session can learn the outcome of work it delegated without a human copy-pasting it back (v0.23.0+).
+Read-back: what the agent in a tracked terminal last **said**, so an orchestrating session can learn the outcome of work it delegated without a human copy-pasting it back.
 
 | Endpoint | Parameters | Purpose |
 | -------- | ---------- | ------- |
@@ -658,7 +740,7 @@ Both are self-reports, and they answer different questions. A [note](#get-set-no
 
 ### `GET /set-note` · `GET /note` · `GET /clear-note`
 
-A short handoff a worker publishes for its orchestrator to read (v0.22.0+).
+A short handoff a worker publishes for its orchestrator to read.
 
 | Endpoint | Parameters | Purpose |
 | -------- | ---------- | ------- |
@@ -743,7 +825,7 @@ The same 4KB cap applies at both ends.
 
 ### `GET /bg-task`
 
-Reports **outstanding background work**, which is a dimension of its own — not a `status=` value (v0.21.0+).
+Reports **outstanding background work**, which is a dimension of its own — not a `status=` value.
 
 | Parameter | Required | Description |
 | --------- | -------- | ----------- |
@@ -820,7 +902,7 @@ Response:
 { "ok": true, "name": "my-tab", "outcome": "closed", "method": "dispose" }
 ```
 
-`outcome` (v0.19.0+) is the field to branch on:
+`outcome` is the field to branch on:
 
 | `outcome` | HTTP | Means |
 | --------- | ---- | ----- |
@@ -833,7 +915,7 @@ was found, `"pid-kill"` when the registry had no object reference and the
 persisted shell PID was signalled instead. `row-removed` reports
 `"method": "registry"`.
 
-**`close` reconciles the registry, not just the terminal object** (v0.19.0+).
+**`close` reconciles the registry, not just the terminal object.**
 Before this, closing a name whose process had already exited returned success
 having done nothing, and left a row that no targeted verb could remove —
 `/sweep` was the only escape, and `/sweep` takes no target, so clearing one
@@ -872,7 +954,7 @@ return `404` with `"outcome": "not-tracked"`.
 
 ### `GET /set-pr`
 
-Records a PR url against a tracked terminal (#50, v0.25.0+). Data plumbing only.
+Records a PR url against a tracked terminal ([#50](https://github.com/solcarty/vscode-terminal-bridge/issues/50)). Data plumbing only.
 
 | Parameter | Required | Description |
 | --------- | -------- | ----------- |
@@ -963,6 +1045,20 @@ Response:
 ```json
 { "ok": true, "path": "/path/to/worktree", "removed": true, "wasAttached": true }
 ```
+
+---
+
+### `POST /api/status`
+
+Appends a JSON line to `<pipelineStateDir>/pipeline-state.json` in a workspace folder — an append-only log for pipeline/CI state, as opposed to the live tab state everything else here deals with. The directory is [`terminalBridge.pipelineStateDir`](#settings) (default `.sdo`).
+
+```bash
+curl -X POST "$VSCODE_BRIDGE_STATUS_URL" \
+  -H 'Content-Type: application/json' \
+  -d '{"repo":"/Users/you/Workspace/my-repo","stage":"build","state":"green"}'
+```
+
+`repo` names which workspace folder the line belongs to; the rest of the payload is yours, stamped with a `ts`. **Send `repo`.** Without it, a multi-root workspace has no way to tell which project a status line is about, so the write falls back to the *first* folder only — it deliberately never fans out to all of them, which is how one project's CI status previously ended up appended inside unrelated sibling repos.
 
 ---
 
@@ -1118,7 +1214,7 @@ curl -s "http://127.0.0.1:${PORT}/rename-terminal?name=$N&status=working" \
   > /dev/null 2>&1 || true
 ```
 
-### `hook-status` — one line instead of the template (v0.17.0+)
+### `hook-status` — one line instead of the template
 
 Every hook script above re-derives the same two things: which port to talk to, and what this terminal is called. `bridgectl hook-status` absorbs both, so a hook becomes one line:
 
@@ -1130,7 +1226,7 @@ It resolves the terminal name from, in order: `--name=<name>` (or a two-arg `<na
 
 Because it lives in the version-matched copy under `~/.vscode-terminal-bridge/bin/`, the conventions stay current instead of being frozen into each repo's hook scripts at whatever they were on the day those were written. `bridgectl scaffold --backend claude` prints a ready-to-merge `settings.json` snippet using it.
 
-### `scaffold --backend claude --apply` — merge instead of print (v0.24.0+)
+### `scaffold --backend claude --apply` — merge instead of print
 
 The printed snippet documents the **target** state. What an upgrade needs is the **delta** — which of those hooks your `settings.json` is missing — and that is a careful read of a file whose existing hooks may be hand-rolled, matcher-scoped, and working. Getting it wrong either duplicates a status write or silently drops one; upgrading a real install to v0.23.0 came down to a single missing `Stop` entry ([#47](https://github.com/solcarty/vscode-terminal-bridge/issues/47)).
 
@@ -1199,7 +1295,7 @@ Cline hook event names were deliberately chosen to mirror Claude Code's:
 
 **Key difference from Claude Code hooks:** each Cline hook script receives its JSON payload on **stdin** (not argv, not env) — `{ hookName, workspaceInfo: { rootPath }, taskId, ... }`. Claude Code hooks, by contrast, get context via env vars (`$CLAUDE_TAB_NAME`, `$PWD`) and the command template is inlined into `settings.json`.
 
-### Scaffolding the hooks (v0.17.0+)
+### Scaffolding the hooks
 
 Because Cline matches hooks by **filename** against its event names, with no registration step, the whole set can be generated:
 
@@ -1240,93 +1336,148 @@ curl "http://127.0.0.1:${PORT}/open-terminal?name=my-task&cwd=${CWD}&cmd=$(pytho
 
 ---
 
-## Automated worktree setup
+## Implementation patterns
 
-Open a named terminal for a git worktree, attach the worktree to the VS Code workspace, and start Claude automatically — all via the HTTP bridge, no `code` CLI required:
+The API reference above says what each endpoint does. This section is the part that is harder to reconstruct from a reference: **how the pieces compose into a working agent system**, and which field makes each step trustworthy.
 
-```bash
-ISSUE="my-task"
-WORKTREE="$HOME/worktrees/my-repo/$ISSUE"
+All of these use `bridgectl` rather than raw `curl` — it handles port discovery, preferring the `VSCODE_BRIDGE_PORT` pinned into a bridge-spawned tab over the racy shared port file, and it is one command per action so a single permission allow-rule covers it.
 
-git worktree add "$WORKTREE" -b "$ISSUE"
+### Pattern 1: Spawn a worker and know whether it actually started
 
-PORT=$(cat "$PWD/.vscode-bridge-port" 2>/dev/null || echo 31415)
-CWD=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$WORKTREE'))")
-CMD=$(python3 -c "import urllib.parse; print(urllib.parse.quote(\"claude '/linear-process $ISSUE'\"))")
-
-# Attach the worktree folder to the VS Code workspace (writes .vscode-bridge-port there too)
-curl -s "http://127.0.0.1:${PORT}/add-folder?path=${CWD}"
-
-# Open the terminal (focus is preserved in the editor by default)
-curl -s "http://127.0.0.1:${PORT}/open-terminal?name=${ISSUE}&cwd=${CWD}&cmd=${CMD}&icon=hubot&color=terminal.ansiCyan"
-```
-
-The terminal is registered under `my-task`, so the Claude Code hooks above rename it automatically, and `/close-terminal?name=my-task` closes it when the work is done. When the worktree is cleaned up, call `/remove-folder` to detach it from the workspace.
-
----
-
-## Common patterns
-
-### Pattern 1: Monitor multiple long-running processes
+The orchestrator creates a tab, hands it a kickoff prompt, and walks away. The trap is that **a successful `open` is not proof the agent launched** — `open` answers before the startup command has been attempted, and a tab that came up as a bare shell looks identical to one running an agent, because the shell really is running either way.
 
 ```bash
-PORT=$(cat "$PWD/.vscode-bridge-port" 2>/dev/null || echo 31415)
+BRIDGE=~/.vscode-terminal-bridge/bin/bridgectl.sh
 
-curl "http://127.0.0.1:${PORT}/open-terminal?name=build&cmd=npm%20run%20build"
+WORKTREE="$HOME/worktrees/my-repo/task-42"
+git worktree add "$WORKTREE" -b task-42
 
-# From your build script:
-curl "http://127.0.0.1:${PORT}/rename-terminal?name=build&label=build%20%5B%E2%9A%99%EF%B8%8F%20compiling%5D"
-curl "http://127.0.0.1:${PORT}/rename-terminal?name=build&label=build%20%5B%E2%9C%85%20done%5D"
-curl "http://127.0.0.1:${PORT}/rename-terminal?name=build&label=build%20%5B%E2%9D%8C%20failed%5D"
+# Attach the worktree to the VS Code workspace — the HTTP equivalent of `code --add`,
+# with no `code` CLI required. The extension writes .vscode-bridge-port into it, so
+# hooks running inside that folder discover the right window's port.
+curl -s "http://127.0.0.1:$(cat "$PWD/.vscode-bridge-port")/add-folder?path=${WORKTREE}"
+
+bash $BRIDGE open task-42 "$WORKTREE" \
+  "claude --permission-mode auto --name task-42 'Read MISSION.md and follow it.'" hubot
+
+# The outcome lands on the /list row, not in open's response.
+bash $BRIDGE list | jq -r '.terminals[] | select(.name=="task-42") | .cmdDelivery'
 ```
 
-### Pattern 2: Shell hooks for any interactive process
+| `cmdDelivery` | Meaning |
+| --- | --- |
+| `shell-integration` | Confirmed: the shell accepted the command. |
+| `timeout` | Written blind after the fallback delay — the write happened, pickup unknown. |
+| `none` / `null` | Not delivered, or not there yet. |
 
-Use zsh `preexec`/`precmd` hooks in `~/.zshrc` to update the tab whenever a command runs:
+A `timeout` row that never produces a heartbeat is a tab to **look at**, not to relaunch. `open` is idempotent by name: re-opening a live tracked name hands the existing tab back (`reused: true`) and deliberately does *not* re-run the command, precisely because an agent may already be working in it.
 
-```zsh
-function preexec() {
-  PORT=$(cat "$PWD/.vscode-bridge-port" 2>/dev/null || echo 31415)
-  N=$(basename "$PWD")
-  curl -s "http://127.0.0.1:${PORT}/rename-terminal?name=$N&label=$N%20%5B%E2%9A%99%EF%B8%8F%20working%5D" > /dev/null 2>&1 &
-}
+Spawn unattended workers with the backend's own non-interactive flag (`--permission-mode auto` for Claude Code). Nobody is sitting at that tab to answer a permission dialog — and a pending dialog also makes `send` refuse to deliver, so the session is stuck in both directions at once.
 
-function precmd() {
-  PORT=$(cat "$PWD/.vscode-bridge-port" 2>/dev/null || echo 31415)
-  N=$(basename "$PWD")
-  curl -s "http://127.0.0.1:${PORT}/rename-terminal?name=$N&label=$N%20%5B%E2%8F%B8%20idle%5D" > /dev/null 2>&1 &
-}
-```
+### Pattern 2: Tell working from wedged from finished
 
-> **Note:** This covers shell-level commands only. For finer-grained updates inside a long-running process (like an AI agent), use tool-level hooks instead.
-
-### Pattern 3: CI / deployment status board
+Three fields, none of which is sufficient alone:
 
 ```bash
-PORT=$(cat "$PWD/.vscode-bridge-port" 2>/dev/null || echo 31415)
-
-for env in staging prod; do
-  curl "http://127.0.0.1:${PORT}/open-terminal?name=deploy-$env"
-done
-
-# From your deploy script:
-curl "http://127.0.0.1:${PORT}/rename-terminal?name=deploy-staging&label=staging%20%5B%F0%9F%9F%A1%20deploying%5D"
-curl "http://127.0.0.1:${PORT}/rename-terminal?name=deploy-staging&label=staging%20%5B%E2%9C%85%20live%5D"
+bash $BRIDGE list | python3 -c '
+import json, sys, datetime as dt
+d = json.load(sys.stdin)
+now = dt.datetime.fromisoformat(d["now"].replace("Z", "+00:00"))
+for t in d["terminals"]:
+    hb = t.get("lastHeartbeatAt")
+    age = int((now - dt.datetime.fromisoformat(hb.replace("Z", "+00:00"))).total_seconds()) if hb else None
+    print(f"{t[\"name\"]:<12} {t.get(\"displayStatus\"):<12} agentAlive={t.get(\"agentAlive\")} hb_age={age}s")
+'
 ```
 
-### Pattern 4: Issue/task-scoped terminals
+- **`status` is self-reported.** A wedged agent and a busy one both say `working` forever.
+- **`lastHeartbeatAt` is the independent signal.** It advances on the repeat hook calls sustained work generates, so `working` with a 40-minute-old heartbeat is wedged — but pick your own threshold, because a build legitimately runs quiet for 20 minutes. The bridge deliberately never derives that verdict for you.
+- **`agentAlive` answers what `pidAlive` structurally cannot.** `pidAlive` only proves the *shell* exists, and a crashed agent leaves a live shell prompt behind. See [`/list`](#timestamps-and-liveness) for the full contract — including that `null` means unknown, never dead, so a bare `if (!alive)` check is a bug.
+
+**`idle` is ambiguous by construction:** a successfully finished worker and a dead one look the same. Resolve it with `agentAlive` plus the terminal's note or output (Pattern 3), never by relaunching on suspicion — that starts a second agent on a worktree that already has one.
+
+### Pattern 3: Chain work — hand off without a human in the middle
+
+The orchestrator needs the *result*, not just the state. Two read-backs exist for that, and the difference is who writes them:
 
 ```bash
-PORT=$(cat "$PWD/.vscode-bridge-port" 2>/dev/null || echo 31415)
+# Worker (or its Stop hook) publishes. Both resolve their own tab name from
+# VSCODE_BRIDGE_ORCHESTRATOR_ID — no --name needed from inside the tab.
+bash $BRIDGE note set --text-file=/tmp/handoff.md   # a deliberate handoff
+bash $BRIDGE hook-output                            # the turn's final text, automatically
 
-for issue in TASK-1 TASK-2 TASK-3; do
-  CWD=$(python3 -c "import urllib.parse; print(urllib.parse.quote(\"$HOME/work/$issue\"))")
-  curl "http://127.0.0.1:${PORT}/open-terminal?name=$issue&cwd=$CWD"
-done
-
-# Close when done
-curl "http://127.0.0.1:${PORT}/close-terminal?name=TASK-1"
+# Orchestrator reads, then decides what to spawn next.
+bash $BRIDGE note get task-42
+bash $BRIDGE output task-42 --n=1
 ```
+
+`/list` carries only `noteUpdatedAt` / `lastOutputAt`, never the bodies — so poll the timestamps across many tabs cheaply, then fetch the one that moved.
+
+Relay a failure back into the session that *created* it rather than re-deriving the fix yourself, and use a file: CI output is multi-line and will not survive inline shell quoting.
+
+```bash
+bash $BRIDGE send task-42 --text-file=/tmp/ci-failure.txt
+```
+
+Then confirm delivery honestly. `send` exiting 0 means the text was **written**, not read. Compare `lastSendAt` against `lastHeartbeatAt` — a heartbeat *after* your send means the agent has acted since it landed — and check `lastSendDelivery`: `submitted` is confirmed, while `submit-unverified` plus a heartbeat older than the send is the stranded-paste signature, whose fix is `bridgectl nudge` (a bare Enter), never re-sending the text.
+
+### Pattern 4: A manager agent that owns a feature
+
+The shape that scales past one worker: a long-lived **manager** tab owns a unit of work larger than any single agent's context, and spawns, supervises and reaps short-lived workers under it.
+
+```
+feature-manager (long-lived, one per feature)
+├── spawns task-1, task-2 …            open + cmdDelivery       (Pattern 1)
+├── polls them on one list call        heartbeat + agentAlive   (Pattern 2)
+├── relays CI failures into the tab    send --text-file         (Pattern 3)
+├── reads results back                 note get / output        (Pattern 3)
+├── closes each worker when merged     close                    (Pattern 5)
+└── opens a review tab at the end, and stops there
+```
+
+Why a manager rather than the top-level session doing it: the orchestrator you talk to is the most expensive context in the system, and supervising a feature is a long, repetitive loop. Giving the loop its own tab keeps it out of that context and survives you closing the conversation. **The manager runs as a tracked terminal like any other**, so it reports its own status, publishes its own notes, and can itself be supervised by Pattern 2.
+
+One rule worth encoding: a manager's authority ends at *opening* the next step, never at accepting its result. Ship the gate to a human deliberately rather than letting the loop close on itself.
+
+### Pattern 5: Reap — and the difference between `close` and `forget`
+
+```bash
+bash $BRIDGE close  task-42   # disposes the tab AND drops the tracked row
+bash $BRIDGE forget task-42   # drops the row only — never touches a process
+```
+
+Use `forget` when the process must survive (it's serving something, or you only want the registry tidied). Branch on `close`'s `outcome` field rather than its exit code — `closed`, `not-tracked` and `row-removed` are different facts.
+
+`sweep` disposes tracked terminals whose `cwd` no longer maps to a live git worktree. It is a **blunt instrument**: it reasons from worktree existence, not from what an agent is doing, so it will close a healthy tab whose worktree was removed underneath it. Prefer closing by name at the point you know the work is done.
+
+### Pattern 6: Headless work — no TUI to type into
+
+Most of `send`'s machinery — bracketed paste, `submit-unverified`, `nudge` — exists because an orchestrator is typing into a TUI. When nothing needs to be typed by a human, skip the typing entirely: [`bridgectl worker`](#headless-workers-bridgectl-worker) drives the agent over its structured stream-json channel from *inside* a tracked terminal, so the tab, its icon and its `/list` row all still work.
+
+### Pattern 7: Two windows that can see each other
+
+A second VS Code window is a second bridge on a second port, and neither can address the other by cwd. [Presence](#get-announce--get-apibridges) is the discovery layer: each window's main agent announces itself, and any process can read the whole network off disk.
+
+```bash
+bash $BRIDGE announce working     # this window's own agent
+bash $BRIDGE agents               # every live window, from any cwd
+```
+
+Presence is deliberately *not* a channel: knowing another window is up tells you whether to wait, hand something to a shared file, or ask the human — it does not let you inject into it.
+
+### Pattern 8: Non-agent uses
+
+The bridge predates all of the above and is still a plain status board for anything that can make an HTTP request:
+
+```bash
+bash $BRIDGE open build "$PWD" "npm run build"
+
+# From the build script itself:
+bash $BRIDGE status build working
+bash $BRIDGE status build idle      # or: error
+```
+
+Prefer `status=` over a hand-written `label=`: the bridge owns the codicon and colour, the update is idempotent, and repeat calls don't reset `statusChangedAt`. Shell-level coverage for tabs you didn't spawn is a `preexec`/`precmd` pair in `~/.zshrc` calling the same two commands.
 
 ---
 

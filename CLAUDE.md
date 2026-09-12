@@ -175,6 +175,25 @@ It degrades to silence, never an error: nothing published reads as an empty list
 
 That's the whole feature. The bridge does not poll GitHub, does not know a token, and does not assert the PR is still open — treat the value as advisory: it may have been merged, closed, or force-pushed since it was set. Whoever needs the PR's actual current state polls it themselves, outside the bridge, the same way background-job status and note bodies are left to the caller.
 
+## Env var names: expand/contract off `HH_` (#57, v0.27.0+)
+
+Every terminal `/open-terminal` spawns gets `VSCODE_BRIDGE_ORCHESTRATOR_ID` and `VSCODE_BRIDGE_STATUS_URL` exported into it now, matching the `VSCODE_BRIDGE_PORT` prefix the extension already used. They used to be `HH_ORCHESTRATOR_ID` / `HH_BRIDGE_STATUS_URL` — named after `house.health`, one private consumer, even though every hook and script that talks to the bridge reads them. That's a naming leak in a general-purpose extension's public contract, not a behavior change, which is why this is expand/contract rather than a rename in place: **this release exports both old and new names side by side.** Nothing that reads either name breaks.
+
+The `HH_` names are deprecated and will be **dropped in v0.28.0**. Known callers on the old names — `agent-workflows` (`bin/wt-setup`, `bin/wt-finish`, `bin/pre-pr-gate`) and `house.health` (hooks, `scripts/`, `.claude/`) — are migrated to read the new names (preferring them, falling back to the old) in the same pass as this release, in their own repos' commits.
+
+## `.sdo/` is a setting now, not a hardcoded path (#57, v0.27.0+)
+
+`/api/status` used to always append `pipeline-state.json` under a hardcoded `.sdo/` directory in the matched workspace folder — `.sdo` is a private consumer's directory name, not something a general extension should assume. It's now `terminalBridge.pipelineStateDir`, a VS Code setting defaulting to `.sdo` so nothing changes on disk for anyone until they opt in. Set it per-workspace in `.vscode/settings.json` to write somewhere else.
+
+## Public-surface audit (#57)
+
+Full audit for consumer-specific naming, ahead of first publication:
+
+- **Fixed this pass:** `HH_ORCHESTRATOR_ID` / `HH_BRIDGE_STATUS_URL` env vars, `.sdo/` output directory (above); `package.json`'s `description` referenced `/worktree-start`, a private consumer's slash command, and has been reworded to describe what the extension does instead of who calls it.
+- **Found, left alone — a bigger call than a naming pass:** the extension identity itself, `publisher: "sdo"` / `displayName: "SDO Terminal Bridge"` in `package.json`. Changing either changes the extension ID (`sdo.terminal-bridge`) that the README's install instructions, `bin/vscode-bridge.sh`, and `bin/bridgectl.sh` all reference by name, and is a republishing/reinstall event for every existing install, not a text edit. Worth a decision with eyes on it, not a drive-by rename.
+- **Found, left alone — informational, not part of the interface:** `house.health#4589` citations in `CLAUDE.md`, `extension.js` comments, and `test/agent-alive.test.js` / `test/idle-note-guard.test.js`. These document *why* a behavior exists (a real incident in a real private tracker) rather than anything a caller depends on — no HTTP route, CLI flag, or file path is named after that repo. Scrubbing them would lose the provenance for no interface benefit.
+- **Checked and clean:** HTTP routes and payload fields, CLI subcommands/flags in `bin/*.sh`, file and directory names under `~/.vscode-terminal-bridge/` (`port`, `nodes.json`, `bin/`), and log/error strings — none of these are named after a specific consumer.
+
 ## Key endpoints
 
 All endpoints are GET with query-string params (not POST/JSON — see `extension.js`).

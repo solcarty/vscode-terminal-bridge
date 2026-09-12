@@ -1178,12 +1178,18 @@ function activate(context) {
         const norm = (p) => path.resolve(p).replace(/\/+$/, '');
         const matched = repo ? allFolders.filter((f) => norm(f.uri.fsPath) === norm(repo)) : [];
         const folders = matched.length ? matched : allFolders.slice(0, 1);
+        // #57 — `.sdo` was a hardcoded private consumer's directory name. Now a
+        // setting (`terminalBridge.pipelineStateDir`, default unchanged) so
+        // nothing breaks today and other consumers aren't stuck writing into a
+        // directory named after someone else's project.
+        const pipelineStateDir = vscode.workspace.getConfiguration('terminalBridge')
+          .get('pipelineStateDir', '.sdo');
         const written = [];
         for (const folder of folders) {
           try {
-            const sdoDir = path.join(folder.uri.fsPath, '.sdo');
-            if (!fs.existsSync(sdoDir)) fs.mkdirSync(sdoDir, { recursive: true });
-            fs.appendFileSync(path.join(sdoDir, 'pipeline-state.json'), entry + '\n', 'utf8');
+            const stateDir = path.join(folder.uri.fsPath, pipelineStateDir);
+            if (!fs.existsSync(stateDir)) fs.mkdirSync(stateDir, { recursive: true });
+            fs.appendFileSync(path.join(stateDir, 'pipeline-state.json'), entry + '\n', 'utf8');
             written.push(folder.uri.fsPath);
           } catch { /* ignore read-only folders */ }
         }
@@ -1295,6 +1301,18 @@ function activate(context) {
       const sendDeferred = () => {
         if (name) terminal.sendText(`export CLAUDE_TAB_NAME=${JSON.stringify(name)}`);
         // Inject orchestrator env vars so status hooks work inside the terminal.
+        //
+        // #57 — these were HH_ORCHESTRATOR_ID / HH_BRIDGE_STATUS_URL, named after
+        // house.health, one private consumer, even though every hook and script
+        // that talks to the bridge reads them. Renamed to the VSCODE_BRIDGE_
+        // prefix this extension already uses for VSCODE_BRIDGE_PORT below.
+        //
+        // Expand/contract: this release sets BOTH names so nothing downstream
+        // breaks before it migrates. The HH_ names are deprecated and will be
+        // dropped in a future release once known callers (agent-workflows,
+        // house.health) have moved to the new names — see CLAUDE.md.
+        terminal.sendText(`export VSCODE_BRIDGE_ORCHESTRATOR_ID=${JSON.stringify(name || '')}`);
+        terminal.sendText(`export VSCODE_BRIDGE_STATUS_URL="http://127.0.0.1:${activePort}/api/status"`);
         terminal.sendText(`export HH_ORCHESTRATOR_ID=${JSON.stringify(name || '')}`);
         terminal.sendText(`export HH_BRIDGE_STATUS_URL="http://127.0.0.1:${activePort}/api/status"`);
         // Pin this terminal (and any subshells it spawns) to the exact port of

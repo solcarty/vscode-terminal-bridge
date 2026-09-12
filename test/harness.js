@@ -62,6 +62,7 @@ const vscodeMock = {
   },
   workspace: {
     workspaceFolders: [],
+    name: undefined,
     onDidChangeWorkspaceFolders: () => ({ dispose() {} }),
     updateWorkspaceFolders: () => true,
     // Real vscode.workspace.getConfiguration(section).get(key, default) returns
@@ -116,4 +117,5 @@ module.exports = { ext, context, state, vscodeMock, makeTerminal, renames,
   countTerminals: name => terminalsInWindow.filter(t => t.name === name).length,
   get disposed() { return disposed; },
   portFile: path.join(process.env.HOME, '.vscode-terminal-bridge', 'port'),
+  bridgesDir: path.join(process.env.HOME, '.vscode-terminal-bridge', 'bridges'),
 };

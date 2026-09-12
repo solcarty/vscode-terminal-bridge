@@ -179,7 +179,7 @@ That's the whole feature. The bridge does not poll GitHub, does not know a token
 
 Every terminal `/open-terminal` spawns gets `VSCODE_BRIDGE_ORCHESTRATOR_ID` and `VSCODE_BRIDGE_STATUS_URL` exported into it now, matching the `VSCODE_BRIDGE_PORT` prefix the extension already used. They used to be `HH_ORCHESTRATOR_ID` / `HH_BRIDGE_STATUS_URL` — named after `house.health`, one private consumer, even though every hook and script that talks to the bridge reads them. That's a naming leak in a general-purpose extension's public contract, not a behavior change, which is why this is expand/contract rather than a rename in place: **this release exports both old and new names side by side.** Nothing that reads either name breaks.
 
-The `HH_` names are deprecated and will be **dropped in v0.28.0**. Known callers on the old names — `agent-workflows` (`bin/wt-setup`, `bin/wt-finish`, `bin/pre-pr-gate`) and `house.health` (hooks, `scripts/`, `.claude/`) — are migrated to read the new names (preferring them, falling back to the old) in the same pass as this release, in their own repos' commits.
+The `HH_` names are deprecated and will be **dropped in v0.28.0**. Known callers on the old names — `agent-workflows`'s `bin/wt-setup`, `bin/wt-finish`, `bin/pre-pr-gate`, and `commands/pre-pr.md` — are migrated to read the new names (preferring them, falling back to the old) in the same pass as this release (solcarty/agent-workflows#1). `house.health` was audited too and had no references to migrate.
 
 ## `.sdo/` is a setting now, not a hardcoded path (#57, v0.27.0+)
 
@@ -193,6 +193,22 @@ Full audit for consumer-specific naming, ahead of first publication:
 - **Found, left alone — a bigger call than a naming pass:** the extension identity itself, `publisher: "sdo"` / `displayName: "SDO Terminal Bridge"` in `package.json`. Changing either changes the extension ID (`sdo.terminal-bridge`) that the README's install instructions, `bin/vscode-bridge.sh`, and `bin/bridgectl.sh` all reference by name, and is a republishing/reinstall event for every existing install, not a text edit. Worth a decision with eyes on it, not a drive-by rename.
 - **Found, left alone — informational, not part of the interface:** `house.health#4589` citations in `CLAUDE.md`, `extension.js` comments, and `test/agent-alive.test.js` / `test/idle-note-guard.test.js`. These document *why* a behavior exists (a real incident in a real private tracker) rather than anything a caller depends on — no HTTP route, CLI flag, or file path is named after that repo. Scrubbing them would lose the provenance for no interface benefit.
 - **Checked and clean:** HTTP routes and payload fields, CLI subcommands/flags in `bin/*.sh`, file and directory names under `~/.vscode-terminal-bridge/` (`port`, `nodes.json`, `bin/`), and log/error strings — none of these are named after a specific consumer.
+
+## Presence: a registry of live bridges (#55, v0.27.0+)
+
+Two main agents in two VS Code windows couldn't tell each other exists. The transport was never the problem — each window already binds its own port and `postJson`/`getJson` with token auth already existed for the remote-node registry — **discovery** was: the single `~/.vscode-terminal-bridge/port` file collapses to one value, last writer wins, across every window. A caller in window A had no way to address window B.
+
+`~/.vscode-terminal-bridge/bridges/<id>.json`, one file per live window, fixes that. Written on activation (and re-written whenever workspace folders change), removed on clean deactivation. `id` is a fresh `crypto.randomUUID()` per activation — **not** persisted across reloads, deliberately: a reloaded window is a new process with a new pid, and reusing an old id would let a stale entry's pid check pass by accident. The legacy single `port` file is still written alongside it, unchanged, for every existing caller — deprecated in favor of the registry for cross-window discovery, but not removed.
+
+**Agent identity** is `terminalBridge.agentId`, a per-window setting (consistent with `terminalBridge.pipelineStateDir` above), falling back to `vscode.workspace.name` (what VS Code already shows in the title bar), falling back to the first workspace folder's basename, `null` if none resolve. Chosen over identity-at-`announce`-time because a setting survives reloads and doesn't require the caller to remember to pass it on every call.
+
+**Self-reported status, via `/announce?status=<value>`** (`bridgectl announce <status>`), because the main agent driving a window is *not* one of the bridge-managed terminals — it's the session that spawns those, so it can't be observed the way a tab is; it has to say so itself. Reuses the same status vocabulary and `statusChangedAt`/`lastHeartbeatAt` discipline as terminal status: `statusChangedAt` moves only on a value change, `lastHeartbeatAt` moves on every call. Same honesty caveat as everywhere else in this file: this is what was last announced, not what's true now.
+
+**Read path:** `GET /api/bridges` (`bridgectl agents`) returns every entry, this window's included (`self: true`). `bridgectl agents` deliberately does **not** go through any bridge's HTTP server — it reads `~/.vscode-terminal-bridge/bridges/` directly, which is the only way to satisfy "not cwd-dependent" without a chicken-and-egg problem: reaching a bridge via HTTP requires already knowing a port, which is exactly the thing cross-window discovery can't assume. Reading the directory works from any cwd, with zero live bridges, with no bridge reachable at all.
+
+**Reaping is fail-closed, matching the `pidAlive`/`agentAlive` precedent above:** a registry entry is deleted only on a *confirmed*-dead pid (`isPidAlive(entry.pid) === false`), never on a stale heartbeat. `null` (unresolvable pid) is reported and left in place, not reaped — the same "unknown, never dead" rule `pidAlive` and `agentAlive` already use for terminals. This deliberately does **not** derive an "abandoned" verdict from heartbeat age the way the issue's own proposal suggested combining pid liveness with heartbeat age — this file's existing rule is that the bridge never derives a verdict from staleness, it reports the timestamp and lets the reader pick a threshold (a build legitimately runs quiet for 20 minutes; so does an agent between announces). The tradeoff this accepts — a recycled pid after a reboot reads as still-alive — is the same one `pidAlive` already accepts for terminals. Reaping happens lazily, inside every `/api/bridges` / `bridge_agents` read, rather than as a separate sweep pass: cheap, and it keeps the list accurate for whoever's asking without waiting for another window's next activation.
+
+**Out of scope, on purpose:** any agent-to-agent messaging. This is presence only — "who is here, and what did they last say about themselves" — not a way to inject anything into another window. `send`/`nudge` still only target bridge-managed terminals within the calling process's own bridge.
 
 ## Key endpoints
 
@@ -213,6 +229,8 @@ All endpoints are GET with query-string params (not POST/JSON — see `extension
 | `/set-note` · `/note` · `/clear-note` | A worker's short handoff for its orchestrator (`text=` / `textFile=`) |
 | `/set-output` · `/output` · `/clear-output` | Read-back: the turn's final assistant text, pushed in by a Stop hook |
 | `/set-pr` | Record a PR url on a tracked terminal (`name=`, `url=`) — advisory, last write wins |
+| `/announce` | Presence: self-reported status for this window's main agent (`status=`), written into its `bridges/<id>.json` entry |
+| `/api/bridges` | Presence: every live window's registry entry, this one included — reads `~/.vscode-terminal-bridge/bridges/`, reaping only confirmed-dead pids |
 | `/sweep` | Dispose terminals whose cwd no longer maps to a live `git worktree` |
 | `/add-folder` / `/remove-folder` | Attach/detach a workspace folder |
 | `/reindex` | Re-link open terminals to persisted metadata |
@@ -234,6 +252,8 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note get <name>
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh output <name> [--n=<1..3>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh bg-task {start|end|clear} [--name=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh pr <name> <url>
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh announce <status>
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh agents
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status <status> [--name=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend {cline|claude} [--dir=<repo>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend claude --apply [--settings=<path>]

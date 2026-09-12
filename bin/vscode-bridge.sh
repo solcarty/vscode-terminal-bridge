@@ -717,6 +717,67 @@ bridge_pr() {
     "http://127.0.0.1:${port}/set-pr" >/dev/null 2>&1 || true
 }
 
+# bridge_announce <status> — self-reported presence status for THIS window's
+# main agent (bridge v0.27.0+, #55). The main agent is not one of the
+# bridge-managed terminals — it's the session driving them — so it can't be
+# observed the way a tab is; it has to announce itself, into this window's own
+# presence-registry entry (~/.vscode-terminal-bridge/bridges/<id>.json), read
+# back via bridge_agents / /api/bridges. Same self-reported-status honesty
+# caveat as every other status field: this says what was last announced, not
+# what's true now. Silent no-op outside VS Code, like bridge_status.
+bridge_announce() {
+  _bridge_active || return 0
+  local status="${1:-}"
+  if [ -z "$status" ]; then
+    echo "usage: bridgectl.sh announce <status>" >&2
+    return 2
+  fi
+  local port
+  port=$(_bridge_port)
+  curl -fsS -m 2 --get --data-urlencode "status=$status" \
+    "http://127.0.0.1:${port}/announce" >/dev/null 2>&1 || true
+}
+
+# bridge_agents — list every live window's presence-registry entry, from
+# ANY cwd (bridge v0.27.0+, #55). Deliberately does not go through a bridge's
+# HTTP server at all: unlike every other query here, this has no natural
+# "which window's bridge do I ask" — the whole point is answering that without
+# already knowing it. Every window writes into the same
+# ~/.vscode-terminal-bridge/bridges/ directory, so reading it directly works
+# even with zero live bridges reachable from this shell's cwd, and is exactly
+# what a live bridge's own /api/bridges handler does server-side.
+#
+# Loud, not silent, like bridge_list: an empty result must mean "no live
+# windows", not "couldn't check" — so a read failure is reported, not
+# swallowed. Reaping follows the same fail-closed contract as /api/bridges:
+# only a CONFIRMED-dead pid is removed; a null or unreadable pid is reported
+# as pidAlive:null and left in place.
+bridge_agents() {
+  node -e '
+    const fs = require("fs");
+    const path = require("path");
+    const dir = process.argv[1];
+    let files = [];
+    try { files = fs.readdirSync(dir).filter(f => f.endsWith(".json")); } catch { files = []; }
+    const agents = [];
+    for (const f of files) {
+      let entry;
+      try { entry = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8")); } catch { continue; }
+      let pidAlive = null;
+      if (entry.pid) {
+        try { process.kill(entry.pid, 0); pidAlive = true; }
+        catch (err) { pidAlive = err.code === "EPERM" ? true : false; }
+      }
+      if (pidAlive === false) {
+        try { fs.unlinkSync(path.join(dir, f)); } catch { /* ignore */ }
+        continue;
+      }
+      agents.push({ ...entry, pidAlive });
+    }
+    console.log(JSON.stringify({ ok: true, now: new Date().toISOString(), agents }));
+  ' "$HOME/.vscode-terminal-bridge/bridges"
+}
+
 # bridge_bg_task <start|end|clear> [--name=<name>]
 #
 # Report OUTSTANDING BACKGROUND WORK (bridge v0.21.0+) — a dimension of its

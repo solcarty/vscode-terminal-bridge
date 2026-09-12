@@ -2,6 +2,7 @@ const vscode = require('vscode');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { exec } = require('child_process');
 const { promisify } = require('util');
 
@@ -237,6 +238,17 @@ async function hasAgentChild(pid) {
 // ---------------------------------------------------------------------------
 
 const NODES_REGISTRY_PATH = path.join(require('os').homedir(), '.vscode-terminal-bridge', 'nodes.json');
+
+// ---------------------------------------------------------------------------
+// Presence registry (#55) — one file per live window, so a main agent in one
+// VS Code window can discover another window's bridge without either side
+// knowing the other's port ahead of time. Replaces nothing: the legacy single
+// `~/.vscode-terminal-bridge/port` file (PORT_FALLBACK_PATH above) is still
+// written for existing callers — it just collapses to one value across every
+// window (last activation wins), which is fine for "find *a* port" but can't
+// answer "find window B's port from window A".
+// ---------------------------------------------------------------------------
+const BRIDGES_DIR = path.join(require('os').homedir(), '.vscode-terminal-bridge', 'bridges');
 
 function loadNodeRegistry() {
   try {
@@ -2210,11 +2222,116 @@ function activate(context) {
         workspaceFolders: folders,
       }));
 
+    } else if (url.pathname === '/announce') {
+      // #55 — the main agent driving a window is not one of the bridge-managed
+      // terminals (it's the session the user talks to, which spawns those), so
+      // it can't be observed the way a tab is. It has to announce itself, with
+      // the same self-reported-status caveat every other status field in this
+      // file carries: this says what was last announced, not what's true now.
+      const status = url.searchParams.get('status');
+      if (!status) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'status param required' }));
+        return;
+      }
+      const now = new Date().toISOString();
+      // Same statusChangedAt discipline as persistMetadata: only a VALUE
+      // change moves it, so a repeated announce of the same status doesn't
+      // reset "how long has this agent been in this state".
+      if (status !== bridgeStatus) bridgeStatusChangedAt = now;
+      bridgeStatus = status;
+      bridgeLastHeartbeatAt = now;
+      writeBridgeRegistry(activePort);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true, id: bridgeId, status: bridgeStatus,
+        statusChangedAt: bridgeStatusChangedAt, lastHeartbeatAt: bridgeLastHeartbeatAt,
+      }));
+
+    } else if (url.pathname === '/api/bridges') {
+      // Every live window writes into the same directory, so any one bridge
+      // can answer for the whole network — no cross-window RPC needed.
+      let files = [];
+      try { files = fs.readdirSync(BRIDGES_DIR).filter(f => f.endsWith('.json')); } catch { /* none yet */ }
+      const bridges = [];
+      for (const f of files) {
+        let entry;
+        try { entry = JSON.parse(fs.readFileSync(path.join(BRIDGES_DIR, f), 'utf8')); } catch { continue; }
+        const pidAlive = isPidAlive(entry.pid);
+        // Reap only a DEFINITIVE death (pidAlive === false). Never reap on a
+        // stale heartbeat alone — this file's own rule (see CLAUDE.md) is that
+        // the bridge never derives a verdict from staleness, only reports the
+        // timestamp and lets the reader pick a threshold. The tradeoff this
+        // leaves on the table (a recycled pid reads as still-alive) is the
+        // same one pidAlive already accepts for terminals.
+        if (pidAlive === false) {
+          try { fs.unlinkSync(path.join(BRIDGES_DIR, f)); } catch { /* ignore */ }
+          continue;
+        }
+        bridges.push({ ...entry, pidAlive, self: entry.id === bridgeId });
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, now: new Date().toISOString(), bridges }));
+
     } else {
       res.writeHead(404);
       res.end('Not found');
     }
   });
+
+  // ── Presence registry (#55) ────────────────────────────────────────────────
+  // Identity is a fresh id per activation (this process, this window, this
+  // run) — not persisted across reloads, because a reloaded window is a new
+  // process with a new pid, and reusing an old id would let a stale entry's
+  // pid check pass by accident.
+  const bridgeId = crypto.randomUUID();
+  const bridgeStartedAt = new Date().toISOString();
+  let bridgeStatus = null;
+  let bridgeStatusChangedAt = null;
+  let bridgeLastHeartbeatAt = null;
+
+  // Agent identity: a per-window setting first (explicit, survives a
+  // workspace with a generic folder name), falling back to the workspace name
+  // VS Code already shows in its title bar, and finally the first folder's
+  // basename for a workspace with no explicit name. `null` when none of those
+  // resolve (e.g. an empty window) — never fabricated.
+  function bridgeAgentId() {
+    const configured = vscode.workspace.getConfiguration('terminalBridge').get('agentId');
+    if (configured) return configured;
+    if (vscode.workspace.name) return vscode.workspace.name;
+    const folders = vscode.workspace.workspaceFolders || [];
+    return folders.length ? path.basename(folders[0].uri.fsPath) : null;
+  }
+
+  const bridgeEntryPath = () => path.join(BRIDGES_DIR, `${bridgeId}.json`);
+
+  function writeBridgeRegistry(port) {
+    try {
+      fs.mkdirSync(BRIDGES_DIR, { recursive: true });
+      const folders = (vscode.workspace.workspaceFolders || []).map(f => f.uri.fsPath);
+      fs.writeFileSync(bridgeEntryPath(), JSON.stringify({
+        id: bridgeId,
+        port,
+        pid: process.env.VSCODE_PID ? Number(process.env.VSCODE_PID) : process.pid,
+        startedAt: bridgeStartedAt,
+        workspaceFolders: folders,
+        workspaceName: vscode.workspace.name || null,
+        agentId: bridgeAgentId(),
+        // Self-reported, via /announce — same honesty caveat as every other
+        // status field in this file: this is what was last announced, not
+        // what's true right now.
+        status: bridgeStatus,
+        statusChangedAt: bridgeStatusChangedAt,
+        lastHeartbeatAt: bridgeLastHeartbeatAt,
+      }, null, 2), 'utf8');
+    } catch { /* non-fatal — presence is best-effort, like the port files */ }
+  }
+
+  function removeBridgeRegistry() {
+    try {
+      if (fs.existsSync(bridgeEntryPath())) fs.unlinkSync(bridgeEntryPath());
+    } catch { /* ignore */ }
+  }
 
   // ── Dynamic port binding — try the base port, increment on EADDRINUSE ────
   // VSCODE_BRIDGE_BASE_PORT moves the whole search range (used by the test
@@ -2255,7 +2372,10 @@ function activate(context) {
 
   // Re-write port files when the workspace changes (e.g. /add-folder adds a worktree folder)
   context.subscriptions.push(
-    vscode.workspace.onDidChangeWorkspaceFolders(() => writePortFiles(activePort))
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      writePortFiles(activePort);
+      writeBridgeRegistry(activePort);
+    })
   );
 
   // The port we're currently trying to bind. Distinct from activePort, which
@@ -2275,6 +2395,7 @@ function activate(context) {
     activePort = server.address().port;
     console.log(`[terminal-bridge] listening on 127.0.0.1:${activePort}`);
     writePortFiles(activePort);
+    writeBridgeRegistry(activePort);
   });
 
   function startServer(port) {
@@ -2298,7 +2419,7 @@ function activate(context) {
 
   startServer(candidatePort);
 
-  context.subscriptions.push({ dispose: () => { removePortFiles(); server && server.close(); } });
+  context.subscriptions.push({ dispose: () => { removePortFiles(); removeBridgeRegistry(); server && server.close(); } });
 }
 
 function deactivate() {

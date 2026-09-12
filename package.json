@@ -2,7 +2,7 @@
   "name": "terminal-bridge",
   "displayName": "SDO Terminal Bridge",
   "description": "Opens, renames, and closes VS Code terminal tabs via a local HTTP API",
-  "version": "0.26.0",
+  "version": "0.27.0",
   "scripts": {
     "test": "node test/run.js"
   },

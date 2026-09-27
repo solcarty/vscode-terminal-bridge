@@ -28,6 +28,7 @@ let terminalsInWindow = [];
 const renames = [];
 let activeTerminal = null;
 let shellIntegrationCbs = [];
+let closeCbs = [];
 
 const vscodeMock = {
   commands: {
@@ -52,7 +53,10 @@ const vscodeMock = {
       terminalsInWindow.push(t);
       return t;
     },
-    onDidCloseTerminal: () => ({ dispose() {} }),
+    onDidCloseTerminal: (cb) => {
+      closeCbs.push(cb);
+      return { dispose() { closeCbs = closeCbs.filter(c => c !== cb); } };
+    },
     onDidChangeTerminalShellIntegration: (cb) => {
       shellIntegrationCbs.push(cb);
       return { dispose() { shellIntegrationCbs = shellIntegrationCbs.filter(c => c !== cb); } };
@@ -113,6 +117,12 @@ module.exports = { ext, context, state, vscodeMock, makeTerminal, renames,
   addTerminal: t => { terminalsInWindow.push(t); return t; },
   // Drive the shell-integration-ready path that /open-terminal waits on.
   fireShellIntegration: terminal => shellIntegrationCbs.forEach(cb => cb({ terminal })),
+  // The user closed a tab: it leaves window.terminals, then VS Code fires
+  // onDidCloseTerminal. Resolves once every handler has settled.
+  closeTerminal: t => {
+    terminalsInWindow = terminalsInWindow.filter(x => x !== t);
+    return Promise.all(closeCbs.map(cb => cb(t)));
+  },
   findTerminal: name => terminalsInWindow.find(t => t.name === name),
   countTerminals: name => terminalsInWindow.filter(t => t.name === name).length,
   get disposed() { return disposed; },

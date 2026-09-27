@@ -640,13 +640,27 @@ async function applyPresentation(context, name, terminal, opts = {}) {
 async function reindexTerminals(context) {
   const metadata  = loadMetadata(context);       // name → { cwd, label, color, … }
   const worktrees = await parseWorktrees();       // path → name
+  const open      = new Set(vscode.window.terminals);
 
-  // Build reverse map: cwd → name (from persisted metadata — takes precedence)
-  const cwdToName = Object.fromEntries(
-    Object.entries(metadata)
-      .filter(([, m]) => m.cwd)
-      .map(([name, m]) => [m.cwd, name])
-  );
+  // Reverse map: cwd → every persisted name recorded at that cwd. A list, not a
+  // single name: tabs opened at a repo root (feature loops, the main session)
+  // share one cwd, and collapsing them to one entry made the pick arbitrary.
+  const cwdToNames = new Map();
+  for (const [name, m] of Object.entries(metadata)) {
+    if (!m.cwd) continue;
+    if (!cwdToNames.has(m.cwd)) cwdToNames.set(m.cwd, []);
+    cwdToNames.get(m.cwd).push(name);
+  }
+
+  // #64 — a name is only fillable when nothing live holds it. Reindex runs on
+  // every focus, every shell-integration event and before open/close/send, so
+  // any new terminal at a tracked cwd (a VS Code task, a fresh shell) used to
+  // take the name over from the tab that still owned it. Reindex exists to
+  // recover a binding lost to a reload, never to replace one that works.
+  const isBoundLive = name => {
+    const t = terminals.get(name);
+    return !!t && open.has(t);
+  };
 
   let reindexed = 0;
 
@@ -654,34 +668,43 @@ async function reindexTerminals(context) {
     // Skip terminals already tracked in this session.
     if ([...terminals.values()].includes(terminal)) continue;
 
-    let matched = false;
+    let name = null;
 
     // Strategy A — terminal.name matches a persisted key directly.
     // (VS Code preserves creation names across reloads for non-renamed terminals.)
-    if (metadata[terminal.name]) {
-      terminals.set(terminal.name, terminal);
-      matched = true;
+    if (metadata[terminal.name] && !isBoundLive(terminal.name)
+        && !(await pidContradicts(metadata[terminal.name], terminal))) {
+      name = terminal.name;
     }
 
     // Strategy B — shell-integration CWD lookup.
-    if (!matched) {
-      const cwd = terminal.shellIntegration?.cwd?.fsPath;
-      if (cwd) {
-        // Persisted metadata first (most precise), then git worktree basename.
-        const name = cwdToName[cwd] ?? worktrees.get(normalizePath(cwd));
-        if (name) {
-          terminals.set(name, terminal);
-          matched = true;
-        }
+    const cwd = !name && terminal.shellIntegration?.cwd?.fsPath;
+    if (cwd) {
+      // Persisted metadata first (most precise), then git worktree basename.
+      const persisted = cwdToNames.get(cwd) ?? [];
+      if (persisted.length === 1) {
+        const only = persisted[0];
+        if (!isBoundLive(only) && !(await pidContradicts(metadata[only], terminal))) name = only;
+      } else if (persisted.length > 1) {
+        // Several names share this cwd, so the cwd alone is a guess. Bind only
+        // when the terminal's own shell pid picks out exactly one of them.
+        const pid = await resolvePid(terminal);
+        const hits = pid ? persisted.filter(n => metadata[n].pid === pid && !isBoundLive(n)) : [];
+        if (hits.length === 1) name = hits[0];
+      } else {
+        const wt = worktrees.get(normalizePath(cwd));
+        if (wt && !isBoundLive(wt)) name = wt;
       }
     }
 
-    if (matched) {
+    if (name) {
+      // The name's previous terminal, if any, is gone (isBoundLive said so), so
+      // this replaces a dead binding, never a live one.
+      terminals.set(name, terminal);
       reindexed++;
       // Restore color from persisted metadata (simple property assignment,
       // no terminal-activation required).
-      const name = [...terminals.entries()].find(([, t]) => t === terminal)?.[0];
-      const savedColor = name && metadata[name]?.color;
+      const savedColor = metadata[name]?.color;
       if (savedColor) {
         try { terminal.color = new vscode.ThemeColor(savedColor); } catch { /* noop */ }
       }
@@ -692,6 +715,30 @@ async function reindexTerminals(context) {
     console.log(`[terminal-bridge] re-indexed ${reindexed} terminal(s)`);
   }
   return reindexed;
+}
+
+// Best-effort, time-boxed shell pid for a terminal. undefined when processId
+// doesn't settle in time or the terminal was disposed mid-read (see #54).
+async function resolvePid(terminal) {
+  try {
+    return await Promise.race([
+      terminal.processId,
+      new Promise(resolve => setTimeout(() => resolve(undefined), 250)),
+    ]);
+  } catch {
+    return undefined;
+  }
+}
+
+// #64 — true when the persisted row provably belongs to a different process:
+// its recorded pid is still alive and is not this terminal's shell. A dead or
+// missing recorded pid proves nothing (a full restart revives tabs under new
+// pids, and #54 showed the recorded pid can be a transient child), so those
+// fall through to the name/cwd match as before.
+async function pidContradicts(meta, terminal) {
+  if (!meta?.pid || isPidAlive(meta.pid) !== true) return false;
+  const pid = await resolvePid(terminal);
+  return !!pid && pid !== meta.pid;
 }
 
 // ---------------------------------------------------------------------------
@@ -1121,6 +1168,9 @@ function activate(context) {
   writeBundledCli(context);
 
   // ── Keep registry clean when the user closes a terminal manually ──────────
+  // Only the name whose bound terminal IS the closed one is dropped. Closing an
+  // untracked or foreign tab must never delete another name's row (#64: a task
+  // terminal that had been mis-bound took a live loop's metadata with it).
   context.subscriptions.push(
     vscode.window.onDidCloseTerminal(async closed => {
       for (const [key, t] of terminals) {

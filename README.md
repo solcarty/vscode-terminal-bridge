@@ -263,6 +263,13 @@ curl http://127.0.0.1:$PORT/reindex
 
 The `reindexed` count is the number of terminals newly linked in this call (0 if everything was already tracked).
 
+*v0.28.0+ ([#64](https://github.com/solcarty/vscode-terminal-bridge/issues/64)).* Re-index only **fills** a name: one that is unbound, or whose terminal has closed. It never moves a name off a terminal that is still open, so a new tab or VS Code task terminal opened at a tracked terminal's cwd can't take that name over. A terminal is matched to a persisted name by its tab name first, then by its shell-integration cwd, then by git worktree basename, with these guards:
+
+- **Several names share the cwd** (e.g. tabs opened at a repo root): no cwd match unless the terminal's shell pid equals exactly one of those rows' recorded `pid`.
+- **The row's recorded `pid` is alive and isn't this terminal's shell:** no match. That process belongs to some other terminal. A dead or missing recorded pid proves nothing (a full restart revives tabs under new pids), so it doesn't block a match.
+
+Closing a tab removes only the name bound to that tab. Closing an untracked tab removes nothing.
+
 ---
 
 ### `GET /open-terminal`
@@ -1483,7 +1490,7 @@ Prefer `status=` over a hand-written `label=`: the bridge owns the codicon and c
 
 ## After a VS Code reload
 
-The extension re-indexes automatically. When the window is focused after a reload it scans all open terminals against persisted metadata and active git worktrees, re-linking any match. You can also call `/reindex` explicitly from a script to force a scan without waiting for window focus.
+The extension re-indexes automatically. When the window is focused after a reload it scans all open terminals against persisted metadata and active git worktrees, re-linking any match. You can also call `/reindex` explicitly from a script to force a scan without waiting for window focus. Since v0.28.0 a re-index never takes a name away from a terminal that is still open; see [`GET /reindex`](#get-reindex) for the matching rules.
 
 ## Remote jobs
 

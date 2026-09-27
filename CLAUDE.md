@@ -181,7 +181,7 @@ That's the whole feature. The bridge does not poll GitHub, does not know a token
 
 Every terminal `/open-terminal` spawns gets `VSCODE_BRIDGE_ORCHESTRATOR_ID` and `VSCODE_BRIDGE_STATUS_URL` exported into it now, matching the `VSCODE_BRIDGE_PORT` prefix the extension already used. They used to be `HH_ORCHESTRATOR_ID` / `HH_BRIDGE_STATUS_URL` — named after `house.health`, one private consumer, even though every hook and script that talks to the bridge reads them. That's a naming leak in a general-purpose extension's public contract, not a behavior change, which is why this is expand/contract rather than a rename in place: **this release exports both old and new names side by side.** Nothing that reads either name breaks.
 
-The `HH_` names are deprecated and will be **dropped in v0.28.0**. Known callers on the old names — `agent-workflows`'s `bin/wt-setup`, `bin/wt-finish`, `bin/pre-pr-gate`, and `commands/pre-pr.md` — are migrated to read the new names (preferring them, falling back to the old) in the same pass as this release (solcarty/agent-workflows#1). `house.health` was audited too and had no references to migrate.
+The `HH_` names are deprecated and will be **dropped in v0.29.0** (moved from v0.28.0, which shipped the #64 re-index fix alone). Known callers on the old names — `agent-workflows`'s `bin/wt-setup`, `bin/wt-finish`, `bin/pre-pr-gate`, and `commands/pre-pr.md` — are migrated to read the new names (preferring them, falling back to the old) in the same pass as this release (solcarty/agent-workflows#1). `house.health` was audited too and had no references to migrate.
 
 ## `.sdo/` is a setting now, not a hardcoded path (#57, v0.27.0+)
 
@@ -211,6 +211,21 @@ Two main agents in two VS Code windows couldn't tell each other exists. The tran
 **Reaping is fail-closed, matching the `pidAlive`/`agentAlive` precedent above:** a registry entry is deleted only on a *confirmed*-dead pid (`isPidAlive(entry.pid) === false`), never on a stale heartbeat. `null` (unresolvable pid) is reported and left in place, not reaped — the same "unknown, never dead" rule `pidAlive` and `agentAlive` already use for terminals. This deliberately does **not** derive an "abandoned" verdict from heartbeat age the way the issue's own proposal suggested combining pid liveness with heartbeat age — this file's existing rule is that the bridge never derives a verdict from staleness, it reports the timestamp and lets the reader pick a threshold (a build legitimately runs quiet for 20 minutes; so does an agent between announces). The tradeoff this accepts — a recycled pid after a reboot reads as still-alive — is the same one `pidAlive` already accepts for terminals. Reaping happens lazily, inside every `/api/bridges` / `bridge_agents` read, rather than as a separate sweep pass: cheap, and it keeps the list accurate for whoever's asking without waiting for another window's next activation.
 
 **Out of scope, on purpose:** any agent-to-agent messaging. This is presence only — "who is here, and what did they last say about themselves" — not a way to inject anything into another window. `send`/`nudge` still only target bridge-managed terminals within the calling process's own bridge.
+
+## Re-index fills names, it never moves them (#64, v0.28.0+)
+
+`reindexTerminals()` runs on window focus, on every `onDidChangeTerminalShellIntegration`, and before open/close/send lookups. Before v0.28.0 it skipped terminals that were already tracked, but not *names* that were already bound. Any new terminal whose tab name or shell cwd matched a tracked row took that name, even while the name's own terminal was still open. Tabs opened at a repo root were the exposed ones, because every VS Code task and fresh shell starts there.
+
+The incident: `feature-agent-loop` ran in `feat-<N>` at the house.health root. A `nx run workspace:deploy-prod` task terminal opened at the same cwd and took the name. The loop's `rename`s went to the task's tab (all `|| true`, so nothing noticed), `list` reported the name `pidAlive: false` while the loop was healthy, and when the task terminal closed, `onDidCloseTerminal` deleted the row. The real tab was then untracked for good. This is the likely mechanism behind the earlier "feature-agent-loop tab name lost / title frozen" reports.
+
+The rules now:
+
+- **A name bound to a terminal still in `vscode.window.terminals` is never re-bound**, by either strategy. Re-index recovers a binding lost to a reload; it doesn't replace one that works.
+- **`cwdToName` became `cwd → [names]`.** The old one-name-per-cwd map made a shared cwd an arbitrary pick. With more than one name at a cwd, the cwd alone doesn't bind; only a shell pid equal to exactly one row's recorded `pid` does.
+- **A live recorded pid that isn't this terminal's shell vetoes a match** (both strategies). A *dead* recorded pid doesn't: a full VS Code restart revives tabs under new pids, and #54 showed the recorded pid can be a transient child. Treating a dead pid as a veto would break the ordinary reload case this function exists for. Same fail-closed shape as `pidAlive`: only positive evidence of another owner blocks.
+- **`onDidCloseTerminal` already dropped only the name bound to the closed terminal.** That rule was never wrong. The hijack was what made a foreign terminal the bound one. `test/reindex-rebind.test.js` now pins both halves, and the harness fires close events for real instead of stubbing them.
+
+Rejected: requiring a pid match for every cwd bind. It would stop the incident, but a restarted window would never re-link any tab by cwd, since every pid changes.
 
 ## Key endpoints
 

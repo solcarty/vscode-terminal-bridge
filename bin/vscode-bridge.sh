@@ -1034,11 +1034,29 @@ bridge_hook_status() {
 
   # house.health#4589 — an `idle` Stop can't be trusted at face value; see the
   # guard's own comment above _bridge_turn_state_dir for why.
-  if [ "$state" = "idle" ] && _bridge_idle_needs_note "$name" 2>/dev/null; then
-    state="needs-input"
+  #
+  # But a Stop payload carrying a non-empty last_assistant_message IS a handoff:
+  # it's exactly what the sibling `Stop → hook-output` entry publishes to the
+  # output rail, which is where orchestrators read results now (`bridgectl
+  # output`), not notes. Without this every finished worker read `needs-input`
+  # and every `send` to it needed --force. A confirmed handoff clears the
+  # turn-start mark, so the ~60s idle nudge that follows (downgraded to `idle`
+  # above) fails open instead of re-promoting; the next `working` re-arms it.
+  local handed_off=""
+  if [ "$state" = "idle" ]; then
+    if printf '%s' "$payload" \
+        | grep -qE '"last_assistant_message"[[:space:]]*:[[:space:]]*("[^"]|\[[[:space:]]*\{)'; then
+      handed_off=1
+    elif _bridge_idle_needs_note "$name" 2>/dev/null; then
+      state="needs-input"
+    fi
   fi
 
-  _bridge_turn_track "$name" "$state" 2>/dev/null || true
+  if [ -n "$handed_off" ]; then
+    printf 'idle\t\n' > "$(_bridge_turn_state_dir)/$name" 2>/dev/null || true
+  else
+    _bridge_turn_track "$name" "$state" 2>/dev/null || true
+  fi
   bridge_status "$name" "$state"
 }
 

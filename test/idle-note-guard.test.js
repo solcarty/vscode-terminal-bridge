@@ -103,5 +103,44 @@ const r = spawnSync('bash', ['-c',
 got = (r.stdout.match(/STATE:(\S+)/) || [])[1];
 check('the #51 idle-nudge downgrade still goes through the note guard', got === 'needs-input', got);
 
+// A Stop payload with a non-empty last_assistant_message is a handoff — the
+// same text `hook-output` publishes to the output rail — so idle is trusted
+// even with no note, and the ~60s idle nudge that follows stays idle too.
+const hookWithPayload = (state, payload) => {
+  const r = spawnSync('bash', ['-c',
+    `source ${JSON.stringify(SH)}
+     bridge_status() { echo "STATE:$2"; }
+     curl() { echo '{"ok":true,"name":"testtab","note":null,"noteUpdatedAt":null}'; }
+     bridge_hook_status ${state} --name=testtab`,
+  ], { encoding: 'utf8', input: payload });
+  return (r.stdout.match(/STATE:(\S+)/) || [])[1];
+};
+const nudge = '{"message":"Claude is waiting for your input"}';
+
+resetTurnState();
+hookStatus('working', { note: null });
+got = hookWithPayload('idle', '{"hook_event_name":"Stop","last_assistant_message":"PR #1 is green."}');
+check('idle whose Stop payload carries a final message is left alone (output-rail handoff)', got === 'idle', got);
+got = hookWithPayload('needs-input', nudge);
+check('the idle nudge after an output-rail handoff stays idle', got === 'idle', got);
+
+resetTurnState();
+hookStatus('working', { note: null });
+got = hookWithPayload('idle', '{"hook_event_name":"Stop","last_assistant_message":[{"type":"text","text":"done"}]}');
+check('content-block array final message also counts as a handoff', got === 'idle', got);
+
+resetTurnState();
+hookStatus('working', { note: null });
+got = hookWithPayload('idle', '{"hook_event_name":"Stop","last_assistant_message":""}');
+check('an EMPTY final message is not a handoff — still promoted to needs-input', got === 'needs-input', got);
+
+// A handoff only covers its own turn: the next turn re-arms the guard.
+resetTurnState();
+hookStatus('working', { note: null });
+hookWithPayload('idle', '{"last_assistant_message":"turn one"}');
+hookStatus('working', { note: null });
+got = hookStatus('idle', { note: null });
+check('the turn after a handoff is guarded again (no note, no output → needs-input)', got === 'needs-input', got);
+
 console.log(fails ? `\n${fails} FAILURE(S)` : '\nall green');
 process.exit(fails ? 1 : 0);

@@ -85,6 +85,7 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open   <name> <cwd> [cmd] [icon]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh status <name> <state>   # working|idle|needs-input|pr-open|merged|...
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh close  <name>   # disposes the tab AND removes its tracked row
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh forget <name>   # removes the tracked row only, never touches a process
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh repaint         # redraws every tracked tab's stored title
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh send   <name> <text>|--text-file=<path> [--no-submit] [--force] [--mode=...] [--submit-delay=<ms>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh nudge  <name> [--force]   # bare Enter — releases a paste left staged in the input box
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh list
@@ -669,7 +670,8 @@ Response (status mode):
   "baseLabel": "my-task",
   "icon": null,
   "color": "terminal.ansiCyan",
-  "status": "working"
+  "status": "working",
+  "applied": true
 }
 ```
 
@@ -684,11 +686,38 @@ Response (idempotent no-op):
   "icon": null,
   "color": "terminal.ansiCyan",
   "status": "working",
-  "noOp": true
+  "noOp": true,
+  "applied": true
 }
 ```
 
 Returns `404` if the terminal is not in the registry (e.g. opened before the last reload).
+
+#### `applied` — whether the title actually landed (v0.28.1+)
+
+VS Code can only rename the **active** terminal, so a label change briefly shows the target tab, renames it, and restores the previously active one (keyboard focus is preserved). All renames in a window are serialized, and the rename only runs once the target is confirmed active (up to ~1s). If it never becomes active, the rename is **skipped** rather than applied to whatever tab is active:
+
+```json
+{ "ok": true, "name": "my-task", "label": "$(loading~spin) my-task", "applied": false, "reason": "not-active" }
+```
+
+The label is not recorded in that case, so the next call with the same values retries instead of returning `noOp`. `ok: true` with `applied: false` means the registry (status, color, heartbeat) was updated and only the tab title wasn't. `/bg-task` responses carry the same `applied`/`reason` pair when they change the label.
+
+A repeat call is also not a no-op when the tab's live title (`terminal.name`) differs from the label the bridge last wrote, so a tab showing some other tab's title is repaired by its next status update. To repair every tab at once, use [`/repaint`](#get-repaint).
+
+---
+
+### `GET /repaint`
+
+Redraws every tracked, open terminal's stored label through the same serialized rename path, ignoring the idempotency check. Use it to fix tab titles that landed on the wrong tab (e.g. after upgrading from a version before v0.28.1). It changes no registry state.
+
+```bash
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh repaint
+curl http://127.0.0.1:$PORT/repaint
+# {"ok":true,"repainted":5,"skipped":0,"terminals":[{"name":"w1","label":"$(loading~spin) w1","applied":true}, ...]}
+```
+
+Each tab switch waits for activation, so a call takes up to ~1s per tab in the worst case. Tabs that never became active are listed with `applied: false` and counted in `skipped`.
 
 ---
 

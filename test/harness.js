@@ -27,6 +27,10 @@ let terminalsInWindow = [];
 
 const renames = [];
 let activeTerminal = null;
+// How show() behaves. Real VS Code activates asynchronously (the ext host
+// RPCs the main thread), so a test can delay activation to open the race
+// window, or swallow it entirely to model a show() that never takes effect.
+const showBehavior = { delayMs: 0, ignore: false };
 let shellIntegrationCbs = [];
 let closeCbs = [];
 
@@ -89,7 +93,11 @@ function makeTerminal(name, pid) {
     name,
     processId: Promise.resolve(pid ?? 4242),
     sendText: (text, submit) => t.sent.push({ text, submit }),
-    show: () => { activeTerminal = t; },
+    show: () => {
+      if (showBehavior.ignore) return;
+      if (showBehavior.delayMs > 0) setTimeout(() => { activeTerminal = t; }, showBehavior.delayMs);
+      else activeTerminal = t;
+    },
     dispose: () => { disposed.push(name); terminalsInWindow = terminalsInWindow.filter(x => x !== t); },
     sent: [],
   };
@@ -113,7 +121,8 @@ const context = {
   },
 };
 
-module.exports = { ext, context, state, vscodeMock, makeTerminal, renames,
+module.exports = { ext, context, state, vscodeMock, makeTerminal, renames, showBehavior,
+  get activeTerminal() { return activeTerminal; },
   addTerminal: t => { terminalsInWindow.push(t); return t; },
   // Drive the shell-integration-ready path that /open-terminal waits on.
   fireShellIntegration: terminal => shellIntegrationCbs.forEach(cb => cb({ terminal })),

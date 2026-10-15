@@ -33,6 +33,7 @@ case "$sub" in
   open)   bridge_open   "$@" ;;
   close)  bridge_close  "$@" ;;
   forget) bridge_forget "$@" ;;
+  repaint) bridge_repaint "$@" ;;
   send)   bridge_send   "$@" ;;
   nudge)  bridge_nudge  "$@" ;;
   status) bridge_status "$@" ;;
@@ -57,7 +58,7 @@ case "$sub" in
     fi
     ;;
   *)
-    echo "usage: bridgectl.sh {open|close|forget|send|nudge|status|rename|sweep|list|ping|hook-status|hook-output|bg-task|note|output|pr|announce|agents|scaffold|worker} [args...]" >&2
+    echo "usage: bridgectl.sh {open|close|forget|repaint|send|nudge|status|rename|sweep|list|ping|hook-status|hook-output|bg-task|note|output|pr|announce|agents|scaffold|worker} [args...]" >&2
     echo "       bridgectl.sh open <name> <cwd> [cmd] [icon] [color] [--node=<name>] [--ref=<ref>] [--cmd-file=<path>]" >&2
     echo "       bridgectl.sh send <name> <text>|--text-file=<path> [--no-submit] [--force] [--mode=auto|paste|literal|join] [--submit-delay=<ms>]" >&2
     echo "         (send refuses when the target sits at an interactive prompt — injected text would answer it. --force overrides.)" >&2
@@ -65,6 +66,7 @@ case "$sub" in
     echo "       bridgectl.sh nudge <name> [--force]   # bare Enter — releases a multi-line paste stranded in the input box (delivery=submit-unverified)" >&2
     echo "       bridgectl.sh close <name>    # disposes the terminal AND removes its tracked row; prints outcome JSON" >&2
     echo "       bridgectl.sh forget <name>   # removes the tracked row only, never touches a process" >&2
+    echo "       bridgectl.sh repaint   # redraws every tracked tab's stored title (fixes titles that landed on the wrong tab)" >&2
     echo "       bridgectl.sh output <name> [--n=<1..3>]   # read back what the agent last said (needs the Stop hook-output hook)" >&2
     echo "       bridgectl.sh hook-output   # Stop/SubagentStop hook: publishes last_assistant_message from the payload on stdin" >&2
     echo "       bridgectl.sh note set <text>|--text-file=<path> [--name=<name>]   # publish a handoff for an orchestrator to read" >&2

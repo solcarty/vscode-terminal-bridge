@@ -579,11 +579,64 @@ function displayStatusKey(meta = {}) {
   return status;
 }
 
+// ── Rename serialization ────────────────────────────────────────────────────
+// `workbench.action.terminal.renameWithArg` renames whichever terminal is
+// ACTIVE — there is no way to address a terminal by object. So every rename is
+// show(target) → rename → restore, and two of those interleaving across an
+// await put A's label on B's tab. Hooks fire constantly and loop terminals
+// rename on every tick, so that interleave was the norm, not an edge: several
+// tabs ended up wearing one tab's title while /list stayed correct.
+//
+// One promise chain serializes every rename in the process. A failed step
+// never wedges the chain — the next one runs regardless.
+let renameChain = Promise.resolve();
+function withRenameLock(fn) {
+  const run = renameChain.then(fn, fn);
+  renameChain = run.catch(() => {});
+  return run;
+}
+
+const ACTIVATE_TIMEOUT_MS = 1000;
+const ACTIVATE_POLL_MS    = 10;
+
+// Resolve true once `terminal` is the active terminal, false at the deadline.
+// Polls rather than relying solely on onDidChangeActiveTerminal: the event can
+// fire before we subscribe, and a poll needs no cleanup on every exit path.
+async function waitUntilActive(terminal, timeoutMs = ACTIVATE_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (vscode.window.activeTerminal !== terminal) {
+    if (Date.now() >= deadline) return false;
+    await new Promise(r => setTimeout(r, ACTIVATE_POLL_MS));
+  }
+  return true;
+}
+
+// The tab's live title disagrees with what we last wrote — someone else's
+// label landed on it (the pre-lock race), or the user renamed it by hand.
+// terminal.name carries the raw title, codicon syntax included.
+//
+// A name still equal to the registry key is NOT treated as drift: that's the
+// creation name, and it's also what an extension host that never synced the
+// title would keep reporting. Counting it would rename on every single call.
+function titleDrifted(name, terminal, effectiveLabel) {
+  const live = terminal && terminal.name;
+  return typeof live === 'string' && live !== effectiveLabel && live !== name;
+}
+
 // Apply the tab's presentation (label prefix + color) from whatever the
-// registry currently says. Shared by /rename-terminal and /bg-task so both
-// dimensions render through one code path instead of two that drift.
-async function applyPresentation(context, name, terminal, opts = {}) {
-  const { baseLabelOverride, explicitColor, iconId, explicitLabel } = opts;
+// registry currently says. Shared by /rename-terminal, /bg-task and /repaint
+// so every caller renders through one code path — and one lock.
+//
+// Returns `applied: false` + `reason` when the rename was skipped because the
+// target never became the active terminal. Renaming anyway would label
+// whatever tab IS active, which is the bug this exists to prevent. The label
+// is then not persisted, so the next call sees a change and retries.
+function applyPresentation(context, name, terminal, opts = {}) {
+  return withRenameLock(() => applyPresentationLocked(context, name, terminal, opts));
+}
+
+async function applyPresentationLocked(context, name, terminal, opts = {}) {
+  const { baseLabelOverride, explicitColor, iconId, explicitLabel, force, repaintLabel } = opts;
   const meta     = loadMetadata(context)[name] ?? {};
   const key      = displayStatusKey(meta);
   const cfg      = (key && key !== 'none') ? (STATUS_MAP[key] ?? null) : null;
@@ -596,41 +649,78 @@ async function applyPresentation(context, name, terminal, opts = {}) {
 
   const effectiveLabel = explicitLabel
     ? explicitLabel                                   // legacy label= mode: caller owns the whole string
-    : (cfg ? `$(${cfg.codicon}) ${baseLabel}` : baseLabel);
+    : repaintLabel                                    // /repaint: redraw exactly what was last written
+    ?? (cfg ? `$(${cfg.codicon}) ${baseLabel}` : baseLabel);
 
   const resolvedColor = explicitColor ?? cfg?.color ?? undefined;
 
-  const labelChanged = effectiveLabel !== meta.effectiveLabel;
+  const labelChanged = force
+    || effectiveLabel !== meta.effectiveLabel
+    || titleDrifted(name, terminal, effectiveLabel);
   const colorChanged = resolvedColor  !== meta.color;
 
   if (!labelChanged && !colorChanged && !iconId) {
-    return { effectiveLabel, baseLabel, color: resolvedColor, displayStatus: key, noOp: true };
+    return { effectiveLabel, baseLabel, color: resolvedColor, displayStatus: key, noOp: true, applied: true };
   }
 
+  let applied = true;
+  let reason;
   if (labelChanged) {
     // Only switch the active terminal if needed, and use show(true)
     // (preserveFocus) so keyboard focus is NEVER stolen.
     const prev = vscode.window.activeTerminal;
     const needsSwitch = prev !== terminal;
     if (needsSwitch) terminal.show(true);
-    await vscode.commands.executeCommand(
-      'workbench.action.terminal.renameWithArg',
-      { name: effectiveLabel }
-    );
-    if (needsSwitch && prev) prev.show(true);
+    if (needsSwitch && !(await waitUntilActive(terminal))) {
+      applied = false;
+      reason = 'not-active';
+    } else {
+      await vscode.commands.executeCommand(
+        'workbench.action.terminal.renameWithArg',
+        { name: effectiveLabel }
+      );
+    }
+    if (needsSwitch && prev && prev !== terminal) {
+      prev.show(true);
+      // Hold the lock until the restore lands, or the next rename reads the
+      // stale active terminal as its `prev` and "restores" to the wrong tab.
+      await waitUntilActive(prev, ACTIVATE_TIMEOUT_MS / 4);
+    }
   }
 
   if (iconId)        terminal.iconPath = new vscode.ThemeIcon(iconId);
   if (resolvedColor) terminal.color    = new vscode.ThemeColor(resolvedColor);
 
   await persistMetadata(context, name, {
-    label: effectiveLabel,
+    ...(applied ? { label: effectiveLabel, effectiveLabel } : {}),
     baseLabel,
-    effectiveLabel,
     color: resolvedColor,
   });
 
-  return { effectiveLabel, baseLabel, color: resolvedColor, displayStatus: key, noOp: false };
+  return {
+    effectiveLabel, baseLabel, color: resolvedColor, displayStatus: key, noOp: false,
+    applied, ...(reason ? { reason } : {}),
+  };
+}
+
+// Re-apply every tracked terminal's label through the lock, ignoring the
+// idempotency check — repairs tabs mislabeled before the lock existed, whose
+// stored effectiveLabel already matches and would otherwise never be redrawn
+// in a VS Code that doesn't sync terminal.name back.
+async function repaintTerminals(context) {
+  await reindexTerminals(context);
+  const results = [];
+  for (const [name, terminal] of terminals) {
+    if (!vscode.window.terminals.includes(terminal)) continue;
+    const stored = loadMetadata(context)[name]?.effectiveLabel;
+    const shown = await applyPresentation(context, name, terminal, {
+      force: true,
+      ...(stored ? { repaintLabel: stored } : {}),
+    });
+    results.push({ name, label: shown.effectiveLabel, applied: shown.applied,
+      ...(shown.reason ? { reason: shown.reason } : {}) });
+  }
+  return results;
 }
 
 // ---------------------------------------------------------------------------
@@ -1533,6 +1623,8 @@ function activate(context) {
           bgTask: (bg?.pendingTasks ?? 0) > 0,
           pendingTasks: bg?.pendingTasks ?? pendingBefore,
           noOp: shown.noOp,
+          applied: shown.applied,
+          ...(shown.reason ? { reason: shown.reason } : {}),
         }));
         return;
       }
@@ -1594,6 +1686,10 @@ function activate(context) {
         bgTask: (Number(after.pendingTasks) || 0) > 0,
         pendingTasks: Math.max(0, Number(after.pendingTasks) || 0),
         ...(shown.noOp ? { noOp: true } : {}),
+        // false = the tab never became active, so the rename was skipped
+        // rather than landing on whichever tab was. The next call retries.
+        applied: shown.applied,
+        ...(shown.reason ? { reason: shown.reason } : {}),
       }));
 
     } else if (url.pathname === '/set-note' || url.pathname === '/clear-note') {
@@ -1856,6 +1952,8 @@ function activate(context) {
         status: meta.status ?? null,
         displayStatus: shown ? shown.displayStatus : displayStatusKey(meta),
         label: shown ? shown.effectiveLabel : null,
+        ...(shown ? { applied: shown.applied } : {}),
+        ...(shown?.reason ? { reason: shown.reason } : {}),
       }));
 
     } else if (url.pathname === '/close-terminal') {
@@ -2112,6 +2210,18 @@ function activate(context) {
       const ok = vscode.workspace.updateWorkspaceFolders(idx, 1);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok, path: p, removed: ok, wasAttached: true }));
+
+    } else if (url.pathname === '/repaint') {
+      // Redraw every tracked tab's stored label through the rename lock —
+      // repairs titles that landed on the wrong tab before the lock existed.
+      const results = await repaintTerminals(context);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        repainted: results.filter(r => r.applied).length,
+        skipped: results.filter(r => !r.applied).length,
+        terminals: results,
+      }));
 
     } else if (url.pathname === '/reindex') {
       // Explicit re-index trigger — useful right after a window reload before

@@ -283,7 +283,7 @@ Opens a named terminal tab and optionally runs a command in it.
 | `cmd` | No | Shell command to run on open (URL-encoded) |
 | `cmdFile` | No | Path to a file containing the command to run instead of `cmd`. Use this for long or quote-heavy commands (e.g. a multi-hundred-character agent kickoff prompt) — threading them through argv risks breaking across shell-quoting at the call site, URL-encoding, and re-parsing by the terminal's shell. Ignored if `cmd` is also set. |
 | `color` | No | Tab color — VS Code ThemeColor ID (e.g. `terminal.ansiGreen`) |
-| `icon` | No | Tab icon — VS Code ThemeIcon ID (e.g. `hubot`, `check`, `error`). Set once at creation to mark the terminal's identity. |
+| `icon` | No | Tab icon — a codicon id (e.g. `hubot`, `check`, `error`, `sync~spin`): it must match `[a-z0-9-]+(~spin)?`. Set once at creation to mark the terminal's identity. Anything else (an emoji, a `$(…)` string) is ignored and echoed back as `iconIgnored`; the terminal still opens, with no icon. |
 | `focus` | No | Set `focus=1` to steal keyboard focus. Default: focus is **preserved** (the editor keeps focus). |
 | `node` | No | Offload `cmd` to a worker node registered in `~/.vscode-terminal-bridge/nodes.json` instead of running it in this window. See [Remote jobs](#remote-jobs). |
 | `ref` | No | Git ref the remote job's worktree is cut from. Only used with `node=`. Default: `main`. |
@@ -306,11 +306,15 @@ Response:
 { "ok": true, "name": "my-tab", "cwd": "/path/to/dir", "cmd": "echo hello", "color": null, "icon": null, "reused": false, "delivery": "pending" }
 ```
 
-The bundled `bridgectl.sh open` client checks this response and returns a non-zero exit code (printing the error to stderr) if the bridge couldn't be reached or reported failure — it no longer swallows every error with a blind `|| true`.
+With an `icon` that isn't a codicon id, the response carries `"icon"` unset and `"iconIgnored": "<what you passed>"` (v0.30.0+). VS Code would otherwise print it in the tab as literal `$(🛰️)` text.
+
+The bundled `bridgectl.sh open` client checks this response and returns a non-zero exit code (printing the error to stderr) if the bridge couldn't be reached or reported failure — it no longer swallows every error with a blind `|| true`. It waits up to 10 s for the bridge (2 s before v0.30.0), and prints a stderr warning, exit still 0, when the response reports `iconIgnored`.
 
 #### `open` is idempotent by name, and the response is not a delivery claim
 
 **Idempotent by name (#53).** A client that times out (`curl`'s own timeout is shorter than the shell-integration fallback below) and retries used to leave **two** tabs against **one** registry row — the first an orphan `list` can't see and `close`/`sweep` can't target, and if the timed-out attempt also ran `cmd`, two agents on one worktree branch. Now, if `name` is already tracked *and* its terminal is still live in the window, `open` hands back the existing tab and runs nothing further: `reused: true`, `delivery: "skipped-reused"` — the command is deliberately **not** re-run, since an agent may already be working in a reused tab and relaunching over it is exactly the destructive shape this exists to prevent. A tracked name whose terminal is gone (a stale row) still creates fresh, as before.
+
+**Overlapping opens (v0.30.0+).** `open` claims `name` before it does anything that can wait, including the `node=` round-trip and `createTerminal`. A second `open` for a name another open is still creating waits for that one to finish, then gets its terminal back with `reused: true`; it never creates a second tab, and with `node=` it never starts a second remote job. If the first open fails and creates nothing, the waiting one creates the terminal itself.
 
 **The response is not a claim the command ran (#52).** `open` used to answer `ok: true` before `cmd` had even been attempted, so a caller couldn't tell a launch that ran its command from one that left a bare shell — every field on the tab (`live`, `pidAlive`) looks healthy either way, because the shell really is running. The immediate response's `delivery` is one of `pending` (a fresh tab — outcome not known yet), `skipped-reused` (see above), or `none` (no `cmd` given). The real outcome lands on the `/list` row as `cmdDelivery` / `cmdDeliveredAt`:
 

@@ -47,6 +47,17 @@ function shQuote(str) {
 // Survives display name changes within a session.
 const terminals = new Map();
 
+// #6944 — names an /open-terminal has claimed but not yet finished recording:
+// name → promise that settles when that open is done. `terminals` only learns a
+// name after createTerminal, and an open can await (a node= round-trip) before
+// that, so a second open in the gap used to create a second tab. It waits on
+// the claim instead, then reuses whatever the first one made.
+const pendingOpens = new Map();
+
+// A ThemeIcon id: a codicon name, optionally animated. Anything else (an emoji,
+// a `$(…)` string) is rendered by VS Code as literal `$(…)` text in the tab.
+const CODICON_ID = /^[a-z0-9-]+(~spin)?$/;
+
 // workspaceState key for persisted terminal metadata.
 const METADATA_KEY = 'terminalBridgeMetadata';
 
@@ -1245,7 +1256,11 @@ function activate(context) {
       const name    = url.searchParams.get('name')  || undefined;
       let cmd       = url.searchParams.get('cmd')   || undefined;
       const colorId = url.searchParams.get('color') || undefined;
-      const iconId  = url.searchParams.get('icon')  || undefined;
+      const iconParam = url.searchParams.get('icon') || undefined;
+      // #6944 — only a codicon id becomes the tab's icon. Anything else is
+      // dropped and reported back as iconIgnored, never shown as `$(…)` text.
+      const iconId      = iconParam && CODICON_ID.test(iconParam) ? iconParam : undefined;
+      const iconIgnored = iconParam && !iconId ? iconParam : undefined;
       // focus=1 steals keyboard focus (old default); omit or focus=0 to preserve focus.
       const stealFocus = url.searchParams.get('focus') === '1';
       // node= offloads cmd to a worker (bin/worker.js) registered in
@@ -1266,6 +1281,57 @@ function activate(context) {
       // status/log back into this tab (remote job).
       let effectiveCmd = cmd;
       let jobId;
+
+      // #6944 — claim the name before anything that can await (the node=
+      // round-trip below) and before createTerminal. A second open for a name
+      // another open is still creating waits here, then falls into the #53
+      // reuse check below and gets that terminal back with reused: true. The
+      // claim is released when this response closes, whichever path ends it;
+      // if the first open failed and made nothing, the waiter creates.
+      if (name) {
+        while (pendingOpens.has(name)) await pendingOpens.get(name);
+        let release;
+        const claim = new Promise(r => { release = r; });
+        pendingOpens.set(name, claim);
+        res.once('close', () => {
+          if (pendingOpens.get(name) === claim) pendingOpens.delete(name);
+          release();
+        });
+      }
+
+      // #53 — open is idempotent by name. A client that times out (curl gave up
+      // at ~2s while the server went on to create the tab) retries, and an
+      // unconditional createTerminal then leaves TWO tabs against ONE registry
+      // row: the first is an orphan `list` cannot see, `close` cannot target and
+      // `sweep` will not reap. Worse, if the timed-out attempt also ran the
+      // command, the retry produces two agents on one worktree branch.
+      //
+      // So if the name is already tracked AND its terminal is still present in
+      // the window, hand back the existing one and run nothing further.
+      if (name && terminals.has(name)) {
+        const existing = terminals.get(name);
+        if (vscode.window.terminals.includes(existing)) {
+          existing.show(!stealFocus);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: true, name, cwd, cmd, color: colorId, icon: iconId, node, jobId,
+            ...(iconIgnored ? { iconIgnored } : {}),
+            reused: true,
+            // The command is NOT re-run against a reused tab: an agent may
+            // already be working in it, and relaunching over the top is the
+            // destructive shape this guard exists to prevent.
+            delivery: effectiveCmd ? 'skipped-reused' : 'none',
+          }));
+          return;
+        }
+        // Tracked but the terminal is gone — a stale row. Fall through and
+        // create, which is the existing reuse-the-name behaviour.
+        //
+        // #6944 — this check runs before the node= block, not after it: a
+        // reused open runs nothing further, and that includes not starting a
+        // second remote job whose tail no tab would ever show.
+        terminals.delete(name);
+      }
 
       if (node) {
         const nodeCfg = loadNodeRegistry()[node];
@@ -1295,35 +1361,6 @@ function activate(context) {
         }
 
         effectiveCmd = `bash ${CLI_INSTALL_DIR}/bridge-tail.sh ${node} ${jobId}`;
-      }
-
-      // #53 — open is idempotent by name. A client that times out (curl gave up
-      // at ~2s while the server went on to create the tab) retries, and an
-      // unconditional createTerminal then leaves TWO tabs against ONE registry
-      // row: the first is an orphan `list` cannot see, `close` cannot target and
-      // `sweep` will not reap. Worse, if the timed-out attempt also ran the
-      // command, the retry produces two agents on one worktree branch.
-      //
-      // So if the name is already tracked AND its terminal is still present in
-      // the window, hand back the existing one and run nothing further.
-      if (name && terminals.has(name)) {
-        const existing = terminals.get(name);
-        if (vscode.window.terminals.includes(existing)) {
-          existing.show(!stealFocus);
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            ok: true, name, cwd, cmd, color: colorId, icon: iconId, node, jobId,
-            reused: true,
-            // The command is NOT re-run against a reused tab: an agent may
-            // already be working in it, and relaunching over the top is the
-            // destructive shape this guard exists to prevent.
-            delivery: effectiveCmd ? 'skipped-reused' : 'none',
-          }));
-          return;
-        }
-        // Tracked but the terminal is gone — a stale row. Fall through and
-        // create, which is the existing reuse-the-name behaviour.
-        terminals.delete(name);
       }
 
       const options = { cwd, name };
@@ -1429,6 +1466,7 @@ function activate(context) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ok: true, name, cwd, cmd, color: colorId, icon: iconId, node, jobId,
+        ...(iconIgnored ? { iconIgnored } : {}),
         reused: false,
         // Not a claim that the command ran — see noteDelivery above. Poll
         // /list's cmdDelivery for the outcome.

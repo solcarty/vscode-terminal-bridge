@@ -187,13 +187,19 @@ bridge_open() {
   [ -n "$node" ]  && set -- "$@" --data-urlencode "node=$node"
   [ -n "$ref" ]   && set -- "$@" --data-urlencode "ref=$ref"
   local response
-  if ! response=$(curl -fsS -m 2 --get "$@" "http://127.0.0.1:${port}/open-terminal" 2>&1); then
+  # 10s, not 2s (#6944): open can outlast 2s (a node= round-trip), and a client
+  # that gave up and retried is how one name used to get two tabs.
+  if ! response=$(curl -fsS -m 10 --get "$@" "http://127.0.0.1:${port}/open-terminal" 2>&1); then
     echo "bridge_open: failed to reach bridge on port $port: $response" >&2
     return 1
   fi
   case "$response" in
     *'"ok":true'*) : ;;
     *) echo "bridge_open: bridge reported failure: $response" >&2; return 1 ;;
+  esac
+  # Not a failure — the tab opened — but the icon was not a codicon id.
+  case "$response" in
+    *'"iconIgnored"'*) echo "bridge_open: icon '$icon' is not a codicon id ([a-z0-9-]+(~spin)?); opened without it" >&2 ;;
   esac
 }
 

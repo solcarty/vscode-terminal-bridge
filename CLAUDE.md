@@ -268,6 +268,32 @@ five terminals while a sixth is active. No `renameWithArg`, no `show()`, the act
 put, every title is unchanged, and no icon or color is assigned. `test/reindex-rebind.test.js` used
 renames to observe which terminal a name was bound to. It now probes with a staged `send` instead.
 
+## Opens claim the name first, and icons must be codicon ids (#6944, v0.30.0+)
+
+On 2026-10-16, three `bridge_open` calls reported `timed out after 2001 ms`, and each still produced
+a tab. The client gave up at `curl -m 2` while the bridge carried on. #53's reuse check only saw a
+name once `terminals.set` had run after `createTerminal`. A retry that landed before that point
+created a second tab.
+
+`/open-terminal` now claims the name in `pendingOpens` before anything that can await. A second open
+for a claimed name waits on the claim, then runs the #53 check and gets the first open's terminal
+with `reused: true`. The claim is released on the response's `close`, so every early return (400,
+502) releases it without its own cleanup. A waiter whose first open failed finds nothing and creates
+the terminal itself. `bridge_open` now waits 10 s.
+
+The #53 reuse check also moved **above** the `node=` block. Below it, a reused open had already
+POSTed `/run-job`, so every retry of a remote open started a second job on the worker that no tab
+tailed. `test/open-overlap.test.js` caught that. It also showed that, in the harness, the old code
+never produced the duplicate *tab*: nothing awaited between its check and its `set`, and
+`createTerminal` joins `window.terminals` synchronously. The claim makes the guarantee structural
+instead of relying on there being no await in that gap, and it closes the remote-job gap.
+
+**Icons:** `icon` must match `[a-z0-9-]+(~spin)?`. `new vscode.ThemeIcon('🛰️')` renders as literal
+`$(🛰️)` text in the tab, and callers in `agent-workflows` pass emoji. A non-matching icon is
+dropped, never turned into a ThemeIcon, and echoed as `iconIgnored`. The open still succeeds,
+because a missing icon is cosmetic and failing a launch over it would strand the command.
+`bridge_open` prints a stderr warning, and its exit status stays 0.
+
 ## Key endpoints
 
 All endpoints are GET with query-string params (not POST/JSON — see `extension.js`).

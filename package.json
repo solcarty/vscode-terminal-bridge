@@ -29,6 +29,38 @@
           "description": "Identity this window's main agent announces to the presence registry (/announce, /api/bridges). Falls back to the workspace name, then the first folder's name, when unset."
         }
       }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "terminalBridge",
+          "title": "Terminal Bridge",
+          "icon": "media/terminal-bridge.svg"
+        }
+      ]
+    },
+    "views": {
+      "terminalBridge": [
+        {
+          "id": "terminalBridge.terminals",
+          "name": "Terminals"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "terminalBridge.showTerminal",
+        "title": "Show Terminal",
+        "category": "Terminal Bridge"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "terminalBridge.showTerminal",
+          "when": "false"
+        }
+      ]
     }
   }
 }

@@ -143,6 +143,26 @@ This gives you:
 - `${rootWorkspaceFolderName}` — always shows the workspace folder name on the right
 - `${sequence}` — shows any OSC title sequences emitted by the shell on the left
 
+## The Terminal Bridge side panel
+
+**Tab titles don't carry status.** Since v0.29.0 a terminal's title is the `name` it was opened with and never changes (see [fixed at open](#tab-titles-icons-and-colors-are-fixed-at-open)). Status, progress and the note are shown in the *Terminal Bridge* view in the activity bar instead. It reads the same registry `/list` serves.
+
+One row per tracked terminal whose tab is still open:
+
+| Part | What it shows |
+| ---- | ------------- |
+| Label | The terminal's name |
+| Description | The caller's progress text: the `rename` label minus the name (`rename feat-12 "feat-12 8/1/9 next 16:10"` shows `8/1/9 next 16:10`). With no progress text, the first line of the [note](#get-set-note--get-note--get-clear-note). |
+| Icon | The status codicon and color from the [status table](#status-values), for the row's `displayStatus` (so outstanding background work shows `bg-task` unless a person is needed) |
+| Tooltip | Status and how long it has been in it, the note, `cmdDelivery`, the PR URL when set, `node` when set |
+| Click | Shows that terminal |
+
+**Order:** rows that need a person first (`needs-input`, `permission`, `error`), then `working`, then the rest. Within each group the newest terminal (by `createdAt`) comes first. Grouping uses the raw `status`, so a `working` terminal with a background task still sorts with `working`.
+
+**Untracked:** terminals in the window that the bridge doesn't track, including a duplicate tab that shares a tracked name but isn't the bound one, are listed in a collapsed *Untracked* group, so a stray tab can be found and closed. Clicking one shows it.
+
+**Refresh:** on every registry write (open, close, status, rename, note, PR, background task, heartbeat) and whenever a terminal opens or closes. While any row is `working`, the panel also re-reads once a second, so the time in the tooltip stays current. Otherwise it doesn't poll. A row whose terminal has gone drops on the next refresh.
+
 ## Settings
 
 Two, both per-window (set them in `.vscode/settings.json` for a workspace, or in user settings):
@@ -700,7 +720,7 @@ Returns `404` if the terminal is not in the registry (e.g. opened before the las
 
 #### Tab titles, icons and colors are fixed at open
 
-A terminal's title is the `name` it was opened with, and the bridge never renames it. Its icon and color are the `icon`/`color` passed to `/open-terminal`, and nothing changes them afterwards. Read a terminal's current state from `/list` (`label`, `status`, `displayStatus`, `color`), not from the tab.
+A terminal's title is the `name` it was opened with, and the bridge never renames it. Its icon and color are the `icon`/`color` passed to `/open-terminal`, and nothing changes them afterwards. Read a terminal's current state from `/list` (`label`, `status`, `displayStatus`, `color`) or the [side panel](#the-terminal-bridge-side-panel), not from the tab.
 
 Why the title can't follow status: VS Code can only rename the **active** terminal (`workbench.action.terminal.renameWithArg`). Up to v0.28.x every status change switched to the target tab, renamed it and switched back, and with many agents changing status at once, renames landed on whichever tab was active, so tabs wore each other's titles.
 

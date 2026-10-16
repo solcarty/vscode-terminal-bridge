@@ -33,6 +33,23 @@ let activeTerminal = null;
 const showBehavior = { delayMs: 0, ignore: false };
 let shellIntegrationCbs = [];
 let closeCbs = [];
+let openCbs = [];
+// The side panel's registrations, so a test can assert the view exists and
+// drive its provider and commands without a VS Code window.
+const treeViews = [];
+const registeredCommands = new Map();
+
+class EventEmitter {
+  constructor() { this.listeners = []; this.fired = 0; }
+  get event() {
+    return listener => {
+      this.listeners.push(listener);
+      return { dispose: () => { this.listeners = this.listeners.filter(l => l !== listener); } };
+    };
+  }
+  fire(e) { this.fired++; this.listeners.forEach(l => l(e)); }
+  dispose() { this.listeners = []; }
+}
 
 const vscodeMock = {
   commands: {
@@ -46,6 +63,10 @@ const vscodeMock = {
       }
       return Promise.resolve();
     },
+    registerCommand: (id, fn) => {
+      registeredCommands.set(id, fn);
+      return { dispose() { registeredCommands.delete(id); } };
+    },
   },
   window: {
     get terminals() { return terminalsInWindow; },
@@ -56,6 +77,7 @@ const vscodeMock = {
     createTerminal: (options) => {
       const t = makeTerminal((options && options.name) || 'x');
       terminalsInWindow.push(t);
+      openCbs.forEach(cb => cb(t));
       return t;
     },
     onDidCloseTerminal: (cb) => {
@@ -66,7 +88,16 @@ const vscodeMock = {
       shellIntegrationCbs.push(cb);
       return { dispose() { shellIntegrationCbs = shellIntegrationCbs.filter(c => c !== cb); } };
     },
+    onDidOpenTerminal: (cb) => {
+      openCbs.push(cb);
+      return { dispose() { openCbs = openCbs.filter(c => c !== cb); } };
+    },
     onDidChangeWindowState: () => ({ dispose() {} }),
+    createTreeView: (id, options) => {
+      const view = { id, options, dispose() {} };
+      treeViews.push(view);
+      return view;
+    },
     showErrorMessage: () => {},
   },
   workspace: {
@@ -84,8 +115,11 @@ const vscodeMock = {
     }),
   },
   _config: {},
-  ThemeIcon: class { constructor(id) { this.id = id; } },
+  ThemeIcon: class { constructor(id, color) { this.id = id; this.color = color; } },
   ThemeColor: class { constructor(id) { this.id = id; } },
+  EventEmitter,
+  TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
+  TreeItem: class { constructor(label, collapsibleState) { this.label = label; this.collapsibleState = collapsibleState; } },
   Uri: { file: p => ({ fsPath: p, path: p }) },
 };
 
@@ -126,7 +160,9 @@ const context = {
 
 module.exports = { ext, context, state, vscodeMock, makeTerminal, renames, showBehavior,
   get activeTerminal() { return activeTerminal; },
-  addTerminal: t => { terminalsInWindow.push(t); return t; },
+  addTerminal: t => { terminalsInWindow.push(t); openCbs.forEach(cb => cb(t)); return t; },
+  treeViews,
+  registeredCommands,
   // Drive the shell-integration-ready path that /open-terminal waits on.
   fireShellIntegration: terminal => shellIntegrationCbs.forEach(cb => cb({ terminal })),
   // The user closed a tab: it leaves window.terminals, then VS Code fires

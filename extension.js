@@ -5,6 +5,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { exec } = require('child_process');
 const { promisify } = require('util');
+const { createPanel } = require('./panel');
 
 const execAsync = promisify(exec);
 
@@ -97,6 +98,22 @@ function loadMetadata(context) {
   return context.workspaceState.get(METADATA_KEY) || {};
 }
 
+// Every registry write goes through here, so the side panel refreshes on all of
+// them — a new writer can't forget to notify it.
+const metadataListeners = new Set();
+
+function onDidWriteMetadata(listener) {
+  metadataListeners.add(listener);
+  return { dispose: () => metadataListeners.delete(listener) };
+}
+
+async function saveMetadata(context, meta) {
+  await context.workspaceState.update(METADATA_KEY, meta);
+  for (const listener of metadataListeners) {
+    try { listener(); } catch { /* a listener must never fail a registry write */ }
+  }
+}
+
 // Every metadata write is stamped here rather than at the call sites, so a new
 // caller can't forget to and quietly produce an entry with no age.
 //
@@ -128,7 +145,7 @@ async function persistMetadata(context, name, update) {
 
     meta[name] = next;
   }
-  await context.workspaceState.update(METADATA_KEY, meta);
+  await saveMetadata(context, meta);
 }
 
 // Record that we heard from the agent inside this terminal, independent of
@@ -150,7 +167,7 @@ async function touchHeartbeat(context, name) {
   const meta = loadMetadata(context);
   if (!meta[name]) return;  // never conjure an entry for an untracked name
   meta[name] = { ...meta[name], lastHeartbeatAt: new Date().toISOString() };
-  await context.workspaceState.update(METADATA_KEY, meta);
+  await saveMetadata(context, meta);
 }
 
 // Record that we injected text into this terminal (issue #39).
@@ -184,7 +201,7 @@ async function touchLastSend(context, name, delivery = null) {
   if (!meta[name]) return null;  // never conjure an entry for an untracked name
   const now = new Date().toISOString();
   meta[name] = { ...meta[name], lastSendAt: now, lastSendDelivery: delivery };
-  await context.workspaceState.update(METADATA_KEY, meta);
+  await saveMetadata(context, meta);
   return now;
 }
 
@@ -444,7 +461,7 @@ async function setNote(context, name, text) {
     noteTruncated: truncated,
     noteBytes: Buffer.byteLength(body, 'utf8'),
   };
-  await context.workspaceState.update(METADATA_KEY, meta);
+  await saveMetadata(context, meta);
   return { noteUpdatedAt: now, truncated, bytes: meta[name].noteBytes };
 }
 
@@ -455,7 +472,7 @@ async function clearNote(context, name) {
     ...meta[name],
     note: null, noteUpdatedAt: null, noteTruncated: false, noteBytes: 0,
   };
-  await context.workspaceState.update(METADATA_KEY, meta);
+  await saveMetadata(context, meta);
   return { cleared: true };
 }
 
@@ -523,7 +540,7 @@ async function pushOutput(context, name, text) {
   const outputs = [...prev, entry].slice(-MAX_OUTPUT_ENTRIES);
 
   meta[name] = { ...meta[name], outputs, lastOutputAt: now };
-  await context.workspaceState.update(METADATA_KEY, meta);
+  await saveMetadata(context, meta);
   return { lastOutputAt: now, truncated, bytes: Buffer.byteLength(body, 'utf8'), count: outputs.length };
 }
 
@@ -569,7 +586,7 @@ async function setBgTask(context, name, op) {
   if (next !== prev)          entry.bgTaskChangedAt = now;
 
   meta[name] = entry;
-  await context.workspaceState.update(METADATA_KEY, meta);
+  await saveMetadata(context, meta);
   return { pendingTasks: next, previous: prev, bgTaskStartedAt: entry.bgTaskStartedAt ?? null };
 }
 
@@ -1155,6 +1172,20 @@ function activate(context) {
   // ── Sync the bundled CLI scripts to a fixed, version-matched path so every ──
   // ── consuming repo calls one canonical copy instead of vendoring its own. ───
   writeBundledCli(context);
+
+  // ── Side panel: every tracked terminal with its status and progress. ──────
+  // A panel that fails to build must not take the HTTP server down with it.
+  try {
+    createPanel(vscode, context, {
+      loadMetadata: () => loadMetadata(context),
+      statusMap: STATUS_MAP,
+      displayStatusKey,
+      terminals,
+      onDidWrite: onDidWriteMetadata,
+    });
+  } catch (err) {
+    console.error('[terminal-bridge] side panel failed to register:', err);
+  }
 
   // ── Keep registry clean when the user closes a terminal manually ──────────
   // Only the name whose bound terminal IS the closed one is dropped. Closing an
@@ -1748,7 +1779,7 @@ function activate(context) {
           return;
         }
         meta[name] = { ...meta[name], outputs: [], lastOutputAt: null };
-        await context.workspaceState.update(METADATA_KEY, meta);
+        await saveMetadata(context, meta);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, name, cleared: true, lastOutputAt: null }));
         return;

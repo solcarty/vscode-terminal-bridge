@@ -326,6 +326,38 @@ Decisions worth knowing:
 - **A panel that fails to build must not take the HTTP server with it.** `activate()` wraps
   `createPanel` in a try/catch. Every live tab runs through the server; the panel is a view.
 
+## The All hosts view reads a command, never another bridge (#6946, v0.32.0+)
+
+A window that orchestrates other machines needed every host's terminals in one place. The spec
+ruled out bridge-to-bridge networking: SSH stays the only way between hosts, and a public extension
+can't know anyone's host layout. So the view runs `terminalBridge.hostsCommand` and renders the
+JSON it prints. The bridge knows the contract in the README and nothing else. It lives in
+`hosts.js`, split like `panel.js`: `buildHosts()` is pure and tested against recorded JSON
+(`test/fixtures/hosts-*.json`), and rows go through `panel.buildRows()`, so a host's rows can't
+drift from the Terminals view's.
+
+Decisions worth knowing:
+
+- **Stdout decides, not the exit code.** The first producer exits 2 when any host is down and still
+  prints a full document, which is the case this view exists to show. Treating exit 2 as a failed
+  run would mark the whole view stale exactly when one host drops.
+- **`self` is in the contract (optional).** The spec says a row on "this window's own host" shows the
+  terminal, but a bridge can't tell which host entry it is without naming hosts. The producer
+  already emitted `self: true`, so the README documents it rather than the bridge guessing from
+  hostnames.
+- **Last good is kept per host, not just per document.** A run that fails as a whole keeps the last
+  document and marks the view `stale`. A host that answers `ok: false` inside a good run keeps its
+  own last good reading and terminals, with its error and that reading's age. Without the per-host
+  copy, one host going down would blank its rows, because the producer sends `terminals: []` for it.
+- **Runs only while visible.** The command SSHes to every host, so it runs on
+  `onDidChangeVisibility` and a 30s interval, both cleared when hidden. The view's `when` clause
+  hides it entirely when the setting is empty. A run is killed as a process group after 20s, so a
+  hung `ssh` child goes with it. A setting change during a run queues one more run instead of
+  waiting a whole interval.
+- **Click never sends anything.** Another host's row opens its window with `vscode.openFolder` on
+  `remoteUri`, which focuses the window if it's already open, or copies `<host> <terminal>`.
+  The spec rules out sending, closing or opening terminals on another host.
+
 ## Key endpoints
 
 All endpoints are GET with query-string params (not POST/JSON — see `extension.js`).
@@ -454,7 +486,7 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open llm-gen /any/local/path \
 
 ## Key file
 
-`extension.js` — the extension, apart from the side panel in `panel.js`. No build step required. `bin/worker.js` is the separate, `vscode`-free worker daemon described above.
+`extension.js` — the extension, apart from the side panel in `panel.js` and the All hosts view in `hosts.js`. No build step required. `bin/worker.js` is the separate, `vscode`-free worker daemon described above.
 
 ## Releasing (#6952, v0.29.0+)
 

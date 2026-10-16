@@ -2,7 +2,7 @@
   "name": "terminal-bridge",
   "displayName": "SDO Terminal Bridge",
   "description": "Opens, renames, and closes VS Code terminal tabs via a local HTTP API",
-  "version": "0.31.0",
+  "version": "0.32.0",
   "scripts": {
     "test": "node test/run.js"
   },
@@ -27,6 +27,11 @@
           "type": "string",
           "default": "",
           "description": "Identity this window's main agent announces to the presence registry (/announce, /api/bridges). Falls back to the workspace name, then the first folder's name, when unset."
+        },
+        "terminalBridge.hostsCommand": {
+          "type": "string",
+          "default": "",
+          "description": "A command that prints every host's terminals as one JSON document (see the README, \"All hosts view\"). When set, an All hosts view appears in the Terminal Bridge container and runs it every 30 s while the view is visible. Empty: no view."
         }
       }
     },
@@ -44,6 +49,11 @@
         {
           "id": "terminalBridge.terminals",
           "name": "Terminals"
+        },
+        {
+          "id": "terminalBridge.hosts",
+          "name": "All hosts",
+          "when": "config.terminalBridge.hostsCommand"
         }
       ]
     },
@@ -52,12 +62,21 @@
         "command": "terminalBridge.showTerminal",
         "title": "Show Terminal",
         "category": "Terminal Bridge"
+      },
+      {
+        "command": "terminalBridge.openHostTerminal",
+        "title": "Open Host Terminal",
+        "category": "Terminal Bridge"
       }
     ],
     "menus": {
       "commandPalette": [
         {
           "command": "terminalBridge.showTerminal",
+          "when": "false"
+        },
+        {
+          "command": "terminalBridge.openHostTerminal",
           "when": "false"
         }
       ]

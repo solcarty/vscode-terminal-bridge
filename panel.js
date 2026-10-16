@@ -188,4 +188,4 @@ function createPanel(vscode, context, deps) {
   return { view, provider, refresh };
 }
 
-module.exports = { VIEW_ID, SHOW_COMMAND, POLL_MS, buildRows, progressText, createPanel };
+module.exports = { VIEW_ID, SHOW_COMMAND, POLL_MS, buildRows, progressText, formatAge, createPanel };

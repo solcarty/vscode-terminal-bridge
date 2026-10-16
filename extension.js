@@ -5,7 +5,8 @@ const path = require('path');
 const crypto = require('crypto');
 const { exec } = require('child_process');
 const { promisify } = require('util');
-const { createPanel } = require('./panel');
+const { createPanel, SHOW_COMMAND } = require('./panel');
+const { createHostsPanel, SETTING: HOSTS_SETTING } = require('./hosts');
 
 const execAsync = promisify(exec);
 
@@ -1185,6 +1186,19 @@ function activate(context) {
     });
   } catch (err) {
     console.error('[terminal-bridge] side panel failed to register:', err);
+  }
+
+  // ── All hosts view: every host's terminals, from terminalBridge.hostsCommand.
+  // Read only, and it runs its command only while the view is on screen.
+  try {
+    createHostsPanel(vscode, context, {
+      statusMap: STATUS_MAP,
+      displayStatusKey,
+      getCommand: () => String(vscode.workspace.getConfiguration('terminalBridge').get(HOSTS_SETTING, '') ?? '').trim(),
+      showLocal: name => vscode.commands.executeCommand(SHOW_COMMAND, name),
+    });
+  } catch (err) {
+    console.error('[terminal-bridge] all hosts view failed to register:', err);
   }
 
   // ── Keep registry clean when the user closes a terminal manually ──────────

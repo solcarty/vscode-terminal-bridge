@@ -268,7 +268,7 @@ five terminals while a sixth is active. No `renameWithArg`, no `show()`, the act
 put, every title is unchanged, and no icon or color is assigned. `test/reindex-rebind.test.js` used
 renames to observe which terminal a name was bound to. It now probes with a staged `send` instead.
 
-## Opens claim the name first, and icons must be codicon ids (#6944, v0.29.0+)
+## Opens claim the name first, and icons must be codicon ids (#6944, v0.30.0+)
 
 On 2026-10-16, three `bridge_open` calls reported `timed out after 2001 ms`, and each still produced
 a tab. The client gave up at `curl -m 2` while the bridge carried on. #53's reuse check only saw a

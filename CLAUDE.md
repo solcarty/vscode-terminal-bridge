@@ -181,7 +181,7 @@ That's the whole feature. The bridge does not poll GitHub, does not know a token
 
 Every terminal `/open-terminal` spawns gets `VSCODE_BRIDGE_ORCHESTRATOR_ID` and `VSCODE_BRIDGE_STATUS_URL` exported into it now, matching the `VSCODE_BRIDGE_PORT` prefix the extension already used. They used to be `HH_ORCHESTRATOR_ID` / `HH_BRIDGE_STATUS_URL` — named after `house.health`, one private consumer, even though every hook and script that talks to the bridge reads them. That's a naming leak in a general-purpose extension's public contract, not a behavior change, which is why this is expand/contract rather than a rename in place: **this release exports both old and new names side by side.** Nothing that reads either name breaks.
 
-The `HH_` names are deprecated and will be **dropped in v0.29.0** (moved from v0.28.0, which shipped the #64 re-index fix alone). Known callers on the old names — `agent-workflows`'s `bin/wt-setup`, `bin/wt-finish`, `bin/pre-pr-gate`, and `commands/pre-pr.md` — are migrated to read the new names (preferring them, falling back to the old) in the same pass as this release (solcarty/agent-workflows#1). `house.health` was audited too and had no references to migrate.
+The `HH_` names are deprecated and will be **dropped in a later release** (moved from v0.28.0, which shipped the #64 re-index fix alone, and again from v0.29.0, which shipped the fixed tab titles and the release workflows). Known callers on the old names — `agent-workflows`'s `bin/wt-setup`, `bin/wt-finish`, `bin/pre-pr-gate`, and `commands/pre-pr.md` — are migrated to read the new names (preferring them, falling back to the old) in the same pass as this release (solcarty/agent-workflows#1). `house.health` was audited too and had no references to migrate.
 
 ## `.sdo/` is a setting now, not a hardcoded path (#57, v0.27.0+)
 
@@ -398,10 +398,15 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open llm-gen /any/local/path \
 
 `extension.js` — the entire extension in one file. No build step required. `bin/worker.js` is the separate, `vscode`-free worker daemon described above.
 
-## Packaging
+## Releasing (#6952, v0.29.0+)
 
-```bash
-npx vsce package   # produces a .vsix
-```
+**Every PR that changes shipped code bumps `version` in `package.json`: patch for a fix, minor for new behaviour or a new endpoint. Merging publishes it.** Nothing else is needed, and nothing commits back to `main`.
 
-Install in VS Code: `Extensions → ... → Install from VSIX`
+- `.github/workflows/version-check.yml` runs on every PR to `main`: `npm test`, plus `.github/scripts/version-check.js`, which fails when the PR changes a shipped file and the version isn't semver-greater than the highest `v*` tag. "Shipped" is anything `.vscodeignore` doesn't exclude, so `*.md`, `test/**`, `.claude/**` and `.github/**` are exempt. Changing `.vscodeignore` itself counts as shipped, because it changes what goes into the VSIX.
+- `.github/workflows/release.yml` runs on every push to `main`. If `v<version>` has no tag it packages the VSIX, pushes an annotated tag and creates the GitHub Release with `terminal-bridge-<version>.vsix` attached and notes generated from the PRs merged since the previous tag. If the version is already released it does nothing, so docs-only merges and re-runs are no-ops.
+
+Why the bump lives in the PR rather than in a release job that bumps and commits: a workflow that pushes to `main` races every other merge and needs a token that can bypass branch protection. The PR's author also knows whether the change is a fix or new behaviour; a workflow would have to guess. Before this, releases happened only when someone ran `.claude/commands/release.md` by hand, so `main` reached 0.28.1 while the latest release was still v0.27.0, and #71 documented itself as v0.29.0 without ever bumping. The first automated release shipped all of that as v0.29.0.
+
+One recovery case is handled: a run that pushed the tag and then failed is finished by a re-run, as long as the tag still points at the commit being built. A tag at some other commit with no release is left alone with a warning, because packaging `HEAD` under it would publish code the tag doesn't contain. `.claude/commands/release.md` is the manual backup for that and for a workflow outage.
+
+To build a VSIX locally: `npx @vscode/vsce package --skip-license`. Install in VS Code: `Extensions → ... → Install from VSIX`.

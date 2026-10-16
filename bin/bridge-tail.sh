@@ -7,7 +7,7 @@
 # actually running on a remote machine still looks and feels like a normal
 # local terminal tab in VS Code.
 #
-# Bundled by extension.js's writeBundledCli() alongside bridgectl.sh /
+# Bundled by bridge.js's writeBundledCli() alongside bridgectl.sh /
 # vscode-bridge.sh; edit the copy in this repo's bin/, not the one under
 # ~/.vscode-terminal-bridge/.
 set -euo pipefail

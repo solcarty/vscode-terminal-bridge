@@ -10,7 +10,7 @@ It has since grown into the substrate for running **agents** in terminals — sp
 
 ## How it works
 
-On activation, the extension starts an HTTP server on `127.0.0.1`. It tries port **31415** first; if that port is already taken (e.g. a second VS Code window is open), it increments until it finds a free port (`31416`, `31417`, …), giving up after 32 attempts.
+On activation, the extension starts an HTTP server on `127.0.0.1` — unless a [headless bridge](#headless-mode-no-vs-code-window) already serves this host, in which case the window shows that bridge's terminals instead. It tries port **31415** first; if that port is already taken (e.g. a second VS Code window is open), it increments until it finds a free port (`31416`, `31417`, …), giving up after 32 attempts.
 
 Once bound, the extension writes the active port to a `.vscode-bridge-port` file in **every workspace folder**. Scripts discover their window's port by reading this file from the repo root — no hardcoded port, no guessing which window is which.
 
@@ -267,6 +267,8 @@ curl http://127.0.0.1:$PORT/ping
 
 `workspaceFolders` lets you confirm you're talking to the right window — each window's bridge lists only its own workspace roots.
 
+`backend` (v0.33.0+) says which bridge answered: `vscode` for the extension, `tmux` for a [headless bridge](#headless-mode-no-vs-code-window). A headless bridge reports its own `pid` and its `tmuxSocket` instead of `ipcHook`.
+
 ---
 
 ### `GET /announce` · `GET /api/bridges`
@@ -391,6 +393,7 @@ The bundled `bridgectl.sh open` client checks this response and returns a non-ze
 | `cmdDelivery` | Meaning |
 |---|---|
 | `shell-integration` | The shell reported ready, then the command was written. Confirmed. |
+| `prompt` | [Headless](#headless-mode-no-vs-code-window) only: the tmux pane's cursor sat after a prompt, then the command was written. Confirmed the same way. |
 | `timeout` | The ready signal never arrived; written blind after a fallback delay. The write happened — whether the shell consumed it is unknown. |
 | `none` | Nothing to deliver. |
 | `null` | Rows from before v0.25.0, or a tab that hasn't reached either outcome yet. |
@@ -443,6 +446,8 @@ curl "http://127.0.0.1:${PORT}/list"
   ]
 }
 ```
+
+*v0.33.0+.* The response also carries `backend` (`vscode` or `tmux`), and on a [headless bridge](#headless-mode-no-vs-code-window) each row carries `tmuxSession`: the session to attach to (`tmux -L vscode-bridge attach -t =<session>`), or `null` when the row has no live session. Every other field means the same thing on both backends; `pidAlive` and `agentAlive` read the pane's shell exactly as they read a VS Code tab's.
 
 #### Timestamps and liveness
 
@@ -798,6 +803,7 @@ Read-back: what the agent in a tracked terminal last **said**, so an orchestrati
 | -------- | ---------- | ------- |
 | `/set-output` | `name` (req), `text=` or `textFile=` | Publish a turn's final assistant text (called by a hook, not by hand) |
 | `/output` | `name` (req), `n=` (1–3, default 1) | Read the most recent message(s) back |
+| `/output?pane=1` | `name` (req), `lines=` (default 50) | [Headless](#headless-mode-no-vs-code-window) only (v0.33.0+): what the tmux pane shows now, via `capture-pane` → `{ ok, name, lines, pane }`. A VS Code bridge answers `501`, because VS Code has no way to read a terminal. |
 | `/clear-output` | `name` (req) | Drop what's stored |
 
 ```bash
@@ -1579,6 +1585,59 @@ Prefer `status=` over a hand-written `label=`: the bridge owns the codicon and c
 
 The extension re-indexes automatically. When the window is focused after a reload it scans all open terminals against persisted metadata and active git worktrees, re-linking any match. You can also call `/reindex` explicitly from a script to force a scan without waiting for window focus. Since v0.28.0 a re-index never takes a name away from a terminal that is still open; see [`GET /reindex`](#get-reindex) for the matching rules.
 
+## Headless mode (no VS Code window)
+
+*v0.33.0+ ([#77](https://github.com/solcarty/vscode-terminal-bridge/issues/77)).* The bridge normally lives inside a VS Code window, so on a remote host it exists only while a Remote-SSH window is connected. Headless mode runs the same bridge as a standalone Node process under systemd, with **tmux sessions** as its terminals. Nothing about the API changes: every route, field and `bridgectl` verb in this README works against it, and `bridgectl.sh` finds it the same way.
+
+### Install
+
+On the host (Linux with systemd, `node` ≥ 18 and `tmux` on `PATH`), from a checkout of this repo:
+
+```bash
+bash bin/install-headless.sh --folder="$HOME/Workspace/my-repo" [--folder=...] [--agent-id=dev-1]
+```
+
+It copies `bridge.js`, `headless.js` and `bin/` to `~/.vscode-terminal-bridge/headless/app/`, writes `~/.config/systemd/user/vscode-terminal-bridge.service`, enables and starts it, runs `loginctl enable-linger $USER` (so the service starts at boot with nobody logged in), and waits for `/ping` to answer `backend: "tmux"`. Re-run it to upgrade; the restart keeps every tmux session. `--print-unit` prints the unit it would install and changes nothing.
+
+| Option | What it does |
+| --- | --- |
+| `--folder=<path>` | A workspace folder: gets `.vscode-bridge-port`, roots `/sweep`'s `git worktree list`, and is matched by `/api/status`'s `repo`. Repeatable. Also `VSCODE_BRIDGE_FOLDERS` (colon-separated). |
+| `--agent-id=<id>` | The [presence](#get-announce--get-apibridges) identity (`terminalBridge.agentId`'s counterpart). Falls back to the first folder's basename. |
+| `--socket=<name>` | The tmux socket (`tmux -L <name>`). Default `vscode-bridge`. Also `VSCODE_BRIDGE_TMUX_SOCKET`. |
+| `--pipeline-state-dir=<dir>` | `terminalBridge.pipelineStateDir`'s counterpart. |
+
+Without systemd, run it under anything that restarts it: `node headless.js --folder <path>`. Logs go to stdout (`journalctl --user -u vscode-terminal-bridge` under the unit).
+
+### The unit
+
+`systemd/vscode-terminal-bridge.service`: `Restart=always`, `WantedBy=default.target`, the `node` path and `PATH` recorded at install time (systemd's default `PATH` has no nvm or Homebrew node), and **`KillMode=process`**. The tmux server is forked from the bridge, so it sits in the unit's cgroup; the default `KillMode=control-group` would kill every terminal on each restart.
+
+### The tmux backend
+
+- **Each named terminal is a tmux session** on the bridge's own socket (`tmux -L vscode-bridge`), so your own `tmux ls` never sees them and the bridge never touches yours. Session names are the terminal name with anything outside `[A-Za-z0-9_-]` turned into `_` (tmux rewrites `.` and `:` itself); the real name is kept in the `@bridge_name` session option. `/list`'s `tmuxSession` is the session's name.
+- **`send`** goes through `tmux load-buffer` + `paste-buffer` (with `-p`, a bracketed paste, on the multi-line path), and the submit is `send-keys Enter`. `delivery` values mean what they always did.
+- **`pidAlive` / `agentAlive`** read the pane's shell pid (`#{pane_pid}`) — the same shell-then-`claude`-child check as a VS Code tab.
+- **`cmdDelivery`** is `prompt` when the pane's cursor sat after a prompt before the command was written, `timeout` when that never happened within the fallback.
+- **`/output?pane=1`** returns what the pane shows (`capture-pane`). The hook-fed `/output` ring works too.
+- **To watch or type into one:** `tmux -L vscode-bridge attach -t =<tmuxSession>` (the `=` makes the name exact).
+- **`/add-folder` / `/remove-folder`** change the folder list until the next restart; make a folder permanent with `--folder`.
+
+### Lifetime
+
+- **Sessions outlive the bridge.** A stopped or restarted bridge leaves its sessions running; on start it re-reads `tmux list-sessions` and re-binds each row to its session by name, keeping its `createdAt`, status, note and the rest. The registry lives in `~/.vscode-terminal-bridge/headless/registry.json`.
+- **A session that ends takes its row with it**, as a closed VS Code tab does. The bridge polls tmux every 2 seconds.
+- **After a reboot, terminals do not come back.** The tmux server is gone, so on start the bridge drops every row whose session tmux confirms is gone, and `list` is empty rather than listing terminals that no longer exist. If tmux can't be asked at all, rows are kept until it can.
+
+### Discovery
+
+Exactly the extension's: `~/.vscode-terminal-bridge/port`, `.vscode-bridge-port` in each `--folder`, the bundled CLI in `~/.vscode-terminal-bridge/bin/`, a [presence](#get-announce--get-apibridges) entry in `~/.vscode-terminal-bridge/bridges/` (with `"backend": "tmux"`), and `VSCODE_BRIDGE_PORT` exported into every terminal it opens. Ports start at `31415` as usual.
+
+### Opening a VS Code window on a host that runs headless
+
+The extension does **not** start a second bridge. On activation it looks for a live headless bridge — a presence entry with `"backend": "tmux"`, then `~/.vscode-terminal-bridge/port` — and asks it `/ping`. If one answers `backend: "tmux"`, the window becomes a viewer: no HTTP server, no registry of its own. Its Terminals panel lists the headless bridge's terminals (re-read every 3 seconds; the view's title reads `headless · <port>`), clicking a row opens a VS Code terminal running `tmux attach` on that session (a second click shows the same one), and it writes the headless port into its own workspace folders' `.vscode-bridge-port`. Every caller on the host talks to the one bridge.
+
+If nothing answers, the window serves as it always has. If the headless bridge stops answering later, the view's title says so; reload the window to serve locally.
+
 ## Remote jobs
 
 A long-running job (e.g. a multi-hour local LLM generation) can run on a separate machine on your network — a Mac Mini, a homelab VM, anything reachable over the LAN — instead of blocking your laptop, while still showing up as a normal terminal tab with a live status icon.
@@ -1642,7 +1701,7 @@ Every release on the [Releases](../../releases) page is published by CI when a P
 
 ## Security
 
-The local bridge (`extension.js`) binds to `127.0.0.1` only — it is **not** accessible from other machines on the network, and has no authentication because it controls only your local VS Code instance.
+The local bridge (`extension.js`, or `headless.js` in headless mode) binds to `127.0.0.1` only — it is **not** accessible from other machines on the network, and has no authentication because it controls only your local VS Code instance.
 
 The worker daemon (`bin/worker.js`, see [Remote jobs](#remote-jobs)) is different: it binds `0.0.0.0` so a laptop on the LAN can reach it, and **does** require a bearer token on every request. Anyone with that token can run arbitrary shell commands on the worker machine — store it like an SSH key (`chmod 600` on `nodes.json`, never commit it).
 

@@ -10,3 +10,6 @@ test/**
 # has no business inside the package.)
 .claude/**
 .vscode-bridge-port
+
+# CI: the version-check and release workflows and their script.
+.github/**

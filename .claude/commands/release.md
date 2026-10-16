@@ -1,92 +1,59 @@
-# /release — Cut a new version and publish a GitHub Release with the VSIX
+# /release — Manual backup for a release CI didn't publish
 
-Ships a new version of this extension the way every past release has been done:
-version bump, packaged VSIX, annotated tag, and a GitHub Release with the VSIX
-attached and real release notes — not just a commit on `main`.
+Releases are automatic. Merging a PR to `main` runs
+`.github/workflows/release.yml`, which packages the VSIX, pushes an annotated
+`v<version>` tag and creates the GitHub Release with
+`terminal-bridge-<version>.vsix` attached. The version bump lives in the PR and
+`.github/workflows/version-check.yml` enforces it (see "Releasing" in
+`CLAUDE.md`). **Normally there is nothing to do here.**
 
 ## When to use
 
-After merging fixes/features you want to ship. If the user says "make a
-release" or "cut a new version," this is the full checklist — don't stop at
-just committing and pushing.
+Only when the workflow can't finish the job:
+
+- `release` failed and a re-run won't fix it (for example GitHub Actions is down).
+- The run logged `vX.Y.Z is tagged at another commit and has no release`.
+
+If a merged version simply has no release yet, first try re-running the
+workflow: **Actions → release → Run workflow** on `main`, or
+`gh workflow run release.yml --repo solcarty/vscode-terminal-bridge`. A run that
+tagged the current commit and then failed is finished by a re-run.
+
+Never bump the version here: that belongs in a PR.
 
 ## Steps
 
-1. **Confirm the working tree is clean and pushed.** `git status`, and make
-   sure whatever you're releasing is already committed. If there are
-   uncommitted changes relevant to the release, commit them first (see repo's
-   CLAUDE.md / global git-commit conventions) — don't fold release mechanics
-   into the same commit as the actual fix/feature.
-
-2. **Pick the version number.** Check `package.json`'s current `version` and
-   `git tag -l` / `gh release list` for the last shipped version. Bump
-   patch/minor/major based on the size of the change (this project has used
-   minor bumps liberally, e.g. every new endpoint or behavior change gets a
-   minor bump: 0.14.0 → 0.15.0).
-
-3. **Bump `package.json`:**
+1. **Check what's missing.**
    ```bash
-   # edit "version" field to the new version
+   gh release list --repo solcarty/vscode-terminal-bridge -L 3
+   git fetch --tags && git tag -l 'v*' --sort=-v:refname | head -3
+   gh run list --repo solcarty/vscode-terminal-bridge --workflow release.yml -L 5
    ```
 
-4. **Package the VSIX into a scratch dir:**
+2. **Package from the commit the tag points at** (or `origin/main` if there's no tag yet), into a scratch dir, never the repo:
    ```bash
-   mkdir -p /tmp/terminal-bridge-release
-   npx vsce package -o /tmp/terminal-bridge-release/
-   ```
-   Don't package into the repo tree at all — GitHub's release asset is the
-   permanent copy, and old versions can always be reproduced later with
-   `git checkout <tag> && npx vsce package` if ever needed. There is no
-   reason to keep built VSIXes sitting in the repo (that's what got messy
-   before — 16 of them accumulated in the repo root over time). If it warns
-   about a missing LICENSE, that's expected and pre-existing — ignore it.
-
-5. **Commit the version bump** (and any other release-relevant doc changes,
-   e.g. README updates) with a message summarizing what's in the release —
-   look at `git log` for the style prior releases used (e.g. `v0.14.0: add
-   remote job execution via worker nodes + rmux`).
-
-6. **Push the commit:**
-   ```bash
-   git push origin main
+   git checkout v<version>          # or origin/main
+   npx @vscode/vsce package --skip-license -o /tmp/terminal-bridge-release/
    ```
 
-7. **Tag and push the tag** — this is the step that's easy to forget and the
-   reason a version bump alone doesn't show up as a release:
+3. **Tag, if the tag doesn't exist yet:**
    ```bash
-   git tag -a v<version> -m "v<version>: <one-line summary>"
+   git tag -a v<version> -m "v<version>"
    git push origin v<version>
    ```
 
-8. **Create the GitHub Release with the VSIX attached:**
+4. **Create the release with the VSIX attached:**
    ```bash
    gh release create v<version> /tmp/terminal-bridge-release/terminal-bridge-<version>.vsix \
-     --repo solcarty/vscode-terminal-bridge \
-     --title "v<version>: <one-line summary>" \
-     --notes "<release notes — see below>"
+     --repo solcarty/vscode-terminal-bridge --verify-tag \
+     --title "v<version>" --generate-notes --notes-start-tag v<previous-version>
    ```
-   Look at `gh release view v<prior-version> --repo solcarty/vscode-terminal-bridge --json body`
-   for the notes style/format prior releases used (bullet list per
-   fix/feature, referencing issue numbers where applicable).
 
-9. **Clean up the scratch dir** — the VSIX now lives permanently as a
-   GitHub Release asset, so there's no reason to keep the local copy:
+5. **Check it, then clean up:**
    ```bash
-   rm -rf /tmp/terminal-bridge-release
+   gh release download v<version> --repo solcarty/vscode-terminal-bridge -p '*.vsix' -D /tmp/check
+   rm -rf /tmp/terminal-bridge-release /tmp/check
    ```
 
-10. **If the release fixes filed GitHub issues**, close each one with a
-    comment referencing the commit/tag, e.g.:
-
-    ```bash
-    gh issue close <n> --repo solcarty/vscode-terminal-bridge \
-      --comment "Fixed in v<version>: <what changed>."
-    ```
-
-## Common mistake this skill exists to prevent
-
-Bumping `package.json`'s version and committing is **not** a release — it's
-invisible on the GitHub Releases page. A release requires an annotated git
-tag pushed to the remote AND a `gh release create` call with the VSIX
-attached. Both steps 7 and 8 are required; skipping either means "the new
-release" won't show up where the user expects it.
+A version bump on `main` with no tag and no GitHub Release is not a release.
+Both the tag and the release with the VSIX attached are required.

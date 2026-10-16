@@ -1,0 +1,83 @@
+# Merging to main publishes the version the PR declared: package the VSIX, tag
+# v<version>, and create a GitHub Release with it attached. The bump lives in
+# the PR (version-check.yml); nothing here commits or pushes to main. A version
+# that is already released is a no-op, so docs-only pushes and re-runs succeed
+# without publishing anything.
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # every v* tag, for the guard and the notes range
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Decide
+        id: plan
+        run: |
+          version=$(node -p "require('./package.json').version")
+          tag="v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # Previous release for the notes range: the highest v* tag that isn't this one.
+          prev=$(git tag -l 'v*' --sort=-v:refname | grep -vxF "$tag" | head -n1 || true)
+          echo "prev=$prev" >> "$GITHUB_OUTPUT"
+
+          if ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "create_tag=true" >> "$GITHUB_OUTPUT"
+            echo "$tag has no tag yet: publishing."
+          elif gh release view "$tag" >/dev/null 2>&1; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "$tag is already released: nothing to do."
+          elif [ "$(git rev-parse "$tag^{commit}")" = "$(git rev-parse HEAD)" ]; then
+            # A run that pushed the tag and then failed: finish it from the same commit.
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "create_tag=false" >> "$GITHUB_OUTPUT"
+            echo "$tag is tagged at this commit but has no release: finishing it."
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::$tag is tagged at another commit and has no release. Not publishing; see .claude/commands/release.md."
+          fi
+
+      - name: Package
+        if: steps.plan.outputs.publish == 'true'
+        run: |
+          mkdir -p dist
+          npx --yes @vscode/vsce package --skip-license -o "dist/terminal-bridge-${{ steps.plan.outputs.version }}.vsix"
+
+      - name: Tag
+        if: steps.plan.outputs.publish == 'true' && steps.plan.outputs.create_tag == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.plan.outputs.tag }}" -m "${{ steps.plan.outputs.tag }}"
+          git push origin "refs/tags/${{ steps.plan.outputs.tag }}"
+
+      - name: Release
+        if: steps.plan.outputs.publish == 'true'
+        run: |
+          args=(--verify-tag --title "${{ steps.plan.outputs.tag }}" --generate-notes)
+          if [ -n "${{ steps.plan.outputs.prev }}" ]; then
+            args+=(--notes-start-tag "${{ steps.plan.outputs.prev }}")
+          fi
+          gh release create "${{ steps.plan.outputs.tag }}" \
+            "dist/terminal-bridge-${{ steps.plan.outputs.version }}.vsix" "${args[@]}"

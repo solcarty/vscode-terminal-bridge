@@ -1,0 +1,36 @@
+# Merging to main publishes package.json's version (release.yml), so the bump
+# has to be in the PR. A PR that changes anything .vscodeignore doesn't exclude
+# must carry a version greater than the highest v* tag.
+name: version-check
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the base commit and every v* tag
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Shipped changes bump the version
+        run: >-
+          node .github/scripts/version-check.js
+          --base "${{ github.event.pull_request.base.sha }}"
+          --head "${{ github.event.pull_request.head.sha }}"
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm test

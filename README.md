@@ -1562,6 +1562,10 @@ Unlike the local bridge, every worker endpoint requires `Authorization: Bearer <
 - A **failed** job's worktree is left in place for manual inspection — `git worktree remove` it yourself, or hit `/sweep-job` once you're done.
 - To inspect a stuck or running job directly: SSH into the worker and run `rmux attach -t <jobId>`.
 
+## Releasing
+
+Every release on the [Releases](../../releases) page is published by CI when a PR merges to `main`. A PR that changes anything the VSIX ships (everything except `*.md`, `test/**`, `.claude/**` and `.github/**`, per `.vscodeignore`) must bump `version` in `package.json` past the latest `v*` tag: patch for a fix, minor for new behaviour or a new endpoint. The `version-check` workflow fails the PR otherwise. On merge, the `release` workflow tags `v<version>` and attaches `terminal-bridge-<version>.vsix` to a new GitHub Release; a merge whose version is already released publishes nothing.
+
 ## Security
 
 The local bridge (`extension.js`) binds to `127.0.0.1` only — it is **not** accessible from other machines on the network, and has no authentication because it controls only your local VS Code instance.

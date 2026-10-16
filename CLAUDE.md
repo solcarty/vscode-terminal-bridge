@@ -294,6 +294,38 @@ dropped, never turned into a ThemeIcon, and echoed as `iconIgnored`. The open st
 because a missing icon is cosmetic and failing a launch over it would strand the command.
 `bridge_open` prints a stderr warning, and its exit status stays 0.
 
+## The side panel is where status went (#6943, v0.31.0+)
+
+Once titles stopped carrying status (*Tab titles are set once at open*, above), a human had nowhere
+to see it short of running `list`. The *Terminal Bridge* activity-bar view is that place. It lives in `panel.js`, not `extension.js`:
+the row model, `buildRows()`, is a pure function of registry rows, so what a row shows and where it
+sorts is tested without a VS Code mock (`test/panel-rows.test.js`). `createPanel()` is the thin
+layer that turns rows into TreeItems. `STATUS_MAP` and `displayStatusKey` are passed in, not copied,
+so the panel can't drift from what `/list` reports.
+
+Decisions worth knowing:
+
+- **Every registry write goes through `saveMetadata()`**, which fires the panel's refresh. Before
+  this, eight call sites wrote `workspaceState` directly (heartbeat, note, output, bg-task, …).
+  Hooking only `persistMetadata` would have left the panel blind to notes and heartbeats, and the
+  next new writer would have had to remember. One choke point means it can't be forgotten.
+- **No polling, except while something is `working`.** The panel is event-driven. The 1s re-read
+  only exists so "working for 12m" in the tooltip keeps moving. It's armed from `getChildren()` and
+  cleared the moment no row is `working`. An idle window costs nothing.
+- **Grouping uses raw `status`; the icon uses `displayStatus`.** A `working` agent with a background
+  task should still sort with the busy ones, while its icon shows the `bg-task` it's waiting on.
+  The attention states are the same in both, so the person-needed group is unaffected.
+- **"Newest first" means `createdAt`**, not `statusChangedAt`. Sorting by last change makes rows
+  jump every time a hook fires, which is constantly. Rows from before v0.18.0 have no `createdAt`
+  and sort last in their group; the bridge still doesn't invent a time for them.
+- **Dropped rows use `/list`'s `live` rule** (bound in `terminals`, or a window tab of that name).
+  A row whose tab is gone leaves the panel on the next refresh, even before anything deletes it
+  from the registry.
+- **Untracked means "not bound"**, not "name not in the registry". A duplicate tab that shares a
+  tracked name but isn't the bound terminal is exactly the stray this group exists to surface.
+- **A panel that fails to build must not take the HTTP server with it.** `activate()` wraps
+  `createPanel` in a try/catch. Every live tab runs through the server; the panel is a view.
+
 ## Key endpoints
 
 All endpoints are GET with query-string params (not POST/JSON — see `extension.js`).
@@ -422,7 +454,7 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open llm-gen /any/local/path \
 
 ## Key file
 
-`extension.js` — the entire extension in one file. No build step required. `bin/worker.js` is the separate, `vscode`-free worker daemon described above.
+`extension.js` — the extension, apart from the side panel in `panel.js`. No build step required. `bin/worker.js` is the separate, `vscode`-free worker daemon described above.
 
 ## Releasing (#6952, v0.29.0+)
 

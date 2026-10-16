@@ -1,6 +1,6 @@
-// Regression cover for /rename-terminal, which #40 rerouted through the shared
-// applyPresentation() renderer. Everything here is pre-existing behaviour that
-// must survive that refactor.
+// Regression cover for /rename-terminal's registry semantics. Since #6942 it
+// writes the registry only (title-fixed.test.js covers the tab side); the
+// labels, colors and timestamps it reports must be exactly what they were.
 const h = require('./harness');
 const http = require('http');
 const fs = require('fs');

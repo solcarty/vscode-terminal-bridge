@@ -54,6 +54,14 @@ const wait = ms => new Promise(r => setTimeout(r, ms));
     if (!cond) fails++;
   };
   const row = async n => JSON.parse((await get(port, '/list')).body).terminals.find(t => t.name === n);
+  // Which terminal is `name` bound to? Titles are never renamed (#6942), so
+  // send a staged probe through the name and see which terminal received it.
+  let probes = 0;
+  const probe = async name => {
+    const tag = `probe-${++probes}`;
+    await get(port, `/send-text?name=${name}&text=${tag}&submit=0&force=1`);
+    return t => t.sent.some(s => String(s.text).includes(tag));
+  };
 
   await get(port, '/reindex');
   check('the loop tab is bound to its name at startup', (await row('feat-1'))?.pid === process.pid, await row('feat-1'));
@@ -68,19 +76,16 @@ const wait = ms => new Promise(r => setTimeout(r, ms));
   check('list still reports the loop tab\'s own pid', feat && feat.pid === process.pid, feat);
   check('the name is still live', feat && feat.pidAlive === true, feat);
 
-  h.renames.length = 0;
-  await get(port, '/rename-terminal?name=feat-1&label=feat-1%20tick');
-  check('rename lands on the loop tab, not the task terminal',
-    h.renames.length === 1 && h.renames[0].terminal === 'feat-1', h.renames);
+  let got = await probe('feat-1');
+  check('the name reaches the loop tab, not the task terminal', got(loop) && !got(task),
+    { loop: loop.sent, task: task.sent });
 
   // 2. A terminal with the same name as a live tracked one does not steal it.
   const twin = h.addTerminal(h.makeTerminal('feat-1', OTHER_PID));
   await get(port, '/reindex');
-  h.renames.length = 0;
-  await get(port, '/rename-terminal?name=feat-1&label=again');
+  got = await probe('feat-1');
   check('a same-named second terminal does not take a live name (strategy A)',
-    h.renames.length === 1 && h.renames[0].terminal === 'feat-1' && loop.displayName === 'again'
-      && twin.displayName === undefined, { renames: h.renames, twin: twin.displayName });
+    got(loop) && !got(twin), { loop: loop.sent, twin: twin.sent });
 
   // 3. Closing untracked / foreign terminals never deletes another name's row.
   await h.closeTerminal(task);
@@ -102,23 +107,20 @@ const wait = ms => new Promise(r => setTimeout(r, ms));
   // ...but a pid that picks out exactly one of them does bind.
   const pick = h.addTerminal(withCwd(h.makeTerminal('zsh', OTHER_PID), '/tmp/shared'));
   await get(port, '/reindex');
-  h.renames.length = 0;
-  await get(port, '/rename-terminal?name=amb-b&label=picked');
-  check('an ambiguous cwd binds when the shell pid disambiguates',
-    pick.displayName === 'picked', { renames: h.renames });
+  got = await probe('amb-b');
+  check('an ambiguous cwd binds when the shell pid disambiguates', got(pick), pick.sent);
 
   // 5. A live recorded pid that isn't this terminal's shell vetoes the cwd match.
   const imposter = h.addTerminal(withCwd(h.makeTerminal('zsh', OTHER_PID), '/tmp/owned'));
   await get(port, '/reindex');
-  h.renames.length = 0;
-  await get(port, '/rename-terminal?name=owned&label=nope');
-  check('a live pid owned by another process vetoes the cwd match', imposter.displayName === undefined, { renames: h.renames });
+  got = await probe('owned');
+  check('a live pid owned by another process vetoes the cwd match', !got(imposter), imposter.sent);
 
   // 6. The ordinary reload case still works: one name, no pid, unbound.
   const revived = h.addTerminal(withCwd(h.makeTerminal('zsh', 4343), '/tmp/solo'));
   const r2 = JSON.parse((await get(port, '/reindex')).body);
-  await get(port, '/rename-terminal?name=solo&label=back');
-  check('an unbound single-name cwd still re-binds after a reload', r2.reindexed === 1 && revived.displayName === 'back', r2);
+  got = await probe('solo');
+  check('an unbound single-name cwd still re-binds after a reload', r2.reindexed === 1 && got(revived), r2);
 
   console.log(fails ? `\n${fails} failing` : '\nall green');
   process.exit(fails ? 1 : 0);

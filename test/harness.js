@@ -36,8 +36,9 @@ let closeCbs = [];
 
 const vscodeMock = {
   commands: {
-    // VS Code renames whichever terminal is active; applyPresentation() shows
-    // the target first, so record against activeTerminal to mirror that.
+    // VS Code renames whichever terminal is active, so a rename is recorded
+    // against activeTerminal. The bridge no longer issues any; tests assert
+    // this list stays empty.
     executeCommand: (cmd, arg) => {
       if (cmd === 'workbench.action.terminal.renameWithArg') {
         renames.push({ terminal: activeTerminal?.name ?? null, name: arg && arg.name });
@@ -93,7 +94,9 @@ function makeTerminal(name, pid) {
     name,
     processId: Promise.resolve(pid ?? 4242),
     sendText: (text, submit) => t.sent.push({ text, submit }),
+    shows: 0,
     show: () => {
+      t.shows++;
       if (showBehavior.ignore) return;
       if (showBehavior.delayMs > 0) setTimeout(() => { activeTerminal = t; }, showBehavior.delayMs);
       else activeTerminal = t;

@@ -1,6 +1,6 @@
 # VS Code Terminal Bridge
 
-A tiny VS Code extension that exposes a local HTTP API for managing terminal tabs programmatically — open, rename, and close named terminals from bash scripts, shell tools, or any process that can make an HTTP request.
+A tiny VS Code extension that exposes a local HTTP API for managing terminal tabs programmatically — open and close named terminals, and track each one's status, from bash scripts, shell tools, or any process that can make an HTTP request.
 
 Built to solve a real problem: VS Code extensions and external scripts **cannot** reliably open terminals using AppleScript, keystrokes, or CLI flags. This extension uses the native `vscode.window.createTerminal` API, exposed via a local-only HTTP server.
 
@@ -85,7 +85,7 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open   <name> <cwd> [cmd] [icon]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh status <name> <state>   # working|idle|needs-input|pr-open|merged|...
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh close  <name>   # disposes the tab AND removes its tracked row
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh forget <name>   # removes the tracked row only, never touches a process
-bash ~/.vscode-terminal-bridge/bin/bridgectl.sh repaint         # redraws every tracked tab's stored title
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh repaint         # no-op since v0.29.0 — titles are fixed at open
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh send   <name> <text>|--text-file=<path> [--no-submit] [--force] [--mode=...] [--submit-delay=<ms>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh nudge  <name> [--force]   # bare Enter — releases a paste left staged in the input box
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh list
@@ -94,7 +94,7 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note set <text>|--text-file=<pat
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note get <name>                             # read one back
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh output <name> [--n=<1..3>]                  # read back what it last said
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh pr <name> <url>                             # record a PR url (advisory, last write wins)
-bash ~/.vscode-terminal-bridge/bin/bridgectl.sh rename <name> <label> [icon] [color]   # prefer `status` — it owns icon+color
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh rename <name> <label> [icon] [color]   # registry only — the tab keeps its open-time title
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh announce <status>                           # this window's own agent, not a tab
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh agents                                      # every live window — cwd-independent
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh worker --prompt-file=<path> [--permission-mode=<m>]
@@ -130,7 +130,7 @@ For the port file to work correctly, your repo root must be open as a workspace 
 
 ## VS Code title format (recommended)
 
-This setting only matters for terminals **not** managed by the bridge — any tab opened or renamed via `/open-terminal` / `/rename-terminal` gets a static label (with the `$(codicon)` status prefix baked in, see [status values](#status-values)) that overrides whatever title format VS Code would otherwise compute. For everything else — terminals you open manually, or before this extension renames them — this format gives you a useful default: the live shell title on the left, the workspace folder name on the right.
+This setting only matters for terminals **not** opened by the bridge — a tab opened via `/open-terminal` gets the static `name` it was opened with, which overrides whatever title format VS Code would otherwise compute and is never changed afterwards (see [fixed at open](#tab-titles-icons-and-colors-are-fixed-at-open)). For everything else — terminals you open manually — this format gives you a useful default: the live shell title on the left, the workspace folder name on the right.
 
 **Settings → Terminal › Integrated › Tabs: Title** (or edit `settings.json`):
 
@@ -142,7 +142,6 @@ This gives you:
 
 - `${rootWorkspaceFolderName}` — always shows the workspace folder name on the right
 - `${sequence}` — shows any OSC title sequences emitted by the shell on the left
-- Once a terminal is renamed via `/rename-terminal` (e.g. with `status=working`), its static label replaces this computed format entirely — that's how bridge-managed status icons actually show up in the tab
 
 ## Settings
 
@@ -608,22 +607,22 @@ or restart it headless with `bridgectl worker --resume`. Never resume while the 
 
 ### `GET /rename-terminal`
 
-Renames a tracked terminal tab and optionally updates its icon and color. Supports three modes.
+Records a tracked terminal's label, status and color in the bridge's registry, where [`/list`](#get-list) reports them. **It never changes the tab:** a terminal's title, icon and color are what [`/open-terminal`](#get-open-terminal) created it with, for its whole life (v0.29.0+, see [below](#tab-titles-icons-and-colors-are-fixed-at-open)). Supports three modes.
 
 | Parameter | Required | Description |
 | --------- | -------- | ----------- |
 | `name` | Yes | Registry name (as passed to `/open-terminal`) |
-| `status` | No* | Canonical lifecycle state. The bridge applies the matching codicon label prefix and color automatically. See [status values](#status-values) below. |
-| `label` | No* | Full display label override. When combined with `status=`, updates the base label and re-applies the status prefix on top. *Required if neither `status=` nor `quiet=1` is provided.* |
-| `color` | No | VS Code ThemeColor ID override. Takes precedence over the status default color. |
-| `icon` | No | VS Code ThemeIcon ID. Updates `iconPath` only (does not affect the label codicon). |
-| `quiet` | No | `quiet=1` — update only `icon`/`color` (+ status color) without activating the terminal panel. No label change, no flicker. |
+| `status` | No* | Canonical lifecycle state. The bridge stores it, plus a label carrying the matching codicon prefix and the matching color. See [status values](#status-values) below. |
+| `label` | No* | Full label override. When combined with `status=`, updates the base label and re-applies the status prefix on top. *Required if neither `status=` nor `quiet=1` is provided.* |
+| `color` | No | VS Code ThemeColor ID override for the stored color. Takes precedence over the status default color. |
+| `icon` | No | Accepted and echoed back for compatibility. Has no effect. |
+| `quiet` | No | `quiet=1` — store only status and/or color. The stored label is not changed. |
 
 **Three modes:**
 
-- **Status mode** (`status=<key>`) — the bridge looks up the canonical codicon + color for the given state, prefixes the label as `$(codicon) baseLabel`, and sets the color. `iconPath` is **never** touched — the identity icon (e.g. `hubot`) stays put. Idempotent: repeated calls with the same status value are no-ops if the label and color are already correct.
-- **Quiet mode** (`quiet=1`) — updates `iconPath` and/or color (including the status color when `status=` is combined) via direct property assignment. Zero terminal activation, zero panel flicker. Label is not changed.
-- **Legacy mode** (`label=<text>`) — sets the full display label directly. Use for intentional, infrequent renames (e.g. a skill marking a tab `✅ Done`). This briefly activates the target terminal then restores the previously active one; keyboard focus is always preserved.
+- **Status mode** (`status=<key>`) — the bridge looks up the canonical codicon + color for the given state, stores the label as `$(codicon) baseLabel`, and stores the color. Idempotent: repeated calls with the same status value are no-ops if the label and color are already stored.
+- **Quiet mode** (`quiet=1`) — stores status and/or color (including the status color when `status=` is combined). Label is not changed.
+- **Legacy mode** (`label=<text>`) — stores the full label verbatim (e.g. a loop's `feat-12 3/1/4 next 16:10`).
 
 #### Status values
 
@@ -650,11 +649,11 @@ curl "http://127.0.0.1:${PORT}/rename-terminal?name=my-task&status=working"
 curl "http://127.0.0.1:${PORT}/rename-terminal?name=my-task&status=needs-input"
 curl "http://127.0.0.1:${PORT}/rename-terminal?name=my-task&status=idle"
 
-# Quiet + status — silent color update, no label change, no panel flicker
+# Quiet + status — status and color only, label unchanged
 curl "http://127.0.0.1:${PORT}/rename-terminal?name=my-task&quiet=1&status=working"
 
 # Legacy label override
-curl "http://127.0.0.1:${PORT}/rename-terminal?name=my-task&label=%E2%9C%85%20my-task%20done&color=terminal.ansiGreen"
+curl "http://127.0.0.1:${PORT}/rename-terminal?name=my-task&label=my-task%20done&color=terminal.ansiGreen"
 
 # Update base label while keeping the current status prefix
 curl "http://127.0.0.1:${PORT}/rename-terminal?name=my-task&status=working&label=my-task%20v2"
@@ -693,31 +692,27 @@ Response (idempotent no-op):
 
 Returns `404` if the terminal is not in the registry (e.g. opened before the last reload).
 
-#### `applied` — whether the title actually landed (v0.28.1+)
+`applied` is always `true` since v0.29.0: there is no tab write left to skip. It stays in the response (and in `/bg-task`'s) so the shape callers parse is unchanged. Before v0.29.0 it could be `false` with `reason: "not-active"`.
 
-VS Code can only rename the **active** terminal, so a label change briefly shows the target tab, renames it, and restores the previously active one (keyboard focus is preserved). All renames in a window are serialized, and the rename only runs once the target is confirmed active (up to ~1s). If it never becomes active, the rename is **skipped** rather than applied to whatever tab is active:
+#### Tab titles, icons and colors are fixed at open
 
-```json
-{ "ok": true, "name": "my-task", "label": "$(loading~spin) my-task", "applied": false, "reason": "not-active" }
-```
+A terminal's title is the `name` it was opened with, and the bridge never renames it. Its icon and color are the `icon`/`color` passed to `/open-terminal`, and nothing changes them afterwards. Read a terminal's current state from `/list` (`label`, `status`, `displayStatus`, `color`), not from the tab.
 
-The label is not recorded in that case, so the next call with the same values retries instead of returning `noOp`. `ok: true` with `applied: false` means the registry (status, color, heartbeat) was updated and only the tab title wasn't. `/bg-task` responses carry the same `applied`/`reason` pair when they change the label.
+Why the title can't follow status: VS Code can only rename the **active** terminal (`workbench.action.terminal.renameWithArg`). Up to v0.28.x every status change switched to the target tab, renamed it and switched back, and with many agents changing status at once, renames landed on whichever tab was active, so tabs wore each other's titles.
 
-A repeat call is also not a no-op when the tab's live title (`terminal.name`) differs from the label the bridge last wrote, so a tab showing some other tab's title is repaired by its next status update. To repair every tab at once, use [`/repaint`](#get-repaint).
+Why the icon and color can't follow status either: **VS Code does not apply an icon or color change to an existing terminal, active or inactive.** The `vscode.Terminal` object an extension holds has no `iconPath` or `color` member, only read-only getters (`name`, `processId`, `creationOptions`, `exitStatus`, `state`, `selection`, `shellIntegration`, `dimensions`) and `sendText`/`show`/`hide`/`dispose`. `creationOptions` is frozen. Assigning `terminal.iconPath` or `terminal.color` adds a plain property nothing reads, and no message reaches the window; icon and color only travel with `createTerminal`. This was checked against the extension host shipped in VS Code Insiders 1.142.0 (`out/vs/workbench/api/node/extensionHostProcess.js`), not by toggling a live tab: the bridge in use couldn't be reloaded, and the source leaves no path by which an assignment could take effect. Earlier versions' `quiet=1` and post-rename color assignments therefore never changed a tab.
 
 ---
 
 ### `GET /repaint`
 
-Redraws every tracked, open terminal's stored label through the same serialized rename path, ignoring the idempotency check. Use it to fix tab titles that landed on the wrong tab (e.g. after upgrading from a version before v0.28.1). It changes no registry state.
+Kept so callers of the route and `bridgectl repaint` don't break, but since v0.29.0 there is nothing to redraw: titles are fixed at open. It changes nothing and reports every tracked, open terminal as skipped, with its stored label.
 
 ```bash
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh repaint
 curl http://127.0.0.1:$PORT/repaint
-# {"ok":true,"repainted":5,"skipped":0,"terminals":[{"name":"w1","label":"$(loading~spin) w1","applied":true}, ...]}
+# {"ok":true,"repainted":0,"skipped":5,"terminals":[{"name":"w1","label":"$(loading~spin) w1","applied":false,"reason":"titles-fixed"}, ...]}
 ```
-
-Each tab switch waits for activation, so a call takes up to ~1s per tab in the worst case. Tabs that never became active are listed with `applied: false` and counted in `skipped`.
 
 ---
 
@@ -895,9 +890,9 @@ An agent that starts a background task and *then ends its turn* wrote `bg-task`,
 
 Separate fields mean there are no precedence rules to get wrong, and the both-at-once case — genuinely blocked on a human *while* a task runs — is representable, which no single scalar can express.
 
-#### What the tab renders
+#### What `displayStatus` reports
 
-`/list` reports both dimensions raw; `displayStatus` is the derived value the tab shows:
+`/list` reports both dimensions raw; `displayStatus` is the derived value the stored `label`'s codicon reflects:
 
 1. `needs-input`, `permission`, `error` — a human being required outranks a machine being busy.
 2. Otherwise `bg-task` if `pendingTasks > 0` — "idle" on a terminal with a job in flight is the reading that sent an orchestrator to the wrong tab.
@@ -1102,19 +1097,10 @@ curl -X POST "$VSCODE_BRIDGE_STATUS_URL" \
 
 ### The pattern
 
-Claude Code fires hook events at key lifecycle points. Each hook runs a shell command; by calling `/rename-terminal` from that command you get live tab updates with zero polling.
-
-**Key principle — icon is identity, color is state:**
-
-- Set `icon=` **once** at `/open-terminal` time to mark what kind of session this tab is (e.g. `icon=hubot` for a Claude sub-agent). This icon persists for the lifetime of the tab.
-- Use `color=` in hook calls to communicate the current state. Do **not** pass `icon=` in hook curls — it would overwrite your identity marker on every tool call.
+Claude Code fires hook events at key lifecycle points. Each hook runs a shell command; by calling `/rename-terminal` from that command you keep each terminal's status current in the registry, which [`/list`](#get-list) reports, with zero polling. The tab itself keeps the name, icon and color it was opened with ([why](#tab-titles-icons-and-colors-are-fixed-at-open)), so choose them at `/open-terminal` time to say what kind of session the tab is:
 
 ```bash
-# Good: icon set at creation, hooks only change color
 curl ".../open-terminal?name=my-task&icon=hubot&color=terminal.ansiCyan&cmd=..."
-
-# Hook (PreToolUse) — silent color update, no flicker
-curl ".../rename-terminal?name=my-task&quiet=1&color=terminal.ansiCyan"
 ```
 
 **Tab-name resolution:** the extension exports `CLAUDE_TAB_NAME=<name>` into the shell when a named terminal is opened. Hook scripts can read `$CLAUDE_TAB_NAME` directly rather than relying on `basename "$PWD"`, which only works when the working directory name matches the tab name.
@@ -1138,7 +1124,7 @@ curl -s "http://127.0.0.1:${PORT}/rename-terminal?name=$N&status=working" \
 
 Use `status=` for all lifecycle hooks — the bridge owns the codicon + color mapping so every caller automatically gets a consistent look:
 
-| Hook / event | `status=` | Tab shows | Color |
+| Hook / event | `status=` | Stored `label` | Stored `color` |
 | ------------ | --------- | --------- | ----- |
 | `PreToolUse` | `working` | `$(loading~spin) my-task` | Cyan |
 | `Notification` | `needs-input` | `$(bell-dot) my-task` | Yellow |
@@ -1150,9 +1136,7 @@ Use `status=` for all lifecycle hooks — the bridge owns the codicon + color ma
 | `TaskCreated` | `bg-task start` *(a separate dimension — see [`/bg-task`](#get-bg-task))* | `$(server-process) my-task` | Blue |
 | `TaskCompleted` | `bg-task end` | reverts to the turn state | — |
 
-The `hubot` icon set at creation persists as the Claude-session identity marker throughout — `status=` never touches `iconPath`.
-
-`status=` is also **idempotent**: if `PreToolUse` fires twice in a row while already in `working` state, the second call detects that the label and color are unchanged and returns `noOp: true` without activating the terminal panel. This makes it safe to fire on every hook event without accumulating flicker.
+`status=` never touches the tab. It is also **idempotent**: if `PreToolUse` fires twice in a row while already in `working` state, the second call detects that the label and color are unchanged and returns `noOp: true` (it still stamps `lastHeartbeatAt`).
 
 ### Full settings.json snippet
 
@@ -1531,7 +1515,7 @@ This works without VS Code running on the worker machine: `bin/worker.js` is a s
 2. Cuts a fresh `git worktree` at that SHA under `<repo>-worktrees/<jobId>` — every job starts from current main, and concurrent jobs never collide with each other.
 3. Runs the command inside an [rmux](https://rmux.io/) session (a tmux-compatible, scriptable multiplexer), so the job survives the laptop sleeping or VS Code closing.
 
-The laptop still opens a local terminal tab for the job. That tab doesn't run the job — it runs `bridge-tail.sh <node> <jobId>` (bundled the same way as `bridgectl.sh`), which polls the worker's `/job-status` and drives the tab's icon via the existing `/rename-terminal?status=` mechanism. The job looks and feels local even though it isn't. After a window reload, any tracked terminal with a `node`/`jobId` in its persisted metadata is reattached automatically if the remote job is still running.
+The laptop still opens a local terminal tab for the job. That tab doesn't run the job — it runs `bridge-tail.sh <node> <jobId>` (bundled the same way as `bridgectl.sh`), which polls the worker's `/job-status` and reports the job's state via the existing `/rename-terminal?status=` mechanism. The job looks and feels local even though it isn't. After a window reload, any tracked terminal with a `node`/`jobId` in its persisted metadata is reattached automatically if the remote job is still running.
 
 ### Setting up a worker node
 

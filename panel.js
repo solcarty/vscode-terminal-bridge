@@ -93,8 +93,13 @@ function buildRows(metadata, { statusMap, displayStatusKey, isLive = () => true,
 
 // `deps`: loadMetadata(), statusMap, displayStatusKey, terminals (the bridge's
 // name → Terminal map), onDidWrite(listener) for registry writes.
+//
+// `deps.source()` (#77), when it returns something, replaces the local
+// registry: a window deferring to a headless bridge shows that bridge's rows
+// ({ metadata, isLive(name), show(name) }) and has no untracked group, because
+// its own tabs are viewers, not terminals the bridge runs.
 function createPanel(vscode, context, deps) {
-  const { loadMetadata, statusMap, displayStatusKey, terminals, onDidWrite } = deps;
+  const { loadMetadata, statusMap, displayStatusKey, terminals, onDidWrite, source = () => null } = deps;
   const changed = new vscode.EventEmitter();
   let pollTimer = null;
   let untracked = [];
@@ -103,6 +108,11 @@ function createPanel(vscode, context, deps) {
   const terminalFor = name => terminals.get(name) ?? vscode.window.terminals.find(t => t.name === name);
 
   function readRows() {
+    const remote = source();
+    if (remote) {
+      untracked = [];
+      return buildRows(remote.metadata, { statusMap, displayStatusKey, isLive: remote.isLive });
+    }
     const rows = buildRows(loadMetadata(), { statusMap, displayStatusKey, isLive });
     const bound = new Set(terminals.values());
     untracked = vscode.window.terminals.filter(t => !bound.has(t));
@@ -173,6 +183,8 @@ function createPanel(vscode, context, deps) {
   context.subscriptions.push(view, changed);
 
   context.subscriptions.push(vscode.commands.registerCommand(SHOW_COMMAND, target => {
+    const remote = source();
+    if (remote && typeof target === 'string') return remote.show(target);
     const terminal = typeof target === 'string' ? terminalFor(target) : target;
     if (terminal) terminal.show();
   }));

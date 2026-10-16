@@ -1,0 +1,22 @@
+# The headless bridge (#77) as a systemd --user service. bin/install-headless.sh
+# fills in the @…@ placeholders and installs it; see the README, "Headless mode".
+[Unit]
+Description=VS Code Terminal Bridge (headless, tmux backend)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=@NODE@ @APP@/headless.js @ARGS@
+Restart=always
+RestartSec=2
+# The tmux server is forked from the bridge, so it lives in this unit's cgroup.
+# The default KillMode=control-group would kill every session on each restart;
+# terminals must outlive the bridge, so only the bridge process is stopped.
+KillMode=process
+# systemd's default PATH has no nvm/homebrew node and no ~/.local/bin; the
+# install script records the PATH it ran with.
+Environment=PATH=@PATH@
+
+[Install]
+WantedBy=default.target

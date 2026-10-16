@@ -13,6 +13,7 @@ Application-agnostic — any repo or process can call it via HTTP. Not coupled t
 - On activation: starts an HTTP server on `127.0.0.1:31415` (increments port if taken)
 - Writes the active port to `.vscode-bridge-port` in every workspace folder, and to `~/.vscode-terminal-bridge/port` as a cwd-independent fallback (v0.16.0+)
 - Scripts discover their window's port: `PORT=$(cat "$PWD/.vscode-bridge-port")`
+- Or headless (v0.33.0+): `headless.js` serves the same API under systemd with tmux sessions as terminals, and a VS Code window on that host defers to it — see *The headless bridge* below
 
 ## `list` is a query — it fails loudly (v0.16.0+)
 
@@ -358,9 +359,68 @@ Decisions worth knowing:
   `remoteUri`, which focuses the window if it's already open, or copies `<host> <terminal>`.
   The spec rules out sending, closing or opening terminals on another host.
 
+## The headless bridge: one contract, two backends (#77, v0.33.0+)
+
+On dev-1, dev-2 and watcher the bridge existed only while a Remote-SSH window from the laptop was
+connected. Close the window or let the laptop sleep and `agent-hosts list` read `no bridge`, the
+All hosts view went stale, and the host's loops and workers lost the bridge they report to. SSH was
+never the problem; the bridge's dependence on a VS Code window was.
+
+`headless.js` runs the bridge as a standalone process. What made that safe rather than a fork:
+
+- **The server and the state model moved into `bridge.js`, which never requires `vscode`.** Every
+  route and every registry write is one copy, and `extension.js` and `headless.js` differ only in the
+  `host` they pass `startBridge()` (the interface is documented at the top of `bridge.js`). The host
+  keeps a `vscode.Terminal`'s shape — `name`, `processId`, `sendText`, `show`, `dispose` — so the
+  existing code needed no rewrite, only `vscode.*` swapped for `host.*`. A second copy of the
+  contract would have drifted on the first feature; `test/contract.js` runs one suite against both
+  backends so a drift fails CI instead.
+- **Why tmux.** The backend has to give an agent a real tty (Claude Code is a TUI), outlive the
+  bridge process, take keystrokes from outside, and let a person look in. tmux does all four and is
+  already on every host. `node-pty` would have needed a native build per Node version and dies with
+  its parent, so a bridge restart would kill every agent. `screen` can do it but its scripting
+  (`-X stuff`, `hardcopy`) is clumsier and offers no bracketed paste. tmux also gives what VS Code
+  never could: `capture-pane` reads the screen, hence `/output?pane=1` (a 501 on VS Code rather
+  than an empty success).
+- **A dedicated socket (`-L vscode-bridge`)**, so `list-sessions` is exactly the bridge's terminals:
+  a person's own sessions can never be adopted, swept or killed, and their `tmux ls` stays theirs.
+- **`KillMode=process` in the unit.** The tmux server is forked from the bridge and lands in the
+  unit's cgroup; the default `control-group` kill would end every agent on each restart, and a
+  restart is exactly when the sessions must survive.
+- **After a reboot, rows are dropped, never listed.** On start the bridge asks tmux which sessions
+  exist and drops every row whose session is confirmed gone ("no server running" is a confirmed
+  answer). A row for a session that can't exist would be a fabricated terminal, which is the same
+  rule as `null`-for-unknown timestamps. Fail-closed like `pidAlive`: if tmux can't be asked at all,
+  nothing is dropped. Remote-job rows (`node`) are left to `reattachRemoteJobs`, whose ground truth is
+  the worker.
+- **Readiness is the cursor, not "anything printed".** A pane has no shell-integration event. The
+  first version waited for any screen content and wrote the command over an rc file's error line, so
+  zsh redrew the typeahead six times. A shell at its prompt leaves the cursor mid-line; startup noise
+  ends in a newline. That's `cmdDelivery: "prompt"`.
+- **Late writes are guarded.** `open` persists the shell pid and the delivery outcome when they
+  resolve. In VS Code that is effectively instant; on tmux it is a child process away, so a `forget`
+  in between had its row written back by the pid. Both writes now land only while the name is still
+  bound to the terminal that produced them — which also closes the same gap on VS Code.
+
+### The extension defers to a headless bridge
+
+A Remote-SSH window opening on a headless host checks for a live headless bridge (a presence entry
+with `backend: "tmux"`, then the port file) and, if `/ping` answers `backend: "tmux"`, serves
+nothing. Two bridges on one host would split its terminals between two registries, and every
+caller's port discovery would pick one at random — the multi-window ambiguity this file already
+works around, made permanent. One bridge per host keeps one source of truth. The window becomes a
+viewer: its Terminals panel reads the headless `/list` and a click opens `tmux attach` on the
+session. Only a positive `/ping` defers; a stale port file, a dead entry or another VS Code window's
+bridge all fall through to serving, because a window with no bridge is the one outcome that must
+never happen. The reverse — a headless bridge deferring to a window — was rejected: the headless one
+is the bridge that is always there.
+
+Out of scope here, as the issue said: installing it on the hosts (`agent-workflows`' `host-sync`)
+and any `agent-hosts` change, which already reads whatever bridge answers `bridgectl.sh list`.
+
 ## Key endpoints
 
-All endpoints are GET with query-string params (not POST/JSON — see `extension.js`).
+All endpoints are GET with query-string params (not POST/JSON — see `bridge.js`).
 
 | Endpoint | Purpose |
 |----------|---------|
@@ -383,7 +443,7 @@ All endpoints are GET with query-string params (not POST/JSON — see `extension
 | `/add-folder` / `/remove-folder` | Attach/detach a workspace folder |
 | `/reindex` | Re-link open terminals to persisted metadata |
 | `/repaint` | No-op since v0.29.0 (titles are fixed at open); kept so callers don't break |
-| `/ping` | Health check — returns port, pid, workspace folders |
+| `/ping` | Health check — returns port, pid, workspace folders, `backend` (`vscode` \| `tmux`) |
 
 ## Calling it — use the bundled CLI, not raw curl
 
@@ -486,7 +546,7 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open llm-gen /any/local/path \
 
 ## Key file
 
-`extension.js` — the extension, apart from the side panel in `panel.js` and the All hosts view in `hosts.js`. No build step required. `bin/worker.js` is the separate, `vscode`-free worker daemon described above.
+`bridge.js` — the bridge: registry, HTTP server and every route, shared by both entry points. `extension.js` — the VS Code entry point and backend; the side panel is `panel.js`, the All hosts view `hosts.js`. `headless.js` — the headless entry point and its tmux backend. No build step required. `bin/worker.js` is the separate, `vscode`-free worker daemon described above.
 
 ## Releasing (#6952, v0.29.0+)
 

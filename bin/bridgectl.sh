@@ -13,7 +13,7 @@
 # covers cleanly.
 #
 # This file is bundled with and written to disk by the sdo.terminal-bridge
-# extension itself (see extension.js's writeBundledCli()) — every consuming
+# extension itself (see bridge.js's writeBundledCli()) — every consuming
 # repo calls this one canonical, version-matched copy instead of vendoring its
 # own. Edit the copy in this repo's bin/, not the one under
 # ~/.vscode-terminal-bridge/.

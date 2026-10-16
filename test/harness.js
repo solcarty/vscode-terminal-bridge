@@ -82,7 +82,8 @@ const vscodeMock = {
     // joins window.terminals. #53's idempotency guard reads both, so a mock that
     // returns a detached 'x' would let a duplicate-tab regression pass.
     createTerminal: (options) => {
-      const t = makeTerminal((options && options.name) || 'x');
+      const t = makeTerminal((options && options.name) || 'x', vscodeMock._createPid);
+      t.options = options;
       terminalsInWindow.push(t);
       openCbs.forEach(cb => cb(t));
       return t;
@@ -134,6 +135,9 @@ const vscodeMock = {
     }),
   },
   _config: {},
+  // The shell pid a created terminal reports. A test that wants pidAlive true
+  // points it at a live process.
+  _createPid: undefined,
   env: { clipboard: { writeText: t => { clipboard.text = t; return Promise.resolve(); } } },
   ThemeIcon: class { constructor(id, color) { this.id = id; this.color = color; } },
   ThemeColor: class { constructor(id) { this.id = id; } },

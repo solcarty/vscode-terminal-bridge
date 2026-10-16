@@ -7,7 +7,7 @@
 # JetBrains, iTerm, AND agent-spawned shells (which don't set $TERM_PROGRAM).
 #
 # This file is bundled with and written to disk by the sdo.terminal-bridge
-# extension itself (see extension.js's writeBundledCli()) so every consuming
+# extension itself (see bridge.js's writeBundledCli()) so every consuming
 # repo calls one canonical, version-matched copy instead of vendoring its own.
 # Edit the copy in this repo's bin/, not the one under ~/.vscode-terminal-bridge/.
 #

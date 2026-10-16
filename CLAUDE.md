@@ -227,22 +227,46 @@ The rules now:
 
 Rejected: requiring a pid match for every cwd bind. It would stop the incident, but a restarted window would never re-link any tab by cwd, since every pid changes.
 
-## Tab titles: one rename at a time, and only on the tab that's active (v0.28.1+)
+## Tab titles are set once at open, and never renamed (v0.29.0+)
 
-`workbench.action.terminal.renameWithArg` renames whichever terminal is **active** — VS Code offers no way to rename a terminal by reference. So `applyPresentation()` was always show(target) → rename → restore, and it assumed two things that were false: that nothing else ran between `show()` and the rename, and that `show()` had taken effect by the time the rename ran. Hooks fire on every tool call and `feature-agent-loop` renames on every tick with its `next HH:MM` countdown, so concurrent `/rename-terminal` requests interleaved across the `await` and A's title landed on B. Observed 2026-10-15: five worker tabs all reading `feat-6891 0/2/4 next 23:29`, one with a stale spinner. `/list` was right the whole time, because the registry is keyed by name and never went through the active-terminal indirection. Only the rendered titles were wrong.
+`workbench.action.terminal.renameWithArg` renames whichever terminal is **active**. VS Code has no
+rename-by-reference: `terminal.name` is read-only, and `createTerminal({ name })` only applies at
+spawn. So every status change used to be show(target) → rename → restore. v0.28.1 serialized those
+behind a lock and refused to rename until the target was confirmed active, and titles still landed
+on the wrong tabs. Measured 2026-10-16 on dev-1: two worker tabs titled `orch-6938`. dev-2 had two
+`orch-backlog` and two `6937` titles, and three tracked names didn't appear as tabs at all. The
+lock only orders the bridge's own renames. It can't stop the user, or a remote window's latency,
+from changing the active terminal mid-rename. And hooks fire on every tool call, with loops
+renaming on every tick, so a dozen agents means a constant stream of tab switches.
 
-A third defect kept them wrong. The idempotency check compared against `meta.effectiveLabel`, which is what the bridge *meant* to write. Once a title landed on the wrong tab, every later identical call was a no-op, and the mislabel was permanent.
+So the bridge doesn't rename at all. A terminal's title is the `name` given to `createTerminal`.
+`rename` and `status` keep their HTTP and CLI shapes but write the registry only (`baseLabel`,
+`label`, `color`, status), and `/list` reports them exactly as before. `label` keeps its
+`$(<codicon>) <baseLabel>` shape, because `agent-hosts list`, the feature agent and the
+orchestrators read it. The codicon has left the *title*, not the data. Gone: `applyPresentation()`,
+`withRenameLock`, `waitUntilActive`, the drift check, and the switch-and-back. (The issue named
+`renameTerminal()`/`pendingRenames`. v0.28.1 had already folded those into `applyPresentation`.)
 
-The rules now:
+**Icon and color don't follow status either.** The issue asked for a test of whether assigning
+`terminal.iconPath`/`terminal.color` on an existing, inactive terminal changes it. The answer was
+taken from the shipped extension host (Insiders 1.142.0, `extensionHostProcess.js`), not from a
+live window, because the in-use bridge can't be reloaded. It is conclusive anyway. The
+`vscode.Terminal` handed to extensions is an object literal of getters plus
+`sendText`/`show`/`hide`/`dispose`. It has no `iconPath` or `color` member, `creationOptions` is
+frozen, and an assignment adds an inert JS property that never produces an RPC. Icon and color
+only travel in `$createTerminal`. So `status` doesn't touch the terminal at all. This also means
+the old `quiet=1` path and the post-rename color assignment never changed a tab. Both are removed,
+along with re-index's color restore.
 
-- **One promise-chain lock serializes every `applyPresentation()` call** (`withRenameLock`). The whole function runs inside it, including the metadata read, so the idempotency check sees the previous call's result. A throwing step doesn't wedge the chain.
-- **The rename runs only after `vscode.window.activeTerminal === terminal`** (polled, 1s cap). If the target never becomes active, the rename is **skipped**. Renaming the wrong tab is strictly worse than not renaming. The response says `applied: false, reason: "not-active"`, and `effectiveLabel` isn't persisted, so the next call retries. The lock is also held until the restore of the previously active tab has landed (shorter cap), or the next rename would capture the stale active terminal as its `prev` and restore to the wrong tab.
-- **A live title that disagrees with the stored label counts as a change.** `terminal.name` carries the tab title VS Code reports back to the extension host (the raw string, `$(codicon)` syntax included), so a tab wearing another tab's title is repaired by its next status update. One exception: a `terminal.name` still equal to the registry key isn't treated as drift. That is the creation name, and it's also what an extension host that never synced the title back would keep reporting. Counting it would mean a rename (and a tab flicker) on every hook call. The exception can only miss a mislabel whose wrong title is exactly the bare registry key.
-- **`/repaint` (`bridgectl repaint`)** redraws every tracked tab's stored label through the same lock, ignoring the idempotency check. It's for tabs mislabeled before this fix, and for any extension host where `terminal.name` doesn't reflect renames, where the drift check can't see the problem. It isn't wired to window focus: a focus-triggered repaint would flick through every tab each time the window was focused.
+Kept for shape compatibility: `applied` on `/rename-terminal`/`/bg-task` responses (always `true`
+now), `icon=` (accepted and echoed, ignored), and `/repaint`/`bridgectl repaint`. `/repaint` is now
+a no-op that reports every tab with `reason: "titles-fixed"`. Showing status somewhere a human
+looks is the job of the Terminal Bridge side panel (#6941, step 2), which reads the registry.
 
-Rejected: dropping the active-terminal indirection. There is no rename-by-reference API to drop to. `terminal.name` is read-only, and `createTerminal({ name })` only applies at spawn.
-
-The harness's `show()` can now be delayed or swallowed (`h.showBehavior`) to model asynchronous activation. Against the pre-fix code, `test/rename-race.test.js` reproduces the incident exactly: five concurrent renames, and every title lands on one tab.
+`test/title-fixed.test.js` pins it: concurrent status, label, quiet, bg-task and repaint calls on
+five terminals while a sixth is active. No `renameWithArg`, no `show()`, the active terminal stays
+put, every title is unchanged, and no icon or color is assigned. `test/reindex-rebind.test.js` used
+renames to observe which terminal a name was bound to. It now probes with a staged `send` instead.
 
 ## Key endpoints
 
@@ -253,7 +277,7 @@ All endpoints are GET with query-string params (not POST/JSON — see `extension
 | `/open-terminal` | Open a named terminal in a given cwd (`cmd=` inline, or `cmdFile=` to run a command from a file) |
 | `/close-terminal` | Close a named terminal (falls back to PID kill if registry desynced; always reconciles the registry row) |
 | `/forget-terminal` | Drop a tracked registry row without touching any process |
-| `/rename-terminal` | Rename / set status icon via `status=` (or `label=`, or `quiet=1`) |
+| `/rename-terminal` | Record a terminal's label / status in the registry via `status=` (or `label=`, or `quiet=1`) — never renames the tab |
 | `/list` | Query tracked terminals (name, cwd, status, pid, live, timestamps, background work) |
 | `/bg-task` | Report outstanding background work (`op=start|end|clear`) — a dimension of its own, not a status |
 | `/send-text` | Inject text into an already-running tracked terminal (`text=` or `textFile=`); a headless worker (`bridgectl worker`, `mode:"headless"` on `/list`) gets it in its inbox instead (`delivery:"inbox"`) |
@@ -268,7 +292,7 @@ All endpoints are GET with query-string params (not POST/JSON — see `extension
 | `/sweep` | Dispose terminals whose cwd no longer maps to a live `git worktree` |
 | `/add-folder` / `/remove-folder` | Attach/detach a workspace folder |
 | `/reindex` | Re-link open terminals to persisted metadata |
-| `/repaint` | Redraw every tracked tab's stored label through the rename lock (repairs titles that landed on the wrong tab) |
+| `/repaint` | No-op since v0.29.0 (titles are fixed at open); kept so callers don't break |
 | `/ping` | Health check — returns port, pid, workspace folders |
 
 ## Calling it — use the bundled CLI, not raw curl
@@ -303,7 +327,7 @@ Source of these scripts is `bin/` in this repo — edit there, not the installed
 
 Additive per event (an existing group keeps its hooks; ours is appended as its own group, never inheriting a `matcher` we don't understand), idempotent on the exact command string, reporting added/already-present per event, backing up to `<settings>.bak`, and **refusing outright on malformed JSON** — a `settings.json` that doesn't parse disables every setting in it, so a partial write is worse than no write. Both paths render from one spec (`_bridge_claude_hook_spec`) so they can't drift.
 
-## Status icons (for rename-terminal `status=` param)
+## Status codicons (stored in `label` by rename-terminal `status=`)
 
 | Status | Icon | Color |
 |--------|------|-------|

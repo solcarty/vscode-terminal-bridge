@@ -490,11 +490,11 @@ bridge_forget() {
   return 0
 }
 
-# bridge_repaint — redraw every tracked tab's stored label.
+# bridge_repaint — kept for callers; a no-op since v0.29.0.
 #
-# Repairs tab titles that landed on the wrong terminal (renameWithArg renames
-# whichever tab is active, and before v0.28.1 concurrent renames raced). Goes
-# through the same rename lock as status updates; prints per-tab results.
+# Tab titles are set once at open and never renamed, so there is nothing to
+# redraw. The bridge reports every tracked tab as skipped (reason
+# "titles-fixed"); this prints that response.
 bridge_repaint() {
   _bridge_active || return 0
   local port out
@@ -844,7 +844,8 @@ bridge_sweep() {
 }
 
 # bridge_rename <name> <label> [icon] [color]
-# Low-level rename. Prefer bridge_status for standard lifecycle states.
+# Low-level label write — registry only, the tab keeps its open-time title.
+# Prefer bridge_status for standard lifecycle states.
 bridge_rename() {
   _bridge_active || return 0
   local name="$1" label="$2" icon="${3:-}" color="${4:-}"

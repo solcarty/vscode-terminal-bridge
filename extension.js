@@ -76,11 +76,10 @@ const STATUS_MAP = {
 
 // ---------------------------------------------------------------------------
 // Metadata helpers — keep workspaceState in sync with the in-memory map.
-// Stored shape: { [name]: { cwd?, label?, baseLabel?, status?, color?, effectiveLabel? } }
+// Stored shape: { [name]: { cwd?, label?, baseLabel?, status?, color? } }
 //   label         — full display label (the effective label with codicon prefix if any)
 //   baseLabel     — the clean base label without a status codicon prefix
 //   status        — last known status= value (null if none)
-//   effectiveLabel — what was last passed to renameWithArg (for idempotency checks)
 // ---------------------------------------------------------------------------
 
 function loadMetadata(context) {
@@ -579,67 +578,25 @@ function displayStatusKey(meta = {}) {
   return status;
 }
 
-// ── Rename serialization ────────────────────────────────────────────────────
-// `workbench.action.terminal.renameWithArg` renames whichever terminal is
-// ACTIVE — there is no way to address a terminal by object. So every rename is
-// show(target) → rename → restore, and two of those interleaving across an
-// await put A's label on B's tab. Hooks fire constantly and loop terminals
-// rename on every tick, so that interleave was the norm, not an edge: several
-// tabs ended up wearing one tab's title while /list stayed correct.
+// ── Presentation is registry data, never the tab ────────────────────────────
+// A terminal's title is the name it was created with, and the bridge never
+// renames it. VS Code can only rename the ACTIVE terminal
+// (`workbench.action.terminal.renameWithArg`), so every rename was
+// show(target) → rename → restore, and with a dozen agents changing status at
+// once a rename landed on whichever tab was active when it ran — tabs ended up
+// wearing each other's titles. Nor can a terminal's icon or color be changed
+// after creation: the `vscode.Terminal` an extension holds has no `iconPath`
+// or `color` member, so assigning one reaches nothing (see README, "Tab
+// titles, icons and colors are fixed at open").
 //
-// One promise chain serializes every rename in the process. A failed step
-// never wedges the chain — the next one runs regardless.
-let renameChain = Promise.resolve();
-function withRenameLock(fn) {
-  const run = renameChain.then(fn, fn);
-  renameChain = run.catch(() => {});
-  return run;
-}
-
-const ACTIVATE_TIMEOUT_MS = 1000;
-const ACTIVATE_POLL_MS    = 10;
-
-// Resolve true once `terminal` is the active terminal, false at the deadline.
-// Polls rather than relying solely on onDidChangeActiveTerminal: the event can
-// fire before we subscribe, and a poll needs no cleanup on every exit path.
-async function waitUntilActive(terminal, timeoutMs = ACTIVATE_TIMEOUT_MS) {
-  const deadline = Date.now() + timeoutMs;
-  while (vscode.window.activeTerminal !== terminal) {
-    if (Date.now() >= deadline) return false;
-    await new Promise(r => setTimeout(r, ACTIVATE_POLL_MS));
-  }
-  return true;
-}
-
-// The tab's live title disagrees with what we last wrote — someone else's
-// label landed on it (the pre-lock race), or the user renamed it by hand.
-// terminal.name carries the raw title, codicon syntax included.
-//
-// A name still equal to the registry key is NOT treated as drift: that's the
-// creation name, and it's also what an extension host that never synced the
-// title would keep reporting. Counting it would rename on every single call.
-function titleDrifted(name, terminal, effectiveLabel) {
-  const live = terminal && terminal.name;
-  return typeof live === 'string' && live !== effectiveLabel && live !== name;
-}
-
-// Apply the tab's presentation (label prefix + color) from whatever the
-// registry currently says. Shared by /rename-terminal, /bg-task and /repaint
-// so every caller renders through one code path — and one lock.
-//
-// Returns `applied: false` + `reason` when the rename was skipped because the
-// target never became the active terminal. Renaming anyway would label
-// whatever tab IS active, which is the bug this exists to prevent. The label
-// is then not persisted, so the next call sees a change and retries.
-function applyPresentation(context, name, terminal, opts = {}) {
-  return withRenameLock(() => applyPresentationLocked(context, name, terminal, opts));
-}
-
-async function applyPresentationLocked(context, name, terminal, opts = {}) {
-  const { baseLabelOverride, explicitColor, iconId, explicitLabel, force, repaintLabel } = opts;
-  const meta     = loadMetadata(context)[name] ?? {};
-  const key      = displayStatusKey(meta);
-  const cfg      = (key && key !== 'none') ? (STATUS_MAP[key] ?? null) : null;
+// So rename and status write the registry — baseLabel, label, color — and
+// /list reports them. `label` keeps its `$(<codicon>) <baseLabel>` shape so
+// readers of /list see exactly what they did before.
+async function recordPresentation(context, name, opts = {}) {
+  const { baseLabelOverride, explicitColor, explicitLabel } = opts;
+  const meta = loadMetadata(context)[name] ?? {};
+  const key  = displayStatusKey(meta);
+  const cfg  = (key && key !== 'none') ? (STATUS_MAP[key] ?? null) : null;
 
   const baseLabel = explicitLabel
     ?? baseLabelOverride
@@ -647,80 +604,17 @@ async function applyPresentationLocked(context, name, terminal, opts = {}) {
     ?? meta.label
     ?? name;
 
-  const effectiveLabel = explicitLabel
+  const label = explicitLabel
     ? explicitLabel                                   // legacy label= mode: caller owns the whole string
-    : repaintLabel                                    // /repaint: redraw exactly what was last written
-    ?? (cfg ? `$(${cfg.codicon}) ${baseLabel}` : baseLabel);
+    : (cfg ? `$(${cfg.codicon}) ${baseLabel}` : baseLabel);
 
-  const resolvedColor = explicitColor ?? cfg?.color ?? undefined;
+  const color = explicitColor ?? cfg?.color ?? undefined;
 
-  const labelChanged = force
-    || effectiveLabel !== meta.effectiveLabel
-    || titleDrifted(name, terminal, effectiveLabel);
-  const colorChanged = resolvedColor  !== meta.color;
-
-  if (!labelChanged && !colorChanged && !iconId) {
-    return { effectiveLabel, baseLabel, color: resolvedColor, displayStatus: key, noOp: true, applied: true };
+  if (label === meta.label && baseLabel === meta.baseLabel && color === meta.color) {
+    return { label, baseLabel, color, displayStatus: key, noOp: true };
   }
-
-  let applied = true;
-  let reason;
-  if (labelChanged) {
-    // Only switch the active terminal if needed, and use show(true)
-    // (preserveFocus) so keyboard focus is NEVER stolen.
-    const prev = vscode.window.activeTerminal;
-    const needsSwitch = prev !== terminal;
-    if (needsSwitch) terminal.show(true);
-    if (needsSwitch && !(await waitUntilActive(terminal))) {
-      applied = false;
-      reason = 'not-active';
-    } else {
-      await vscode.commands.executeCommand(
-        'workbench.action.terminal.renameWithArg',
-        { name: effectiveLabel }
-      );
-    }
-    if (needsSwitch && prev && prev !== terminal) {
-      prev.show(true);
-      // Hold the lock until the restore lands, or the next rename reads the
-      // stale active terminal as its `prev` and "restores" to the wrong tab.
-      await waitUntilActive(prev, ACTIVATE_TIMEOUT_MS / 4);
-    }
-  }
-
-  if (iconId)        terminal.iconPath = new vscode.ThemeIcon(iconId);
-  if (resolvedColor) terminal.color    = new vscode.ThemeColor(resolvedColor);
-
-  await persistMetadata(context, name, {
-    ...(applied ? { label: effectiveLabel, effectiveLabel } : {}),
-    baseLabel,
-    color: resolvedColor,
-  });
-
-  return {
-    effectiveLabel, baseLabel, color: resolvedColor, displayStatus: key, noOp: false,
-    applied, ...(reason ? { reason } : {}),
-  };
-}
-
-// Re-apply every tracked terminal's label through the lock, ignoring the
-// idempotency check — repairs tabs mislabeled before the lock existed, whose
-// stored effectiveLabel already matches and would otherwise never be redrawn
-// in a VS Code that doesn't sync terminal.name back.
-async function repaintTerminals(context) {
-  await reindexTerminals(context);
-  const results = [];
-  for (const [name, terminal] of terminals) {
-    if (!vscode.window.terminals.includes(terminal)) continue;
-    const stored = loadMetadata(context)[name]?.effectiveLabel;
-    const shown = await applyPresentation(context, name, terminal, {
-      force: true,
-      ...(stored ? { repaintLabel: stored } : {}),
-    });
-    results.push({ name, label: shown.effectiveLabel, applied: shown.applied,
-      ...(shown.reason ? { reason: shown.reason } : {}) });
-  }
-  return results;
+  await persistMetadata(context, name, { label, baseLabel, color });
+  return { label, baseLabel, color, displayStatus: key, noOp: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -792,12 +686,6 @@ async function reindexTerminals(context) {
       // this replaces a dead binding, never a live one.
       terminals.set(name, terminal);
       reindexed++;
-      // Restore color from persisted metadata (simple property assignment,
-      // no terminal-activation required).
-      const savedColor = metadata[name]?.color;
-      if (savedColor) {
-        try { terminal.color = new vscode.ThemeColor(savedColor); } catch { /* noop */ }
-      }
     }
   }
 
@@ -1548,19 +1436,19 @@ function activate(context) {
       }));
 
     } else if (url.pathname === '/rename-terminal') {
-      // Rename a terminal tab via VS Code API — no OSC sequences needed.
+      // Records a terminal's label and status in the registry. The tab itself
+      // is never touched: its title, icon and color are what /open-terminal
+      // created it with (see recordPresentation).
       //
       // Modes:
-      //   status=<key>  — Bridge looks up the canonical codicon + color for the
-      //                   given status, prefixes the label, and sets the color.
-      //                   iconPath is NEVER touched (identity icon stays).
+      //   status=<key>  — Stores the status, and a label prefixed with its
+      //                   canonical codicon plus its canonical color.
       //                   Idempotent: repeated calls with the same status are
-      //                   no-ops if the label and color are already correct.
-      //   quiet=1       — Silently updates only iconPath and/or color (+ status
-      //                   color when status= is combined). No terminal activation,
-      //                   no panel flicker. label is not changed.
+      //                   no-ops if the label and color are already stored.
+      //   quiet=1       — Stores status and/or color only; label is not changed.
       //   label=        — Full label override (legacy). Required unless quiet=1
       //                   or status= is provided.
+      //   icon=         — Accepted and echoed for compatibility; has no effect.
       const name    = url.searchParams.get('name');
       const label   = url.searchParams.get('label') || undefined;
       const colorId = url.searchParams.get('color') || undefined;
@@ -1606,15 +1494,14 @@ function activate(context) {
 
       if (bgOp) {
         const bg = await setBgTask(context, name, bgOp);
-        const shown = await applyPresentation(context, name, terminal, {
+        const shown = await recordPresentation(context, name, {
           baseLabelOverride: label,
           explicitColor: colorId,
-          iconId,
         });
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           ok: true, name,
-          label: shown.effectiveLabel, baseLabel: shown.baseLabel,
+          label: shown.label, baseLabel: shown.baseLabel,
           icon: iconId, color: shown.color,
           // The turn state is deliberately untouched — this call carried
           // information about a different dimension.
@@ -1623,16 +1510,16 @@ function activate(context) {
           bgTask: (bg?.pendingTasks ?? 0) > 0,
           pendingTasks: bg?.pendingTasks ?? pendingBefore,
           noOp: shown.noOp,
-          applied: shown.applied,
-          ...(shown.reason ? { reason: shown.reason } : {}),
+          // Kept for response-shape compatibility: there is no tab write left
+          // to skip, so the registry write is the whole of "applied".
+          applied: true,
         }));
         return;
       }
 
       // ── Quiet mode ──────────────────────────────────────────────────────────
-      // Silent update — no terminal activation, no panel flicker.
-      // status= in quiet mode applies the canonical color but does NOT rename
-      // the label (label changes require terminal activation).
+      // Records status and color, leaves the stored label alone. Neither mode
+      // touches the tab any more; quiet= survives for callers that pass it.
       if (quiet) {
         if (status !== undefined) {
           await persistMetadata(context, name, { status: status === 'none' ? null : status });
@@ -1644,8 +1531,6 @@ function activate(context) {
         })();
         const resolvedColor = colorId ?? quietCfg?.color ?? undefined;
 
-        if (iconId)        terminal.iconPath = new vscode.ThemeIcon(iconId);
-        if (resolvedColor) terminal.color    = new vscode.ThemeColor(resolvedColor);
         if (resolvedColor) await persistMetadata(context, name, { color: resolvedColor });
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1657,21 +1542,20 @@ function activate(context) {
       }
 
       // ── Normal (label-updating) mode ────────────────────────────────────────
-      // Persist the turn state first, then render from the registry — the tab
-      // shows a function of BOTH dimensions (see displayStatusKey), so the
-      // renderer has to read the stored state rather than just this call's.
+      // Persist the turn state first, then derive the label from the registry —
+      // it's a function of BOTH dimensions (see displayStatusKey), so it has to
+      // read the stored state rather than just this call's.
       if (status !== undefined) {
         await persistMetadata(context, name, { status: status === 'none' ? null : status });
       }
 
-      const shown = await applyPresentation(context, name, terminal, {
+      const shown = await recordPresentation(context, name, {
         // status= mode derives the base label from the param or persisted
         // state; legacy label= mode (no status=) means the caller owns the
         // whole string.
         baseLabelOverride: status !== undefined ? label : undefined,
         explicitLabel:     status === undefined ? label : undefined,
         explicitColor:     colorId,
-        iconId,
       });
 
       const after = loadMetadata(context)[name] ?? {};
@@ -1679,17 +1563,15 @@ function activate(context) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ok: true, name,
-        label: shown.effectiveLabel, baseLabel: shown.baseLabel,
+        label: shown.label, baseLabel: shown.baseLabel,
         icon: iconId, color: shown.color,
         status: status ?? null,
         displayStatus: shown.displayStatus,
         bgTask: (Number(after.pendingTasks) || 0) > 0,
         pendingTasks: Math.max(0, Number(after.pendingTasks) || 0),
         ...(shown.noOp ? { noOp: true } : {}),
-        // false = the tab never became active, so the rename was skipped
-        // rather than landing on whichever tab was. The next call retries.
-        applied: shown.applied,
-        ...(shown.reason ? { reason: shown.reason } : {}),
+        // Always true now — kept so the response shape is unchanged.
+        applied: true,
       }));
 
     } else if (url.pathname === '/set-note' || url.pathname === '/clear-note') {
@@ -1940,7 +1822,7 @@ function activate(context) {
 
       const terminal = terminals.get(name);
       let shown = null;
-      if (terminal) shown = await applyPresentation(context, name, terminal, {});
+      if (terminal) shown = await recordPresentation(context, name);
 
       const meta = loadMetadata(context)[name] ?? {};
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1951,9 +1833,8 @@ function activate(context) {
         bgTaskStartedAt: bg.bgTaskStartedAt,
         status: meta.status ?? null,
         displayStatus: shown ? shown.displayStatus : displayStatusKey(meta),
-        label: shown ? shown.effectiveLabel : null,
-        ...(shown ? { applied: shown.applied } : {}),
-        ...(shown?.reason ? { reason: shown.reason } : {}),
+        label: shown ? shown.label : null,
+        ...(shown ? { applied: true } : {}),
       }));
 
     } else if (url.pathname === '/close-terminal') {
@@ -2086,7 +1967,7 @@ function activate(context) {
     } else if (url.pathname === '/heartbeat') {
       // #59 — liveness with no other side effect. A headless worker stamps it
       // from its agent's event stream: a silent stream is a wedged agent, and
-      // unlike /rename-terminal this never re-renders the tab.
+      // unlike /rename-terminal this writes no label or status.
       const name = url.searchParams.get('name');
       if (!name) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -2212,14 +2093,19 @@ function activate(context) {
       res.end(JSON.stringify({ ok, path: p, removed: ok, wasAttached: true }));
 
     } else if (url.pathname === '/repaint') {
-      // Redraw every tracked tab's stored label through the rename lock —
-      // repairs titles that landed on the wrong tab before the lock existed.
-      const results = await repaintTerminals(context);
+      // Kept so the route and its CLI verb don't break callers, but there is
+      // nothing left to redraw: titles are set once at open and never renamed.
+      // Reports every tracked terminal as skipped, with the stored label.
+      await reindexTerminals(context);
+      const meta = loadMetadata(context);
+      const results = [...terminals.keys()]
+        .filter(name => vscode.window.terminals.includes(terminals.get(name)))
+        .map(name => ({ name, label: meta[name]?.label ?? name, applied: false, reason: 'titles-fixed' }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ok: true,
-        repainted: results.filter(r => r.applied).length,
-        skipped: results.filter(r => !r.applied).length,
+        repainted: 0,
+        skipped: results.length,
         terminals: results,
       }));
 
@@ -2340,8 +2226,8 @@ function activate(context) {
         lastSendDelivery: meta.lastSendDelivery ?? null,
         // v0.21.0+ — the background-work dimension, tracked separately from
         // status so "waiting on a job I started" stops being reported as
-        // "waiting on a human" (issue #40). displayStatus is what the tab
-        // actually renders; status is still the raw turn state.
+        // "waiting on a human" (issue #40). displayStatus is the derived state
+        // the stored label's codicon reflects; status is still the raw turn state.
         pendingTasks: Math.max(0, Number(meta.pendingTasks) || 0),
         bgTask: (Number(meta.pendingTasks) || 0) > 0,
         bgTaskStartedAt: meta.bgTaskStartedAt ?? null,

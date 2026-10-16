@@ -41,6 +41,9 @@ function tmuxRun(socket, args, input) {
       if (code === 0) resolve(stdout);
       else reject(Object.assign(new Error(stderr.trim() || `tmux exited ${code}`), { stderr }));
     });
+    // tmux can exit before reading stdin (no server yet); the write then fails
+    // with EPIPE. Not a failure: the result comes from the exit code and stderr.
+    child.stdin.on('error', () => {});
     child.stdin.end(input ?? '');
   });
 }
@@ -331,4 +334,4 @@ if (require.main === module) {
   main().catch(err => { console.error('[terminal-bridge] headless bridge failed to start:', err); process.exit(1); });
 }
 
-module.exports = { tmuxHost, fileState, parseArgs, sessionNameFor };
+module.exports = { tmuxRun, tmuxHost, fileState, parseArgs, sessionNameFor };

@@ -402,6 +402,14 @@ never the problem; the bridge's dependence on a VS Code window was.
   in between had its row written back by the pid. Both writes now land only while the name is still
   bound to the terminal that produced them — which also closes the same gap on VS Code.
 
+### `tmuxRun` ignores EPIPE on stdin (#79, v0.33.1+)
+
+`tmuxRun` writes `input` to every tmux command's stdin. When tmux exits first (`list-sessions` with no
+server yet) the write fails with EPIPE, and with no `error` listener on `child.stdin` that killed the
+bridge at startup on a fresh host, restart-looping under systemd. EPIPE here is not a failure: the
+result still comes from the exit code and stderr, so the listener is a no-op. `test/tmux-run-epipe.test.js`
+pins it with a fake tmux that exits at once.
+
 ### The extension defers to a headless bridge
 
 A Remote-SSH window opening on a headless host checks for a live headless bridge (a presence entry

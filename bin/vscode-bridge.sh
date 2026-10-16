@@ -490,6 +490,20 @@ bridge_forget() {
   return 0
 }
 
+# bridge_repaint — redraw every tracked tab's stored label.
+#
+# Repairs tab titles that landed on the wrong terminal (renameWithArg renames
+# whichever tab is active, and before v0.28.1 concurrent renames raced). Goes
+# through the same rename lock as status updates; prints per-tab results.
+bridge_repaint() {
+  _bridge_active || return 0
+  local port out
+  port=$(_bridge_port)
+  out=$(curl -sS -m 30 "http://127.0.0.1:${port}/repaint" 2>/dev/null) || return 0
+  _bridge_emit_json "$out"
+  return 0
+}
+
 # bridge_hook_output   (stdin: a Stop / SubagentStop hook payload)
 #
 # Publishes the turn's final assistant text so an orchestrating session can

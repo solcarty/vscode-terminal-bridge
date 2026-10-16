@@ -38,6 +38,11 @@ let openCbs = [];
 // drive its provider and commands without a VS Code window.
 const treeViews = [];
 const registeredCommands = new Map();
+// Every executeCommand call, and what the clipboard was given, so the All hosts
+// view's clicks can be asserted.
+const executedCommands = [];
+const clipboard = { text: null };
+let configCbs = [];
 
 class EventEmitter {
   constructor() { this.listeners = []; this.fired = 0; }
@@ -56,7 +61,9 @@ const vscodeMock = {
     // VS Code renames whichever terminal is active, so a rename is recorded
     // against activeTerminal. The bridge no longer issues any; tests assert
     // this list stays empty.
-    executeCommand: (cmd, arg) => {
+    executeCommand: (cmd, arg, ...rest) => {
+      executedCommands.push({ cmd, args: [arg, ...rest] });
+      if (registeredCommands.has(cmd)) return Promise.resolve(registeredCommands.get(cmd)(arg, ...rest));
       if (cmd === 'workbench.action.terminal.renameWithArg') {
         renames.push({ terminal: activeTerminal?.name ?? null, name: arg && arg.name });
         if (activeTerminal) activeTerminal.displayName = arg && arg.name;
@@ -93,17 +100,29 @@ const vscodeMock = {
       return { dispose() { openCbs = openCbs.filter(c => c !== cb); } };
     },
     onDidChangeWindowState: () => ({ dispose() {} }),
+    // A view starts hidden, as a collapsed or unopened one does; a test makes
+    // it visible with setVisible(), which fires onDidChangeVisibility.
     createTreeView: (id, options) => {
-      const view = { id, options, dispose() {} };
+      const visibility = new EventEmitter();
+      const view = {
+        id, options, visible: false, dispose() {},
+        onDidChangeVisibility: visibility.event,
+        setVisible(v) { view.visible = v; visibility.fire({ visible: v }); },
+      };
       treeViews.push(view);
       return view;
     },
     showErrorMessage: () => {},
+    showInformationMessage: () => {},
   },
   workspace: {
     workspaceFolders: [],
     name: undefined,
     onDidChangeWorkspaceFolders: () => ({ dispose() {} }),
+    onDidChangeConfiguration: (cb) => {
+      configCbs.push(cb);
+      return { dispose() { configCbs = configCbs.filter(c => c !== cb); } };
+    },
     updateWorkspaceFolders: () => true,
     // Real vscode.workspace.getConfiguration(section).get(key, default) returns
     // `default` when nothing is configured — mirror that rather than always
@@ -115,12 +134,13 @@ const vscodeMock = {
     }),
   },
   _config: {},
+  env: { clipboard: { writeText: t => { clipboard.text = t; return Promise.resolve(); } } },
   ThemeIcon: class { constructor(id, color) { this.id = id; this.color = color; } },
   ThemeColor: class { constructor(id) { this.id = id; } },
   EventEmitter,
   TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
   TreeItem: class { constructor(label, collapsibleState) { this.label = label; this.collapsibleState = collapsibleState; } },
-  Uri: { file: p => ({ fsPath: p, path: p }) },
+  Uri: { file: p => ({ fsPath: p, path: p }), parse: s => ({ uri: s, toString: () => s }) },
 };
 
 function makeTerminal(name, pid) {
@@ -163,6 +183,13 @@ module.exports = { ext, context, state, vscodeMock, makeTerminal, renames, showB
   addTerminal: t => { terminalsInWindow.push(t); openCbs.forEach(cb => cb(t)); return t; },
   treeViews,
   registeredCommands,
+  executedCommands,
+  clipboard,
+  // Change a setting the way VS Code does: store it, then fire the event.
+  setConfig: (key, value) => {
+    vscodeMock._config[key] = value;
+    configCbs.forEach(cb => cb({ affectsConfiguration: s => s === `terminalBridge.${key}` || s === 'terminalBridge' }));
+  },
   // Drive the shell-integration-ready path that /open-terminal waits on.
   fireShellIntegration: terminal => shellIntegrationCbs.forEach(cb => cb({ terminal })),
   // The user closed a tab: it leaves window.terminals, then VS Code fires

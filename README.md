@@ -163,13 +163,63 @@ One row per tracked terminal whose tab is still open:
 
 **Refresh:** on every registry write (open, close, status, rename, note, PR, background task, heartbeat) and whenever a terminal opens or closes. While any row is `working`, the panel also re-reads once a second, so the time in the tooltip stays current. Otherwise it doesn't poll. A row whose terminal has gone drops on the next refresh.
 
+### The *All hosts* view
+
+A window that watches other machines can show every host's terminals at once, in a second view in the same container. It is fed by a command you choose, not by this bridge's registry, and the bridge knows nothing about your hosts beyond what that command prints. Set [`terminalBridge.hostsCommand`](#settings) to turn it on. Empty (the default), there is no view and nothing runs.
+
+**The contract.** The command prints one JSON document on stdout:
+
+```json
+{
+  "hosts": [
+    {
+      "name": "build-box",
+      "self": false,
+      "ok": true,
+      "error": "only when ok is false",
+      "load": 0.47,
+      "cpus": 16,
+      "memAvailableGb": 23.2,
+      "memTotalGb": 31.1,
+      "workers": 3,
+      "workerCap": 4,
+      "remoteUri": "vscode-remote://ssh-remote+build-box/home/me/repo",
+      "terminals": [ /* rows exactly as /list returns them */ ]
+    }
+  ]
+}
+```
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `name` | yes | The host's name, shown as its header |
+| `ok` | yes | `true` when the host answered. `false` shows `error` and keeps the host's last good reading |
+| `terminals` | yes | That host's [`/list`](#get-list) rows, unchanged. Rows with `live: false` are left out |
+| `self` | no | `true` for the host this window runs on. Its rows show the local terminal when clicked |
+| `error` | no | Why the host did not answer |
+| `load`, `cpus`, `memAvailableGb`, `memTotalGb`, `workers`, `workerCap` | no | The header's reading. `null` or absent parts are left out |
+| `remoteUri` | no | A folder URI that opens this host's VS Code window (`vscode.openFolder`) |
+
+Only stdout is read. The exit status is ignored, so a command may exit non-zero to say a host is down and still print the document. A run fails when it doesn't finish in 20 seconds, or its output isn't JSON with a `hosts` array.
+
+**Headers:** one per host, in the document's order: its name, then `load 0.47 / 16 · 23 of 31 GB free · 3 of 4 workers`. When any of its terminals needs a person (`needs-input`, `permission`, `error`), the count comes first (`2 need a person · …`) and the icon is the bell. A host with `ok: false` shows its error and the age of its last good reading (`ssh: … timed out · last reading 4m ago`), with that reading's terminals still under it. One host down never blanks the others.
+
+**Rows:** each host's terminals, shaped and ordered exactly like [the Terminals view](#the-terminal-bridge-side-panel) (name, status icon, progress text, tooltip). `/list` rows carry no note body, so a row with no progress text has no description.
+
+**Click:** a row on the `self` host shows that terminal. A row on another host with a `remoteUri` opens that host's window, or focuses it if it is already open. With no `remoteUri`, `<host> <terminal>` is copied to the clipboard.
+
+**Refresh:** the command runs when the view becomes visible and every 30 seconds while it stays visible, never while it is hidden or collapsed. A run is killed (with its process group) after 20 seconds. When a run fails, the last good result stays on screen and the view's title reads `stale · <age> old` until the next good run.
+
+**Read only.** The view sends nothing to any host. Whatever reaching your hosts takes (SSH, an API) lives in the command.
+
 ## Settings
 
-Two, both per-window (set them in `.vscode/settings.json` for a workspace, or in user settings):
+Three, all per-window (set them in `.vscode/settings.json` for a workspace, or in user settings):
 
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `terminalBridge.agentId` | unset | Names the agent driving this window, for [presence](#get-announce--get-apibridges). Falls back to the workspace name VS Code shows in its title bar, then the first workspace folder's basename, then `null` — never fabricated. Set it when the folder name isn't the identity you want other windows to see. |
+| `terminalBridge.hostsCommand` | empty | A shell command (run with `/bin/sh -c` from your home directory) that prints the [All hosts](#the-all-hosts-view) JSON. Set: the *All hosts* view appears. Empty: no view, nothing runs. Use an absolute path if the command isn't on VS Code's `PATH`. |
 | `terminalBridge.pipelineStateDir` | `.sdo` | Directory, relative to the matched workspace folder, where [`/api/status`](#post-apistatus) appends `pipeline-state.json`. The default is a private consumer's convention kept for compatibility; point it somewhere of your own. |
 
 ## What the extension injects into every terminal it opens

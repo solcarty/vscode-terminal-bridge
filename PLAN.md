@@ -18,4 +18,4 @@
      holding its own; fallback holding another port survives.
    - `test/coexist.test.js`: skew shows both versions in the description; matching version doesn't.
 5. README: `version` fields, repair behaviour, Upgrading section (link house.health#6966). CLAUDE.md design note.
-6. Bump 0.33.1 → 0.33.2 (rebase on #82 if it lands first, take next patch). `npm test`, PR, wait green. (#82 landed at 0.33.2 first → 0.33.3.)
+6. Bump 0.33.1 → 0.33.2 (rebase on #82 if it lands first, take next patch). `npm test`, PR, wait green. (#82 landed at 0.33.2 first → 0.33.3; #87 then took 0.33.3 → 0.33.4.)

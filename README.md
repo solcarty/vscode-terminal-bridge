@@ -269,7 +269,7 @@ curl http://127.0.0.1:$PORT/ping
 
 `backend` (v0.33.0+) says which bridge answered: `vscode` for the extension, `tmux` for a [headless bridge](#headless-mode-no-vs-code-window). A headless bridge reports its own `pid` and its `tmuxSocket` instead of `ipcHook`.
 
-`version` (v0.33.3+) is the bridge's `package.json` version. The [presence](#get-announce--get-apibridges) entry carries it too. A bridge from before v0.33.3 omits it.
+`version` (v0.33.4+) is the bridge's `package.json` version. The [presence](#get-announce--get-apibridges) entry carries it too. A bridge from before v0.33.4 omits it.
 
 ---
 
@@ -1649,9 +1649,9 @@ Without systemd, run it under anything that restarts it: `node headless.js --fol
 
 Exactly the extension's: `~/.vscode-terminal-bridge/port`, `.vscode-bridge-port` in each `--folder`, the bundled CLI in `~/.vscode-terminal-bridge/bin/`, a [presence](#get-announce--get-apibridges) entry in `~/.vscode-terminal-bridge/bridges/` (with `"backend": "tmux"`), and `VSCODE_BRIDGE_PORT` exported into every terminal it opens. Ports start at `31415` as usual.
 
-**It repairs them.** *v0.33.3+ ([#83](https://github.com/solcarty/vscode-terminal-bridge/issues/83)).* Every 30 seconds (`VSCODE_BRIDGE_REPAIR_MS`) the headless bridge checks each folder's `.vscode-bridge-port`, `~/.vscode-terminal-bridge/port` and its presence entry, and rewrites any that is missing or names another port. Each repair logs one line naming the files it rewrote. A healthy check logs nothing. It is the one bridge on its host, so another window's port in one of these files is wrong by definition.
+**It repairs them.** *v0.33.4+ ([#83](https://github.com/solcarty/vscode-terminal-bridge/issues/83)).* Every 30 seconds (`VSCODE_BRIDGE_REPAIR_MS`) the headless bridge checks each folder's `.vscode-bridge-port`, `~/.vscode-terminal-bridge/port` and its presence entry, and rewrites any that is missing or names another port. Each repair logs one line naming the files it rewrote. A healthy check logs nothing. It is the one bridge on its host, so another window's port in one of these files is wrong by definition.
 
-**A bridge removes only its own port files.** *v0.33.3+.* On a clean shutdown the extension and the headless bridge unlink a `.vscode-bridge-port` or `~/.vscode-terminal-bridge/port` only if it still holds their own port. Before v0.33.3, any window closing removed them whatever they held, so an older window on a headless host left the headless bridge running but unreachable.
+**A bridge removes only its own port files.** *v0.33.4+.* On a clean shutdown the extension and the headless bridge unlink a `.vscode-bridge-port` or `~/.vscode-terminal-bridge/port` only if it still holds their own port. Before v0.33.4, any window closing removed them whatever they held, so an older window on a headless host left the headless bridge running but unreachable.
 
 ### Opening a VS Code window on a host that runs headless
 
@@ -1659,7 +1659,7 @@ The extension does **not** start a second bridge. On activation it looks for a l
 
 If nothing answers, the window serves as it always has. If the headless bridge stops answering later, the view's title says so; reload the window to serve locally.
 
-**Version skew is shown.** *v0.33.3+.* If the headless bridge's `/ping` `version` differs from the window's extension version, the window logs both once and the view's title adds them: `headless · 31415 · headless v0.33.3 ≠ window v0.33.2`. A headless bridge from before v0.33.3 reports no version and reads as `v?`.
+**Version skew is shown.** *v0.33.4+.* If the headless bridge's `/ping` `version` differs from the window's extension version, the window logs both once and the view's title adds them: `headless · 31415 · headless v0.33.4 ≠ window v0.33.3`. A headless bridge from before v0.33.4 reports no version and reads as `v?`.
 
 ### Upgrading
 

@@ -11,6 +11,7 @@
 // permission prompt is never silently demoted. These cases are the contract.
 const { spawnSync } = require('child_process');
 const path = require('path');
+const fs = require('fs');
 
 const SH = path.join(__dirname, '..', 'bin', 'vscode-bridge.sh');
 
@@ -48,6 +49,29 @@ check('unrecognized message stays needs-input', got === 'needs-input', got);
 
 got = decide('working', '{"message":"Claude is waiting for your input"}');
 check('non-needs-input states are untouched', got === 'working', got);
+
+// #82 — payloads captured from Claude Code 2.1.302 with a hook that wrote
+// stdin to a file. Both carry `notification_type`, which is preferred over
+// the message wording; the message match is the fallback when it's absent.
+const fixture = f => fs.readFileSync(path.join(__dirname, 'fixtures', 'claude-hooks', f), 'utf8');
+
+got = decide('needs-input', fixture('notification-idle-prompt.json'));
+check('real idle_prompt payload is downgraded to idle', got === 'idle', got);
+
+got = decide('needs-input', fixture('notification-permission-prompt.json'));
+check('real permission_prompt payload stays needs-input', got === 'needs-input', got);
+
+got = decide('needs-input', '{"message":"Claude is waiting for your input","notification_type":"permission_prompt"}');
+check('notification_type permission_prompt wins over idle wording', got === 'needs-input', got);
+
+got = decide('needs-input', '{"message":"Something new","notification_type":"some_future_type"}');
+check('unknown notification_type stays needs-input', got === 'needs-input', got);
+
+got = decide('needs-input', '{"message":"Claude is waiting for your input","notification_type":"some_future_type"}');
+check('unknown notification_type is not demoted by idle wording', got === 'needs-input', got);
+
+got = decide('needs-input', '{"message":"Reworded nudge","notification_type":"idle_prompt"}');
+check('idle_prompt is downgraded whatever the wording', got === 'idle', got);
 
 console.log(fails ? `\n${fails} FAILURE(S)` : '\nall green');
 process.exit(fails ? 1 : 0);

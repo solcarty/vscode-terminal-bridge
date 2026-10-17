@@ -108,6 +108,27 @@ independent meanings — but the fix is different, because here the two meanings
 mutually exclusive turn states. Only the source was ambiguous, so disambiguating at the source is
 enough; a new status value would have re-created the collapse.
 
+### It broke again without the match ever failing (#82, v0.33.2+)
+
+On 2026-10-17 on dev-1, tab `6962` stopped, and 60 s later it read `needs-input` with the #51 code
+installed. Captured payloads (Claude Code 2.1.302, `test/fixtures/claude-hooks/`) showed the
+downgrade still matched. What re-asserted `needs-input` was the #4589 guard. After every turn Claude
+Code runs a prompt-suggestion fork, which fires `SubagentStop` (`agent_type: ""`, no
+`SubagentStart`) about a second **after** the main `Stop`. `SubagentStop → hook-status working`
+then wrote `working` and armed a fresh turn-start mark, so when the nudge arrived the guard saw a
+"turn" with no note and promoted it.
+
+A `SubagentStop` now writes only inside a turn that is still running: the last tracked state is
+`working` or `subagent`. Otherwise it is a no-op, and the status and turn mark stay as they were. The
+same rule stops a background subagent that ends during a permission prompt from overwriting
+`permission` with `working`, which the capture also showed. The guard itself is unchanged. A `Stop`
+with no handoff still re-asserts `needs-input` on the nudge, which is its job.
+
+The payload now also carries `notification_type` (`idle_prompt`, `permission_prompt`). When it is
+present it decides on its own: only `idle_prompt` is downgraded, and an unknown type stays
+`needs-input` even when the wording looks idle. The message match is now only the fallback for
+payloads that have no type.
+
 ## Background work is a second dimension, not a status (v0.21.0+)
 
 `status` is last-writer-wins, and the states written into it aren't mutually exclusive. Turn state (`working`/`idle`/`needs-input`, from `PreToolUse`/`Notification`/`Stop`) and outstanding background work (`bg-task`, from `TaskCreated`) were sharing one field. An agent that started a background task and then ended its turn wrote `bg-task` and had it overwritten moments later — so the tab read `needs-input`, the one status asserting a human is required, for exactly the interval the work was in flight. An orchestrator reading `list` sent attention to a tab that needed nothing.

@@ -283,6 +283,20 @@ function isPidAlive(pid) {
 // meaningful for a pid already confirmed alive — callers pass null/false
 // straight through rather than invoking this.
 async function hasAgentChild(pid) {
+  const cmds = await childCommands(pid);
+  return cmds === null ? null : cmds.some(cmd => /claude/i.test(cmd));
+}
+
+// #87 — sweep's version of the same read: is ANY process running under this
+// shell? A worker whose directory vanished may still be mid-run, and the shell
+// alone can't say so. null = unknown, which sweep treats as "keep".
+async function hasLiveChild(pid) {
+  const cmds = await childCommands(pid);
+  return cmds === null ? null : cmds.length > 0;
+}
+
+// The commands of a pid's direct children: [] for none, null when unreadable.
+async function childCommands(pid) {
   if (!pid) return null;
   try {
     const childPids = await Promise.race([
@@ -293,11 +307,10 @@ async function hasAgentChild(pid) {
         .catch(err => (err && err.code === 1) ? [] : Promise.reject(err)),
       new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 250)),
     ]);
-    if (childPids.length === 0) return false;
-    const cmds = await Promise.all(childPids.map(cpid =>
+    if (childPids.length === 0) return [];
+    return await Promise.all(childPids.map(cpid =>
       execAsync(`ps -p ${cpid} -o command=`).then(({ stdout }) => stdout.trim()).catch(() => '')
     ));
-    return cmds.some(cmd => /claude/i.test(cmd));
   } catch {
     // pgrep/ps missing, timed out, or otherwise unreadable — unknown, not dead.
     return null;
@@ -437,26 +450,62 @@ function normalizePath(p) {
   }
 }
 
-async function parseWorktrees() {
+// #87 — the repo a directory belongs to, as its absolute common git dir
+// (shared by the main checkout and every linked worktree, so it dedupes
+// repos). null when the directory is not inside a git repo.
+async function gitCommonDir(dir) {
+  try {
+    const { stdout } = await execAsync('git rev-parse --git-common-dir', { cwd: dir, timeout: 5000 });
+    const out = stdout.trim();
+    return out ? normalizePath(path.resolve(dir, out)) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function parseWorktrees(extraDirs = []) {
   // Returns Map<absolutePath, name> where name is the last path segment.
   // e.g. '/Users/…/worktrees/vscode-terminal-bridge/issue-11' → 'issue-11'
-  // Resolved relative to the first workspace folder, since the extension
-  // host's process.cwd() isn't guaranteed to be inside any repo at all.
-  const cwd = host.workspaceFolders()[0];
-  if (!cwd) return new Map();
-  try {
-    const { stdout } = await execAsync('git worktree list --porcelain', { cwd });
-    const worktrees = new Map();
-    for (const line of stdout.split('\n')) {
-      if (line.startsWith('worktree ')) {
-        const p = normalizePath(line.slice(9).trim());
-        worktrees.set(p, p.split('/').pop());
-      }
-    }
-    return worktrees;
-  } catch {
-    return new Map();
+  //
+  // #87 — the union over EVERY repo the bridge can see, not just the first
+  // workspace folder's. Reading one repo made every terminal in another
+  // repo's worktree look stale, and the startup sweep killed it. Candidates:
+  // every workspace folder, the sibling repo of a `<repo>-worktrees` folder
+  // (the headless layout, where that root is not itself a repo), and any
+  // directory the caller passes (sweep passes every tracked cwd). Each is
+  // resolved to its repo with `git rev-parse --git-common-dir` and every repo
+  // is listed once. The extension host's process.cwd() isn't guaranteed to be
+  // inside any repo, so nothing is resolved relative to it.
+  const candidates = [];
+  for (const folder of host.workspaceFolders()) {
+    candidates.push(folder);
+    const m = /^(.*)-worktrees\/?$/.exec(folder);
+    if (m) candidates.push(m[1]);
   }
+  candidates.push(...extraDirs);
+
+  const repos = new Map();   // common dir → a directory inside that repo
+  const seen = new Set();
+  for (const dir of candidates) {
+    if (!dir || seen.has(dir) || !fs.existsSync(dir)) continue;
+    seen.add(dir);
+    const common = await gitCommonDir(dir);
+    if (common && !repos.has(common)) repos.set(common, dir);
+  }
+
+  const worktrees = new Map();
+  for (const cwd of repos.values()) {
+    try {
+      const { stdout } = await execAsync('git worktree list --porcelain', { cwd, timeout: 5000 });
+      for (const line of stdout.split('\n')) {
+        if (line.startsWith('worktree ')) {
+          const p = normalizePath(line.slice(9).trim());
+          worktrees.set(p, p.split('/').pop());
+        }
+      }
+    } catch { /* one unreadable repo doesn't hide the others */ }
+  }
+  return worktrees;
 }
 
 // ---------------------------------------------------------------------------
@@ -792,29 +841,68 @@ async function pidContradicts(meta, terminal) {
 }
 
 // ---------------------------------------------------------------------------
-// Sweep: dispose terminals whose persisted cwd no longer maps to a live
-// worktree (ground truth = `git worktree list`), falling back to a PID kill
-// when the VS Code terminal object itself can't be found (registry desync).
+// Sweep: dispose terminals whose worktree is gone, falling back to a PID kill
+// when the terminal object itself can't be found (registry desync).
+//
+// #87 — fail closed per terminal. A row is swept only when ALL hold:
+//   - no repo the bridge can see lists its cwd as a worktree,
+//   - the cwd no longer exists on disk, and
+//   - its shell has no live child process (unknown counts as live).
+// Reading one repo's worktrees used to be the whole test, so every worker in
+// another repo's worktree was swept on each bridge start. A directory that
+// still exists is never swept: being unlisted proves nothing about whether
+// someone is working in it.
+//
+// `dryRun` decides and logs, but closes nothing. The startup sweep is always a
+// dry run, so a bridge restart is never what kills a worker.
 // ---------------------------------------------------------------------------
 
-async function sweepTerminals(context) {
-  const worktrees = await parseWorktrees();   // path → name
+async function terminalPid(terminal, fallback) {
+  if (!terminal) return fallback;
+  try {
+    const pid = await Promise.race([
+      Promise.resolve(terminal.processId),
+      new Promise(resolve => setTimeout(() => resolve(undefined), 250)),
+    ]);
+    return pid || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+async function sweepTerminals(context, { dryRun = false } = {}) {
   const metadata  = loadMetadata(context);
+  const worktrees = await parseWorktrees(          // path → name
+    Object.values(metadata).map(m => m.cwd).filter(Boolean));
   const closed = [];
+  const tag = dryRun ? 'sweep (dry run)' : 'sweep';
 
   // Fail closed: an empty worktree map almost always means we couldn't
-  // determine ground truth (no workspace folder, git not found, etc.),
-  // not that zero worktrees exist. Sweeping on that basis would dispose
-  // every tracked terminal, including live ones (see issue #22).
+  // determine ground truth (no repo resolvable, git not found, etc.),
+  // not that zero worktrees exist (see issue #22).
   if (worktrees.size === 0) {
-    console.log('[terminal-bridge] sweep skipped: could not determine live worktrees');
+    console.log(`[terminal-bridge] ${tag} skipped: could not determine live worktrees`);
     return closed;
   }
 
   for (const [name, meta] of Object.entries(metadata)) {
     if (!meta.cwd || worktrees.has(normalizePath(meta.cwd))) continue;
+    if (fs.existsSync(meta.cwd)) continue;
 
     const terminal = terminals.get(name) ?? host.terminals.find(t => t.name === name);
+    const pid = await terminalPid(terminal, meta.pid);
+    if (isPidAlive(pid) === true) {
+      const busy = await hasLiveChild(pid);
+      if (busy !== false) {
+        console.log(`[terminal-bridge] ${tag} kept ${name}: cwd ${meta.cwd} is gone, but pid ${pid} ${
+          busy ? 'still has a running process' : 'could not be read'}`);
+        continue;
+      }
+    }
+
+    console.log(`[terminal-bridge] ${tag} ${dryRun ? 'would close' : 'closing'} ${name}: cwd ${meta.cwd} no longer exists and no repo lists it`);
+    closed.push(name);
+    if (dryRun) continue;
     if (terminal) {
       terminal.dispose();
     } else if (meta.pid) {
@@ -822,11 +910,10 @@ async function sweepTerminals(context) {
     }
     terminals.delete(name);
     await persistMetadata(context, name, null);
-    closed.push(name);
   }
 
   if (closed.length > 0) {
-    console.log(`[terminal-bridge] swept ${closed.length} stale terminal(s): ${closed.join(', ')}`);
+    console.log(`[terminal-bridge] ${dryRun ? 'sweep (dry run) would close' : 'swept'} ${closed.length} stale terminal(s): ${closed.join(', ')}`);
   }
   return closed;
 }
@@ -1250,7 +1337,9 @@ function startBridge(bridgeHost, context) {
 
   // ── Sweep stale terminals left over from a crash/restart before anyone ───
   // ── notices (e.g. extension host restart under resource pressure). ───────
-  setTimeout(() => sweepTerminals(context), 2500);
+  // #87 — a dry run only: it logs what a sweep would close and closes nothing.
+  // A restart must never be what kills a worker; only an explicit /sweep does.
+  setTimeout(() => sweepTerminals(context, { dryRun: true }), 2500);
 
   // ── Reattach proxy tabs for remote jobs still running on a worker node ───
   // ── (ground truth lives on the worker, so this can't run as part of the ──
@@ -2148,10 +2237,12 @@ function startBridge(bridgeHost, context) {
       // Cross-reference persisted terminals against ground-truth git worktrees
       // and dispose anything whose worktree no longer exists. Self-healing
       // cleanup for when the in-memory registry has desynced from reality.
-      const closed = await sweepTerminals(context);
+      // #87 — `dryRun=1` reports what would close (`wouldClose`) and closes nothing.
+      const dryRun = url.searchParams.get('dryRun') === '1';
+      const closed = await sweepTerminals(context, { dryRun });
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, closed }));
+      res.end(JSON.stringify(dryRun ? { ok: true, dryRun: true, closed: [], wouldClose: closed } : { ok: true, closed }));
 
     } else if (url.pathname === '/add-folder') {
       // Attach a path to the current VS Code workspace without needing the

@@ -447,6 +447,37 @@ is the bridge that is always there.
 Out of scope here, as the issue said: installing it on the hosts (`agent-workflows`' `host-sync`)
 and any `agent-hosts` change, which already reads whatever bridge answers `bridgectl.sh list`.
 
+## A sweep never kills a live worker (#87, v0.33.3+)
+
+On 2026-10-17, rolling out v0.33.2 with `install-headless.sh` on dev-1 and dev-2 killed three live
+Claude workers: `83` in `vscode-terminal-bridge-worktrees/` and `6963`/`6966` in
+`agent-workflows-worktrees/`. `KillMode=process` kept their tmux sessions alive through the restart,
+and then the bridge's own startup sweep killed them. `sweepTerminals()` took `git worktree list` from
+`workspaceFolders()[0]` as the only ground truth, so a terminal in any other repo's worktree looked
+stale. The window extension ran the same code.
+
+Three changes, each enough on its own to have saved those workers:
+
+- **Worktrees come from every repo.** `parseWorktrees()` resolves every workspace folder, the
+  sibling repo of a `<repo>-worktrees` folder, and every tracked cwd to its repo with
+  `git rev-parse --git-common-dir`. It dedupes by that dir and lists each repo once.
+- **Fail closed per terminal.** Being unlisted is no longer enough. The cwd must also be gone from
+  disk, and the shell must have no running child (`hasLiveChild`; unknown counts as running). A
+  directory that exists proves nothing about whether someone works in it, so it is never swept.
+- **The startup sweep is a dry run**, on both backends. It logs what it would close. Only an
+  explicit `/sweep` closes anything, and `/sweep?dryRun=1` reports the same decision. A restart is
+  the worst moment for the bridge to act on a stale view, because it is exactly when sessions it
+  hasn't yet reconciled are still live.
+
+Rejected: dropping the worktree list and deciding on cwd existence alone. A worktree whose directory
+was removed by hand stays listed (`prunable`) until `git worktree prune`, so keeping the union is the
+more conservative read. Also rejected: matching only `claude` children, the way `agentAlive` does. A
+sweep can't tell a build or a test run from an idle shell any better than it can tell an agent, so
+any child process keeps the row.
+
+`test/sweep-multi-repo.test.js` pins it with two real repos. Against the old code it reproduces the
+incident: everything outside the first folder's repo was swept, the busy shell included.
+
 ## Key endpoints
 
 All endpoints are GET with query-string params (not POST/JSON — see `bridge.js`).
@@ -468,7 +499,7 @@ All endpoints are GET with query-string params (not POST/JSON — see `bridge.js
 | `/set-pr` | Record a PR url on a tracked terminal (`name=`, `url=`) — advisory, last write wins |
 | `/announce` | Presence: self-reported status for this window's main agent (`status=`), written into its `bridges/<id>.json` entry |
 | `/api/bridges` | Presence: every live window's registry entry, this one included — reads `~/.vscode-terminal-bridge/bridges/`, reaping only confirmed-dead pids |
-| `/sweep` | Dispose terminals whose cwd no longer maps to a live `git worktree` |
+| `/sweep` | Dispose terminals whose cwd is gone from disk, listed by no repo, with nothing running (`dryRun=1` reports only; startup is always a dry run) |
 | `/add-folder` / `/remove-folder` | Attach/detach a workspace folder |
 | `/reindex` | Re-link open terminals to persisted metadata |
 | `/repaint` | No-op since v0.29.0 (titles are fixed at open); kept so callers don't break |

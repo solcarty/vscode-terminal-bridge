@@ -1,46 +1,38 @@
-# PLAN — #82
+# PLAN — #87
 
-## Root cause (from captured payloads, Claude Code 2.1.302, dev-1)
+## Root cause
 
-The #51 downgrade still fires. The real idle payload is
-`{"message":"Claude is waiting for your input","notification_type":"idle_prompt",...}`, the `sed`
-extracts the message, and the `case` matches, so the state becomes `idle`. The #4589 idle-note
-guard then promotes it back to `needs-input`.
+`sweepTerminals()` (`bridge.js`) takes `parseWorktrees()` as ground truth, and `parseWorktrees()`
+runs `git worktree list --porcelain` in `host.workspaceFolders()[0]` only. A terminal in a worktree
+of any other repo is "not a live worktree" and gets disposed (or SIGTERMed by pid). `startBridge()`
+runs that sweep 2.5 s after every start, on both backends, so restarting the headless bridge killed
+the tmux sessions `KillMode=process` had just kept alive.
 
-After every turn, Claude Code runs a prompt-suggestion fork. That fork fires `SubagentStop` with
-`agent_type: ""` about 1 s *after* the main `Stop` (captured: Stop 01:05:41.1, SubagentStop
-01:05:42.5, with no SubagentStart). It is wired as `SubagentStop → hook-status working`, so it writes
-`working` and `_bridge_turn_track` arms a fresh turn-start mark after the Stop's handoff cleared it.
-60 s later the nudge is downgraded to `idle`, the guard sees a turn with no note newer than its
-start, and it writes `needs-input`. Live on dev-1, tab 6962: lastOutputAt 01:00:11 (Stop), mark
-01:00:12, needs-input 01:01:11.
+## Fix (`bridge.js`)
 
-The same out-of-order `SubagentStop` also overwrites `permission` with `working` when a background
-subagent ends while a permission prompt is up (captured: PermissionRequest 01:04:54.4, SubagentStop
-01:04:55.4).
+1. **`parseWorktrees(extraDirs)` reads every repo.** Candidates: every workspace folder, the sibling
+   repo of any `<repo>-worktrees` folder, and every tracked terminal's cwd that still exists. Each
+   resolves to its repo with `git rev-parse --git-common-dir`; repos are deduped by that dir, and each
+   is listed once with `git worktree list --porcelain`. The map is the union.
+2. **Fail closed per terminal.** A row is swept only when all hold: its cwd is not listed by any repo,
+   the cwd no longer exists on disk, and its shell has no live child process (`hasLiveChild`, the
+   `hasAgentChild` read without the `claude` filter; `null` = unknown = keep). Every swept row logs its
+   reason; every row kept for a live process logs that too.
+3. **No destructive sweep at startup.** The startup sweep, on both backends, becomes a dry run that
+   logs what a sweep would close. Only an explicit `/sweep` closes anything. `/sweep?dryRun=1` exposes
+   the same dry run (`wouldClose`).
 
-## Fix (`bin/vscode-bridge.sh`, `bridge_hook_status`)
+## Tests (`test/sweep-multi-repo.test.js`, vscode harness)
 
-1. **SubagentStop never starts a turn.** When the payload's `hook_event_name` is `SubagentStop`,
-   write `working` only if the last tracked state is `working` or `subagent`. Otherwise, or when
-   unknown, it's a no-op: no status write and no turn-mark change. No settings.json change is needed.
-2. **Prefer `notification_type`.** `idle_prompt` → `idle`. Any other type (`permission_prompt`, an
-   unknown one) stays `needs-input`, whatever the message says. With no type, fall back to the
-   existing message match. A permission prompt is never demoted.
-3. Keep the guard as is. A Stop with no handoff must still re-assert `needs-input` on the nudge.
+Two real git repos with one worktree each; workspace folder = only a non-git `A-worktrees` root (the
+headless layout). Rows: a tab in each worktree, a tab whose dir exists but no repo lists it, a tab
+whose dir was removed (dead pid), and a row whose dir was removed but whose pid is a live shell with
+a child. Assert: startup closes nothing; `/sweep?dryRun=1` reports only the removed-dir tab; `/sweep`
+closes only that one and disposes only its terminal.
 
-## Tests
+## Docs / release
 
-- `test/fixtures/claude-hooks/*.json`: the captured payloads, sanitized.
-- `test/hook-status-notification.test.js`: real idle → idle, real permission → needs-input,
-  `notification_type` beats the message both ways, and the existing cases still pass.
-- A sequence test: working → Stop (real) → post-Stop SubagentStop (real) → idle nudge (real) gives
-  `idle`. Fails before the fix. Also: SubagentStop during `permission` leaves it alone, SubagentStop
-  after `subagent` still writes `working`, and a Stop with no handoff still ends at `needs-input`.
+README `/sweep` section + `sweep` CLI note; CLAUDE.md design note; `package.json` patch bump
+(0.33.2 → 0.33.3, or the next free patch if #83 merges first).
 
-## Ship
-
-Bump 0.33.1 → 0.33.2. Update the CLAUDE.md reasoning and the README if it documents the hook. Run
-`npm test`, push, and `gh pr create` "… (#82)" with `Closes #82`. The PR body gives the root cause,
-the payload, and install steps: `install-headless.sh` on the dev hosts, the VSIX on the laptop. Do
-not install on any host.
+Live restart check (`install-headless.sh` with workers in three repos) is Sol's after install.

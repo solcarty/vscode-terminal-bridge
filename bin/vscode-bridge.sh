@@ -840,13 +840,19 @@ bridge_bg_task() {
 # bridge_sweep — dispose every tracked terminal whose cwd no longer maps to a
 # live `git worktree list` entry, returning {ok, closed:[names]}. Bridge
 # v0.12.0+; older bridges 404 and this no-ops. Safe (and idempotent) to fire
-# after `git worktree remove` to clear tabs orphaned in a now-deleted cwd —
-# the bridge also runs this itself a few seconds after activation.
+# after `git worktree remove` to clear tabs orphaned in a now-deleted cwd.
+# Since #87 a row is closed only when its cwd is gone from disk, no repo lists
+# it, and its shell runs nothing; the bridge's own startup pass is a dry run.
+# `--dry-run` prints {ok, dryRun, wouldClose:[names]} and closes nothing.
 bridge_sweep() {
   _bridge_active || return 0
   local port
   port=$(_bridge_port)
-  curl -fsS -m 2 "http://127.0.0.1:${port}/sweep" >/dev/null 2>&1 || true
+  if [ "${1:-}" = "--dry-run" ]; then
+    curl -fsS -m 10 "http://127.0.0.1:${port}/sweep?dryRun=1" 2>/dev/null || true
+    return 0
+  fi
+  curl -fsS -m 10 "http://127.0.0.1:${port}/sweep" >/dev/null 2>&1 || true
 }
 
 # bridge_rename <name> <label> [icon] [color]

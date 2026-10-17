@@ -447,7 +447,7 @@ is the bridge that is always there.
 Out of scope here, as the issue said: installing it on the hosts (`agent-workflows`' `host-sync`)
 and any `agent-hosts` change, which already reads whatever bridge answers `bridgectl.sh list`.
 
-### The headless bridge repairs its discovery; a bridge removes only its own port files (#83, v0.33.2+)
+### The headless bridge repairs its discovery; a bridge removes only its own port files (#83, v0.33.3+)
 
 On 2026-10-17 a window on dev-1 loaded extension 0.32.0, which predates headless mode. It started a
 bridge of its own, and on dispose `removePortFiles()` unlinked every `.vscode-bridge-port` in its

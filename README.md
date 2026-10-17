@@ -269,6 +269,8 @@ curl http://127.0.0.1:$PORT/ping
 
 `backend` (v0.33.0+) says which bridge answered: `vscode` for the extension, `tmux` for a [headless bridge](#headless-mode-no-vs-code-window). A headless bridge reports its own `pid` and its `tmuxSocket` instead of `ipcHook`.
 
+`version` (v0.33.2+) is the bridge's `package.json` version. The [presence](#get-announce--get-apibridges) entry carries it too. A bridge from before v0.33.2 omits it.
+
 ---
 
 ### `GET /announce` · `GET /api/bridges`
@@ -314,7 +316,7 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh agents
 
 **`agents` is the one command that does not go through any bridge's HTTP server.** It reads `~/.vscode-terminal-bridge/bridges/` off disk directly, because reaching a bridge over HTTP means already knowing a port — the exact thing cross-window discovery cannot assume. So it works from any cwd, with zero live bridges, and with no bridge reachable at all. This is also why it is the answer to `list`'s cwd-dependence: an empty `list` means "cwd outside a known workspace", an empty `agents` means "no windows are up".
 
-One file per live window is written at `~/.vscode-terminal-bridge/bridges/<id>.json` on activation (rewritten when workspace folders change) and removed on clean deactivation. `id` is a fresh UUID per activation, deliberately not persisted across reloads: a reloaded window is a new process with a new pid, and a reused id would let a stale entry's pid check pass by accident.
+One file per live window is written at `~/.vscode-terminal-bridge/bridges/<id>.json` on activation (rewritten when workspace folders change) and removed on clean deactivation. A [headless bridge](#discovery) also puts its entry back if it goes missing. `id` is a fresh UUID per activation, deliberately not persisted across reloads: a reloaded window is a new process with a new pid, and a reused id would let a stale entry's pid check pass by accident.
 
 **Reaping is fail-closed**, matching [`pidAlive`/`agentAlive`](#timestamps-and-liveness): an entry is removed only on a *confirmed*-dead pid, never on a stale heartbeat. An unresolvable pid is reported and left in place. The bridge does not derive "abandoned" from heartbeat age — it reports the timestamps and lets you pick a threshold, the same rule that applies to terminals.
 
@@ -1647,11 +1649,21 @@ Without systemd, run it under anything that restarts it: `node headless.js --fol
 
 Exactly the extension's: `~/.vscode-terminal-bridge/port`, `.vscode-bridge-port` in each `--folder`, the bundled CLI in `~/.vscode-terminal-bridge/bin/`, a [presence](#get-announce--get-apibridges) entry in `~/.vscode-terminal-bridge/bridges/` (with `"backend": "tmux"`), and `VSCODE_BRIDGE_PORT` exported into every terminal it opens. Ports start at `31415` as usual.
 
+**It repairs them.** *v0.33.2+ ([#83](https://github.com/solcarty/vscode-terminal-bridge/issues/83)).* Every 30 seconds (`VSCODE_BRIDGE_REPAIR_MS`) the headless bridge checks each folder's `.vscode-bridge-port`, `~/.vscode-terminal-bridge/port` and its presence entry, and rewrites any that is missing or names another port. Each repair logs one line naming the files it rewrote. A healthy check logs nothing. It is the one bridge on its host, so another window's port in one of these files is wrong by definition.
+
+**A bridge removes only its own port files.** *v0.33.2+.* On a clean shutdown the extension and the headless bridge unlink a `.vscode-bridge-port` or `~/.vscode-terminal-bridge/port` only if it still holds their own port. Before v0.33.2, any window closing removed them whatever they held, so an older window on a headless host left the headless bridge running but unreachable.
+
 ### Opening a VS Code window on a host that runs headless
 
 The extension does **not** start a second bridge. On activation it looks for a live headless bridge — a presence entry with `"backend": "tmux"`, then `~/.vscode-terminal-bridge/port` — and asks it `/ping`. If one answers `backend: "tmux"`, the window becomes a viewer: no HTTP server, no registry of its own. Its Terminals panel lists the headless bridge's terminals (re-read every 3 seconds; the view's title reads `headless · <port>`), clicking a row opens a VS Code terminal running `tmux attach` on that session (a second click shows the same one), and it writes the headless port into its own workspace folders' `.vscode-bridge-port`. Every caller on the host talks to the one bridge.
 
 If nothing answers, the window serves as it always has. If the headless bridge stops answering later, the view's title says so; reload the window to serve locally.
+
+**Version skew is shown.** *v0.33.2+.* If the headless bridge's `/ping` `version` differs from the window's extension version, the window logs both once and the view's title adds them: `headless · 31415 · headless v0.33.2 ≠ window v0.33.1`. A headless bridge from before v0.33.2 reports no version and reads as `v?`.
+
+### Upgrading
+
+On a headless host **the service is the bridge**. Upgrade it by re-running `bash bin/install-headless.sh …` from an updated checkout: it restarts the service in place, and every tmux session survives. A VS Code window on that host is only a viewer of it, so its extension version affects nothing but the view. Reload the window after installing a new VSIX only if a window is open, and the skew note in the view's title tells you when one is out of date. Hosts are rolled out by `agent-workflows`' host-sync ([house.health#6966](https://github.com/solcarty/house.health/issues/6966)).
 
 ## Remote jobs
 

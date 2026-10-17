@@ -163,6 +163,17 @@ function startViewer(context, headless, panel) {
     },
   };
 
+  // #83 — a window older or newer than the headless bridge it defers to is
+  // easy to miss, so say so once in the log and keep both versions in the
+  // panel description. A headless bridge that reports no version predates
+  // the field, which is skew too.
+  const ownVersion = bridge.VERSION;
+  const skew = headless.version !== ownVersion
+    ? ` · headless v${headless.version || '?'} ≠ window v${ownVersion}` : '';
+  if (skew) {
+    console.warn(`[terminal-bridge] headless bridge on ${headless.port} is v${headless.version || '?'}, this window's extension is v${ownVersion}`);
+  }
+
   async function poll() {
     const list = await getLocal(headless.port, '/list', 2000);
     if (list && list.ok) {
@@ -173,7 +184,7 @@ function startViewer(context, headless, panel) {
       console.error(`[terminal-bridge] headless bridge on ${headless.port} stopped answering; reload the window to serve locally`);
     }
     if (panel) {
-      panel.view.description = failing ? `headless bridge on ${headless.port} not answering` : `headless · ${headless.port}`;
+      panel.view.description = (failing ? `headless bridge on ${headless.port} not answering` : `headless · ${headless.port}`) + skew;
       panel.refresh();
     }
   }

@@ -18,6 +18,7 @@ const bridge = require('./bridge');
 
 const TMUX = process.env.VSCODE_BRIDGE_TMUX || 'tmux';
 const POLL_MS = Number(process.env.VSCODE_BRIDGE_TMUX_POLL_MS) || 2000;
+const REPAIR_MS = Number(process.env.VSCODE_BRIDGE_REPAIR_MS) || 30000;
 const STATE_DIR = path.join(os.homedir(), '.vscode-terminal-bridge', 'headless');
 const REGISTRY_PATH = path.join(STATE_DIR, 'registry.json');
 
@@ -237,6 +238,9 @@ function tmuxHost({ socket, folders = [], settings = {} }) {
     onDidChangeWorkspaceFolders: subscribe(folderCbs),
 
     pid: process.pid,
+    // #83 — the one bridge on this host puts back any port file or presence
+    // entry that a window removed or overwrote.
+    repairIntervalMs: REPAIR_MS,
     pingFields: () => ({ pid: process.pid, tmuxSocket: socket }),
     rowFields: (name, terminal) => ({
       tmuxSession: terminal && list.includes(terminal) ? terminal.session : null,

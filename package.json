@@ -2,7 +2,7 @@
   "name": "terminal-bridge",
   "displayName": "SDO Terminal Bridge",
   "description": "Opens, renames, and closes VS Code terminal tabs via a local HTTP API",
-  "version": "0.33.4",
+  "version": "0.33.5",
   "scripts": {
     "test": "node test/run.js"
   },
@@ -30,8 +30,9 @@
         },
         "terminalBridge.hostsCommand": {
           "type": "string",
+          "scope": "machine",
           "default": "",
-          "description": "A command that prints every host's terminals as one JSON document (see the README, \"All hosts view\"). When set, an All hosts view appears in the Terminal Bridge container and runs it every 30 s while the view is visible. Empty: no view."
+          "description": "A command that prints every host's terminals as one JSON document (see the README, \"All hosts view\"). When set, an All hosts view appears in the Terminal Bridge container and runs it every 30 s while the view is visible. Empty: no view. Machine-scoped: a Remote-SSH window reads the remote host's value, not the laptop's."
         }
       }
     },

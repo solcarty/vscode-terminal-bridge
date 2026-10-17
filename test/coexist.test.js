@@ -5,6 +5,7 @@
 // The headless bridge here is a stand-in HTTP server answering /ping and /list
 // the way headless.js does, so this runs without tmux.
 process.env.VSCODE_BRIDGE_VIEWER_POLL_MS = '100';
+process.env.VSCODE_BRIDGE_PROBE_RETRY_MS = '100';
 const h = require('./harness');
 const fs = require('fs');
 const http = require('http');
@@ -97,6 +98,21 @@ function fakeBridge(backend, terminals = [], version) {
   })();
   check('a presence entry with backend tmux is found even when the port file points elsewhere',
     found && found.backend === 'tmux', found);
+
+  // A headless bridge that is silent on the first probe (a slow Remote-SSH
+  // extension host, or a host-sync restart) is still found on a retry.
+  const late = await (async () => {
+    const probe = await fakeBridge('tmux');
+    const port = probe.port;
+    await new Promise(r => probe.server.close(r));
+    fs.writeFileSync(h.portFile, String(port));
+    const lookup = h.ext.findHeadlessBridge();
+    await new Promise(r => setTimeout(r, 30));
+    const back = http.createServer((req, res) => res.end(JSON.stringify({ ok: true, backend: 'tmux', tmuxSocket: 'vscode-bridge' })));
+    await new Promise(r => back.listen(port, '127.0.0.1', r));
+    return lookup.then(r => { back.close(); return r; });
+  })();
+  check('a headless bridge that answers only on a retry is deferred to', late && late.backend === 'tmux', late);
 
   other.server.close();
   console.log(fails ? `\n${fails} FAILURE(S)` : '\nall green');

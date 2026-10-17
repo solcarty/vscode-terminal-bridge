@@ -79,10 +79,14 @@ systemctl --user daemon-reload
 systemctl --user enable "$unit_name" >/dev/null
 systemctl --user restart "$unit_name"
 
-if loginctl enable-linger "$USER" 2>/dev/null; then
-  echo "install-headless: linger on for $USER (starts at boot, no login needed)"
+# cron (host-sync) runs this with no USER in the environment; set -u would stop
+# the script here, after the restart, so host-sync never marked it done and
+# restarted the bridge every five minutes.
+user="${USER:-$(id -un)}"
+if loginctl enable-linger "$user" 2>/dev/null; then
+  echo "install-headless: linger on for $user (starts at boot, no login needed)"
 else
-  echo "install-headless: could not enable linger; run: sudo loginctl enable-linger $USER" >&2
+  echo "install-headless: could not enable linger; run: sudo loginctl enable-linger $user" >&2
 fi
 
 for _ in 1 2 3 4 5 6 7 8 9 10; do

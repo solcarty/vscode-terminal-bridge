@@ -444,6 +444,22 @@ bridge all fall through to serving, because a window with no bridge is the one o
 never happen. The reverse — a headless bridge deferring to a window — was rejected: the headless one
 is the bridge that is always there.
 
+**The probe retries silence (v0.33.5+).** It began as one 500 ms `/ping`. On dev-1 (2026-10-17) a
+Remote-SSH window missed a headless bridge that answered a plain `curl` in 1 ms: the extension
+activated at 13:35:43.9 and started its own bridge on 31417 at 13:35:47.1, and two reloads did the
+same. The same `findHeadlessBridge()` run from a bare `node` on that host found 31415 at once, so
+the stall belongs to the extension host's first local requests, not the bridge. The probe now waits
+2 s per port and tries a silent port three times, 1 s apart. That also covers a headless bridge
+caught mid-restart. A miss costs a second bridge for the window's whole life, and a hit costs
+nothing, so the probe errs long. A port that answers as anything but `tmux` is settled and never
+retried, so a laptop window pays nothing.
+
+The same day showed why that restart window was not hypothetical: host-sync runs
+`install-headless.sh` from cron, which sets no `USER`, so `set -u` stopped the script at
+`loginctl enable-linger "$USER"`. That line comes after the restart, so the step failed, host-sync
+never wrote its marker, and the bridge restarted every five minutes. The script now falls back to
+`id -un`.
+
 Out of scope here, as the issue said: installing it on the hosts (`agent-workflows`' `host-sync`)
 and any `agent-hosts` change, which already reads whatever bridge answers `bridgectl.sh list`.
 

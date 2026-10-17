@@ -18,13 +18,13 @@ const check = (label, cond, got) => {
   if (!cond) fails++;
 };
 
-function fakeBridge(backend, terminals = []) {
+function fakeBridge(backend, terminals = [], version) {
   const hits = [];
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://x');
     hits.push(url.pathname);
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    if (url.pathname === '/ping') res.end(JSON.stringify({ ok: true, backend, tmuxSocket: 'vscode-bridge', pid: process.pid }));
+    if (url.pathname === '/ping') res.end(JSON.stringify({ ok: true, backend, version, tmuxSocket: 'vscode-bridge', pid: process.pid }));
     else if (url.pathname === '/list') res.end(JSON.stringify({ ok: true, backend, terminals }));
     else res.end(JSON.stringify({ ok: false }));
   });
@@ -41,7 +41,7 @@ function fakeBridge(backend, terminals = []) {
   const headless = await fakeBridge('tmux', [
     { name: 'feat-1', status: 'working', live: true, tmuxSession: 'feat-1', createdAt: '2026-10-16T10:00:00Z' },
     { name: 'gone', status: 'idle', live: false, tmuxSession: null, createdAt: '2026-10-16T09:00:00Z' },
-  ]);
+  ], '0.0.1');
   fs.writeFileSync(h.portFile, String(headless.port));
   fs.writeFileSync(path.join(bridgesDir, 'headless.json'),
     JSON.stringify({ id: 'headless', port: headless.port, pid: process.pid, backend: 'tmux' }));
@@ -65,6 +65,10 @@ function fakeBridge(backend, terminals = []) {
   check('the panel lists the live headless rows only', items.map(i => i.label).join() === 'feat-1', items.map(i => i.label));
   check('the row carries its status icon', items[0]?.iconPath?.id === 'loading~spin', items[0]?.iconPath);
   check('the view says it is showing a headless bridge', /headless/.test(view.description || ''), view.description);
+  // #83 — an out-of-date window is visible.
+  const own = require('../package.json').version;
+  check('a version mismatch shows both versions in the view description',
+    (view.description || '').includes('v0.0.1') && (view.description || '').includes(`v${own}`), view.description);
 
   // ── A click attaches to the session ─────────────────────────────────────
   await h.vscodeMock.commands.executeCommand(SHOW_COMMAND, 'feat-1');

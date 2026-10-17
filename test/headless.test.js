@@ -84,7 +84,7 @@ const until = async (fn, ms = 8000) => {
       && listed.tmuxSession === 'cli_one', r.out);
     const ran = await until(async () => {
       const p = await get(bridge.port, '/output?name=cli.one&pane=1&lines=200');
-      return p.ok && /^sent-by-cli$/m.test(p.pane) && /^from-cli$/m.test(p.pane) ? p : null;
+      return p.ok && /^sent-by-cli\s*$/m.test(p.pane) && /^from-cli\s*$/m.test(p.pane) ? p : null;
     });
     check('the open command and the send both ran in the pane', !!ran, await get(bridge.port, '/output?name=cli.one&pane=1'));
     check('the real name survives in @bridge_name',
@@ -117,7 +117,7 @@ const until = async (fn, ms = 8000) => {
     const sent = await get(bridge.port, `/send-text?name=cli.one&text=${q('echo after-restart')}`);
     check('send works after a restart', sent.ok && sent.delivery === 'submitted', sent);
     check('…and lands in the pane', !!(await until(async () =>
-      /^after-restart$/m.test((await get(bridge.port, '/output?name=cli.one&pane=1&lines=200')).pane))), null);
+      /^after-restart\s*$/m.test((await get(bridge.port, '/output?name=cli.one&pane=1&lines=200')).pane))), null);
 
     // ── Reboot: the tmux server is gone, so are its terminals ───────────────
     await bridge.stop();

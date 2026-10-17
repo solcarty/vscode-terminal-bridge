@@ -21,6 +21,7 @@
 //   pingFields()              extra /ping fields
 //   rowFields(name, t)        extra /list fields per row
 //   capturePane?(t, lines)    the pane's visible text (tmux only)
+//   repairIntervalMs?         re-check the discovery files this often (#83)
 //
 // A terminal keeps the shape of a vscode.Terminal: name, processId (a
 // promise of the shell pid), sendText(text, addNewline), show(), dispose().
@@ -32,6 +33,12 @@ const { exec } = require('child_process');
 const { promisify } = require('util');
 
 const execAsync = promisify(exec);
+
+// Reported on /ping and in the presence entry, so a window deferring to a
+// headless bridge can tell when the two are different builds (#83).
+const VERSION = (() => {
+  try { return require('./package.json').version; } catch { return null; }
+})();
 
 let server;
 let host = null;
@@ -2463,6 +2470,7 @@ function startBridge(bridgeHost, context) {
         ok: true,
         port: activePort,
         backend: host.kind,
+        version: VERSION,
         workspaceFolders: host.workspaceFolders(),
         ...host.pingFields(),
       }));
@@ -2559,6 +2567,7 @@ function startBridge(bridgeHost, context) {
         pid: host.pid,
         // #77 — how a window finds a headless bridge to defer to.
         backend: host.kind,
+        version: VERSION,
         startedAt: bridgeStartedAt,
         workspaceFolders: host.workspaceFolders(),
         workspaceName: host.workspaceName() || null,
@@ -2584,16 +2593,49 @@ function startBridge(bridgeHost, context) {
   // harness so a headless run never collides with real editor windows).
   let activePort = Number(process.env.VSCODE_BRIDGE_BASE_PORT) || 31415;
 
+  // #83 — only a file that still holds this bridge's port is ours to remove.
+  // Another bridge may have written it since (a headless one on the same
+  // host, another window), and deleting its file leaves it undiscoverable.
+  const readPort = p => { try { return fs.readFileSync(p, 'utf8').trim(); } catch { return null; } };
+
   function removePortFiles() {
-    for (const folder of host.workspaceFolders()) {
+    const own = String(activePort);
+    for (const p of [...host.workspaceFolders().map(f => path.join(f, '.vscode-bridge-port')), PORT_FALLBACK_PATH]) {
       try {
-        const p = path.join(folder, '.vscode-bridge-port');
-        if (fs.existsSync(p)) fs.unlinkSync(p);
+        if (readPort(p) === own) fs.unlinkSync(p);
       } catch { /* ignore */ }
     }
-    try {
-      if (fs.existsSync(PORT_FALLBACK_PATH)) fs.unlinkSync(PORT_FALLBACK_PATH);
-    } catch { /* ignore */ }
+  }
+
+  // #83 — the headless bridge is the one bridge on its host, so a discovery
+  // file that is missing or names another port (an older window removed it,
+  // or wrote its own) is put back. Silent on a healthy tick; one line per
+  // repair, naming what it rewrote.
+  let listening = false;
+  function repairDiscovery() {
+    if (!listening) return [];
+    const own = String(activePort);
+    const repaired = [];
+    const folderFiles = host.workspaceFolders().map(f => path.join(f, '.vscode-bridge-port'));
+    for (const p of [...folderFiles, PORT_FALLBACK_PATH]) {
+      if (readPort(p) !== own) repaired.push(p);
+    }
+    if (repaired.length) writePortFiles(host.workspaceFolders(), activePort);
+    let entry = null;
+    try { entry = JSON.parse(fs.readFileSync(bridgeEntryPath(), 'utf8')); } catch { /* missing or unreadable */ }
+    if (!entry || String(entry.port) !== own) {
+      writeBridgeRegistry(activePort);
+      repaired.push(bridgeEntryPath());
+    }
+    if (repaired.length) {
+      console.log(`[terminal-bridge] repaired discovery for port ${own}: ${repaired.join(', ')}`);
+    }
+    return repaired;
+  }
+  if (host.repairIntervalMs) {
+    const repairTimer = setInterval(repairDiscovery, host.repairIntervalMs);
+    repairTimer.unref?.();
+    context.subscriptions.push({ dispose: () => clearInterval(repairTimer) });
   }
 
   // Re-write port files when the workspace changes (e.g. /add-folder adds a worktree folder)
@@ -2620,6 +2662,7 @@ function startBridge(bridgeHost, context) {
   server.on('listening', () => {
     activePort = server.address().port;
     console.log(`[terminal-bridge] listening on 127.0.0.1:${activePort}`);
+    listening = true;
     writePortFiles(host.workspaceFolders(), activePort);
     writeBridgeRegistry(activePort);
   });
@@ -2647,7 +2690,7 @@ function startBridge(bridgeHost, context) {
 
   context.subscriptions.push({ dispose: () => { removePortFiles(); removeBridgeRegistry(); server && server.close(); } });
 
-  return { server, get port() { return activePort; } };
+  return { server, get port() { return activePort; }, repairDiscovery };
 }
 
 function stopBridge() {
@@ -2656,5 +2699,5 @@ function stopBridge() {
 
 module.exports = {
   startBridge, stopBridge, writePortFiles, isPidAlive,   loadMetadata, onDidWriteMetadata, displayStatusKey, terminals,
-  STATUS_MAP, BRIDGES_DIR, PORT_FALLBACK_PATH,
+  STATUS_MAP, BRIDGES_DIR, PORT_FALLBACK_PATH, VERSION,
 };

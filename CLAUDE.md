@@ -447,6 +447,27 @@ is the bridge that is always there.
 Out of scope here, as the issue said: installing it on the hosts (`agent-workflows`' `host-sync`)
 and any `agent-hosts` change, which already reads whatever bridge answers `bridgectl.sh list`.
 
+### The headless bridge repairs its discovery; a bridge removes only its own port files (#83, v0.33.4+)
+
+On 2026-10-17 a window on dev-1 loaded extension 0.32.0, which predates headless mode. It started a
+bridge of its own, and on dispose `removePortFiles()` unlinked every `.vscode-bridge-port` in its
+folders and `~/.vscode-terminal-bridge/port` whatever they held. The headless bridge stayed up on
+31415, but `bridgectl` read `bridge-unreachable` until the service was reinstalled, and a worker
+opened then never got its start command. Deferring (above) can't prevent this: a host can always
+meet an older extension.
+
+- **The headless bridge repairs on a timer** (`host.repairIntervalMs`, 30 s): each folder's port
+  file, the fallback and its presence entry are rewritten when missing or naming another port.
+  It is the one bridge on its host, so another port in those files is wrong by definition. A VS Code
+  window doesn't run it: windows sharing a fallback is last-writer-wins on purpose (*Presence*,
+  above), and a repairing window would fight every other window every 30 s. Logs one line per
+  repair, nothing on a healthy tick.
+- **`removePortFiles()` unlinks a file only if it holds this bridge's port.** A file someone else
+  has written since is theirs.
+- **Skew is shown, not acted on.** `/ping` and the presence entry carry `version`; a deferring
+  window logs both and puts them in the view description. It still defers: one bridge per host
+  matters more than matching versions, and the viewer only reads `/list`.
+
 ## A sweep never kills a live worker (#87, v0.33.3+)
 
 On 2026-10-17, rolling out v0.33.2 with `install-headless.sh` on dev-1 and dev-2 killed three live

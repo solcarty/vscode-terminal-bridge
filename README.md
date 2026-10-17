@@ -98,7 +98,7 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh rename <name> <label> [icon] [co
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh announce <status>                           # this window's own agent, not a tab
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh agents                                      # every live window — cwd-independent
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh worker --prompt-file=<path> [--permission-mode=<m>]
-bash ~/.vscode-terminal-bridge/bin/bridgectl.sh sweep
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh sweep [--dry-run]                             # --dry-run prints what would close
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh ping [--node=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status <status> [--name=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-output                                 # Stop hook: publish the turn's final text
@@ -1090,21 +1090,35 @@ Response:
 
 ### `GET /sweep`
 
-Cross-references all persisted terminals against ground truth
-(`git worktree list`) and disposes any whose `cwd` no longer corresponds to
-an existing worktree — falling back to a PID kill when no live terminal
-object can be found. Runs automatically a few seconds after the extension
-activates (catches leaks left over from a crash/restart), and can also be
-called on demand.
+Closes tracked terminals left behind in a removed worktree. It disposes the
+terminal, or kills its pid when no live terminal object can be found. A row is
+closed only when **all** of these hold (v0.33.3+, #87):
+
+- no git repo the bridge can see lists its `cwd` as a worktree. Repos are found
+  from every workspace folder, the sibling `<repo>` of any `<repo>-worktrees`
+  folder, and every tracked `cwd`, so worktrees of any repo count.
+- its `cwd` no longer exists on disk. A directory that still exists is never
+  swept, listed or not.
+- its shell has no running child process. A shell still running something, or
+  one whose children can't be read, is kept and logged.
+
+Every closed or kept row is logged with its reason. If no repo can be read at
+all, the sweep closes nothing.
+
+The bridge runs a **dry run** a few seconds after it starts. It logs what a
+sweep would close and closes nothing, so restarting the bridge never kills a
+worker. Only an explicit call closes anything.
 
 ```bash
 curl "http://127.0.0.1:${PORT}/sweep"
+curl "http://127.0.0.1:${PORT}/sweep?dryRun=1"   # decide, log and report; close nothing
 ```
 
 Response:
 
 ```json
 { "ok": true, "closed": ["task-a", "task-b"] }
+{ "ok": true, "dryRun": true, "closed": [], "wouldClose": ["task-a"] }
 ```
 
 ---
@@ -1549,7 +1563,7 @@ bash $BRIDGE forget task-42   # drops the row only — never touches a process
 
 Use `forget` when the process must survive (it's serving something, or you only want the registry tidied). Branch on `close`'s `outcome` field rather than its exit code — `closed`, `not-tracked` and `row-removed` are different facts.
 
-`sweep` disposes tracked terminals whose `cwd` no longer maps to a live git worktree. It is a **blunt instrument**: it reasons from worktree existence, not from what an agent is doing, so it will close a healthy tab whose worktree was removed underneath it. Prefer closing by name at the point you know the work is done.
+`sweep` disposes tracked terminals whose `cwd` has been removed from disk and is listed by no repo. It won't close a shell that is still running something, but it will close an idle shell whose worktree was removed underneath it. Prefer closing by name at the point you know the work is done. `sweep --dry-run` shows what it would close.
 
 ### Pattern 6: Headless work — no TUI to type into
 
@@ -1602,7 +1616,7 @@ It copies `bridge.js`, `headless.js` and `bin/` to `~/.vscode-terminal-bridge/he
 
 | Option | What it does |
 | --- | --- |
-| `--folder=<path>` | A workspace folder: gets `.vscode-bridge-port`, roots `/sweep`'s `git worktree list`, and is matched by `/api/status`'s `repo`. Repeatable. Also `VSCODE_BRIDGE_FOLDERS` (colon-separated). |
+| `--folder=<path>` | A workspace folder: gets `.vscode-bridge-port`, is one of the repos `/sweep` reads worktrees from, and is matched by `/api/status`'s `repo`. Repeatable. Also `VSCODE_BRIDGE_FOLDERS` (colon-separated). |
 | `--agent-id=<id>` | The [presence](#get-announce--get-apibridges) identity (`terminalBridge.agentId`'s counterpart). Falls back to the first folder's basename. |
 | `--socket=<name>` | The tmux socket (`tmux -L <name>`). Default `vscode-bridge`. Also `VSCODE_BRIDGE_TMUX_SOCKET`. |
 | `--pipeline-state-dir=<dir>` | `terminalBridge.pipelineStateDir`'s counterpart. |

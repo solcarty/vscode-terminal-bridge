@@ -1027,6 +1027,28 @@ bridge_hook_status() {
   fi
   if [ -z "$name" ]; then name="${PWD##*/}"; fi
 
+  # #82 — `SubagentStop → hook-status working` exists to put a turn back to
+  # `working` once its subagent returns. But Claude Code also fires SubagentStop
+  # for forks that run outside any turn: the prompt-suggestion fork lands ~1s
+  # AFTER the main Stop (agent_type "", no SubagentStart), and a background
+  # subagent can finish while a permission prompt is up. Writing `working` then
+  # was false, and worse, it armed a fresh turn-start mark, so the idle nudge
+  # 60s later was promoted back to `needs-input` by the #4589 guard below.
+  # A SubagentStop therefore only writes inside a turn that is still running
+  # (last tracked state working/subagent). Otherwise, including when nothing
+  # is tracked, it leaves status and the turn mark alone.
+  local event
+  event=$(printf '%s' "$payload" \
+    | sed -n 's/.*"hook_event_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  if [ "$event" = "SubagentStop" ]; then
+    local prev_state=""
+    IFS=$'\t' read -r prev_state _ < "$(_bridge_turn_state_dir)/$name" 2>/dev/null || true
+    case "$prev_state" in
+      working|subagent) : ;;
+      *) return 0 ;;
+    esac
+  fi
+
   # `needs-input` is the one status asserting a HUMAN IS REQUIRED — `send`/`nudge`
   # refuse on it, and an orchestrator reading `list` routes attention to it. But
   # Claude Code fires its `Notification` hook for two unrelated things: a real
@@ -1043,14 +1065,26 @@ bridge_hook_status() {
   # Fail-safe by construction — only the known idle phrasings are downgraded, so
   # an unrecognized or absent message still asserts `needs-input` and a real
   # permission prompt is never silently demoted.
+  #
+  # #82 — Claude Code now sends `notification_type` (`idle_prompt`,
+  # `permission_prompt`, ...). When it's there it decides alone: only
+  # `idle_prompt` is downgraded, and any other type stays `needs-input` even if
+  # the wording looks idle. The message match is the fallback for payloads
+  # without a type.
   if [ "$state" = "needs-input" ] && [ -n "$payload" ]; then
-    local msg
-    msg=$(printf '%s' "$payload" \
-      | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-    case "$msg" in
-      *[Ww]aiting\ for\ your\ input*|*[Ww]aiting\ for\ user\ input*|*[Hh]as\ been\ idle*)
-        state="idle" ;;
-    esac
+    local ntype msg
+    ntype=$(printf '%s' "$payload" \
+      | sed -n 's/.*"notification_type"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    if [ -n "$ntype" ]; then
+      [ "$ntype" = "idle_prompt" ] && state="idle"
+    else
+      msg=$(printf '%s' "$payload" \
+        | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      case "$msg" in
+        *[Ww]aiting\ for\ your\ input*|*[Ww]aiting\ for\ user\ input*|*[Hh]as\ been\ idle*)
+          state="idle" ;;
+      esac
+    fi
   fi
 
   # house.health#4589 — an `idle` Stop can't be trusted at face value; see the

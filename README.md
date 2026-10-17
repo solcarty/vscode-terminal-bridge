@@ -1197,8 +1197,9 @@ curl -s "http://127.0.0.1:${PORT}/rename-terminal?name=$N&status=working" \
 | Hook | When it fires | Recommended `status=` |
 | ---- | ------------- | --------------------- |
 | `PreToolUse` | Before every tool call | `working` |
-| `Notification` | Claude needs input (permission prompt, question) | `needs-input` |
+| `Notification` | Claude needs input (permission prompt, question) | `needs-input` — `hook-status` writes `idle` instead for the ~60 s "waiting for your input" nudge (`notification_type: "idle_prompt"`, or that wording when no type is sent); every other type stays `needs-input` |
 | `Stop` | Claude's turn is complete | `idle` — wire `hook-output` here too, see [read-back](#get-set-output--get-output--get-clear-output) |
+| `SubagentStop` | A subagent or fork finished | `working` — `hook-status` writes it only while the turn is still running (last state `working`/`subagent`); after `Stop` or during a `permission` prompt it writes nothing (v0.33.2+) |
 
 ### Recommended state scheme
 

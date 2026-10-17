@@ -219,7 +219,7 @@ Three, all per-window (set them in `.vscode/settings.json` for a workspace, or i
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `terminalBridge.agentId` | unset | Names the agent driving this window, for [presence](#get-announce--get-apibridges). Falls back to the workspace name VS Code shows in its title bar, then the first workspace folder's basename, then `null` — never fabricated. Set it when the folder name isn't the identity you want other windows to see. |
-| `terminalBridge.hostsCommand` | empty | A shell command (run with `/bin/sh -c` from your home directory) that prints the [All hosts](#the-all-hosts-view) JSON. Set: the *All hosts* view appears. Empty: no view, nothing runs. Use an absolute path if the command isn't on VS Code's `PATH`. |
+| `terminalBridge.hostsCommand` | empty | A shell command (run with `/bin/sh -c` from your home directory) that prints the [All hosts](#the-all-hosts-view) JSON. Set: the *All hosts* view appears. Empty: no view, nothing runs. Use an absolute path if the command isn't on VS Code's `PATH`. Machine-scoped (v0.33.5+): a Remote-SSH window reads the remote host's value, so a laptop path never runs on a dev host. |
 | `terminalBridge.pipelineStateDir` | `.sdo` | Directory, relative to the matched workspace folder, where [`/api/status`](#post-apistatus) appends `pipeline-state.json`. The default is a private consumer's convention kept for compatibility; point it somewhere of your own. |
 
 ## What the extension injects into every terminal it opens
@@ -1657,7 +1657,7 @@ Exactly the extension's: `~/.vscode-terminal-bridge/port`, `.vscode-bridge-port`
 
 The extension does **not** start a second bridge. On activation it looks for a live headless bridge — a presence entry with `"backend": "tmux"`, then `~/.vscode-terminal-bridge/port` — and asks it `/ping`. If one answers `backend: "tmux"`, the window becomes a viewer: no HTTP server, no registry of its own. Its Terminals panel lists the headless bridge's terminals (re-read every 3 seconds; the view's title reads `headless · <port>`), clicking a row opens a VS Code terminal running `tmux attach` on that session (a second click shows the same one), and it writes the headless port into its own workspace folders' `.vscode-bridge-port`. Every caller on the host talks to the one bridge.
 
-If nothing answers, the window serves as it always has. If the headless bridge stops answering later, the view's title says so; reload the window to serve locally.
+The probe waits up to 2 s per port and tries a silent port three times, 1 s apart (v0.33.5+), because a Remote-SSH extension host can stall its first local requests while it activates. A port that answers as a VS Code bridge is not retried. If nothing answers, the window serves as it always has. If the headless bridge stops answering later, the view's title says so; reload the window to serve locally.
 
 **Version skew is shown.** *v0.33.4+.* If the headless bridge's `/ping` `version` differs from the window's extension version, the window logs both once and the view's title adds them: `headless · 31415 · headless v0.33.4 ≠ window v0.33.3`. A headless bridge from before v0.33.4 reports no version and reads as `v?`.
 

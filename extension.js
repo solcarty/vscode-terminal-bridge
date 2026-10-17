@@ -94,7 +94,13 @@ function vscodeHost() {
 // a click attaches a VS Code terminal to the tmux session.
 // ---------------------------------------------------------------------------
 
-const PROBE_TIMEOUT_MS = 500;
+// A Remote-SSH extension host can take seconds to complete its first local
+// request while it is still activating extensions: dev-1 watched a 500 ms probe
+// miss a headless bridge that answered a plain curl in 1 ms, and the window
+// served on its own instead.  The probe is generous and retries, because a
+// miss costs a second bridge for the window's whole life; a hit costs nothing.
+const PROBE_TIMEOUT_MS = 2000;
+const PROBE_ATTEMPTS = 3;
 const VIEWER_POLL_MS = Number(process.env.VSCODE_BRIDGE_VIEWER_POLL_MS) || 3000;
 
 function getLocal(port, urlPath, timeoutMs = PROBE_TIMEOUT_MS) {
@@ -125,10 +131,21 @@ async function findHeadlessBridge() {
   } catch { /* no presence registry */ }
   try { ports.push(Number(fs.readFileSync(bridge.PORT_FALLBACK_PATH, 'utf8').trim())); } catch { /* no port file */ }
 
-  for (const port of [...new Set(ports)].filter(p => p > 0)) {
-    const ping = await getLocal(port, '/ping');
-    if (ping && ping.ok && ping.backend === 'tmux') return { ...ping, port };
+  // A port that answers as anything but tmux is settled. Only silence is
+  // retried: a slow extension host, or a headless bridge mid-restart.
+  let silent = [...new Set(ports)].filter(p => p > 0);
+  const retryMs = Number(process.env.VSCODE_BRIDGE_PROBE_RETRY_MS) || 1000;
+  for (let attempt = 1; attempt <= PROBE_ATTEMPTS && silent.length; attempt++) {
+    if (attempt > 1) await new Promise(r => setTimeout(r, retryMs));
+    const next = [];
+    for (const port of silent) {
+      const ping = await getLocal(port, '/ping');
+      if (ping && ping.ok && ping.backend === 'tmux') return { ...ping, port };
+      if (!ping) next.push(port);
+    }
+    silent = next;
   }
+  if (silent.length) console.warn(`[terminal-bridge] no answer from ${silent.join(', ')} after ${PROBE_ATTEMPTS} tries; serving locally`);
   return null;
 }
 

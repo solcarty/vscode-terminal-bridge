@@ -294,14 +294,6 @@ async function hasAgentChild(pid) {
   return cmds === null ? null : cmds.some(cmd => /claude/i.test(cmd));
 }
 
-// #87 — sweep's version of the same read: is ANY process running under this
-// shell? A worker whose directory vanished may still be mid-run, and the shell
-// alone can't say so. null = unknown, which sweep treats as "keep".
-async function hasLiveChild(pid) {
-  const cmds = await childCommands(pid);
-  return cmds === null ? null : cmds.length > 0;
-}
-
 // The commands of a pid's direct children: [] for none, null when unreadable.
 async function childCommands(pid) {
   if (!pid) return null;
@@ -854,7 +846,7 @@ async function pidContradicts(meta, terminal) {
 // #87 — fail closed per terminal. A row is swept only when ALL hold:
 //   - no repo the bridge can see lists its cwd as a worktree,
 //   - the cwd no longer exists on disk, and
-//   - its shell has no live child process (unknown counts as live).
+//   - its process is confirmed dead (#90: alive or unknown is kept).
 // Reading one repo's worktrees used to be the whole test, so every worker in
 // another repo's worktree was swept on each bridge start. A directory that
 // still exists is never swept: being unlisted proves nothing about whether
@@ -898,13 +890,13 @@ async function sweepTerminals(context, { dryRun = false } = {}) {
 
     const terminal = terminals.get(name) ?? host.terminals.find(t => t.name === name);
     const pid = await terminalPid(terminal, meta.pid);
-    if (isPidAlive(pid) === true) {
-      const busy = await hasLiveChild(pid);
-      if (busy !== false) {
-        console.log(`[terminal-bridge] ${tag} kept ${name}: cwd ${meta.cwd} is gone, but pid ${pid} ${
-          busy ? 'still has a running process' : 'could not be read'}`);
-        continue;
-      }
+    // #90 — a live process is never a leftover, whatever its cwd. Only a
+    // confirmed-dead pid is swept; an unresolvable one is unknown, not dead.
+    const alive = isPidAlive(pid);
+    if (alive !== false) {
+      console.log(`[terminal-bridge] ${tag} kept ${name}: cwd ${meta.cwd} is gone, but pid ${pid ?? 'unknown'} ${
+        alive ? 'is still alive' : 'could not be resolved'}`);
+      continue;
     }
 
     console.log(`[terminal-bridge] ${tag} ${dryRun ? 'would close' : 'closing'} ${name}: cwd ${meta.cwd} no longer exists and no repo lists it`);

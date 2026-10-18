@@ -27,10 +27,14 @@ const unlisted = path.join(root, 'unlisted');
 fs.mkdirSync(unlisted);
 const removed = path.join(root, 'B-worktrees', 'gone');
 const removedBusy = path.join(root, 'A-worktrees', 'gone-busy');
+const removedIdle = path.join(root, 'A-worktrees', 'gone-idle');
+const removedNoPid = path.join(root, 'A-worktrees', 'gone-nopid');
 
 // A pid that is certainly dead, and a shell that still runs a child.
 const deadPid = spawnSync('true').pid;
 const busyShell = spawn('bash', ['-c', 'sleep 30; :'], { stdio: 'ignore' });
+// #90 — a live process with no children at all (an idle shell at its prompt).
+const idleShell = spawn('sleep', ['30'], { stdio: 'ignore' });
 
 h.vscodeMock.workspace.workspaceFolders = [path.join(root, 'A'), path.join(root, 'B-worktrees')]
   .map(fsPath => ({ uri: { fsPath } }));
@@ -42,6 +46,8 @@ h.state.set(KEY, {
   'unlisted':  { cwd: unlisted, status: 'working' },
   'gone':      { cwd: removed, status: 'idle', pid: deadPid },
   'gone-busy': { cwd: removedBusy, status: 'working', pid: busyShell.pid },
+  'gone-idle': { cwd: removedIdle, status: 'idle', pid: idleShell.pid },
+  'gone-nopid': { cwd: removedNoPid, status: 'idle' },
 });
 for (const [name, pid] of [['repo-a', deadPid], ['repo-b', deadPid], ['unlisted', deadPid], ['gone', deadPid]]) {
   h.addTerminal(h.makeTerminal(name, pid));
@@ -71,12 +77,12 @@ const sorted = a => [...a].sort().join(',');
   // The startup sweep fires at 2.5s. Let it run, then confirm it closed nothing.
   await wait(3500);
   check(h.disposed.length === 0, `startup sweep disposes nothing (disposed: ${h.disposed.join(',') || 'none'})`);
-  check(Object.keys(h.state.get(KEY)).length === 5, 'startup sweep drops no registry row');
+  check(Object.keys(h.state.get(KEY)).length === 7, 'startup sweep drops no registry row');
 
   const dry = await get(port, '/sweep?dryRun=1');
   check(dry.dryRun === true && sorted(dry.wouldClose) === 'gone',
     `dry run would close only the removed dir (got ${JSON.stringify(dry.wouldClose)})`);
-  check(h.disposed.length === 0 && Object.keys(h.state.get(KEY)).length === 5, 'dry run closes nothing');
+  check(h.disposed.length === 0 && Object.keys(h.state.get(KEY)).length === 7, 'dry run closes nothing');
 
   const real = await get(port, '/sweep');
   check(sorted(real.closed) === 'gone', `sweep closes only the removed dir (got ${JSON.stringify(real.closed)})`);
@@ -86,9 +92,12 @@ const sorted = a => [...a].sort().join(',');
   check(!!rows['repo-a'], "a worktree of the first folder's repo is kept");
   check(!!rows['unlisted'], 'a cwd that exists but no repo lists is kept');
   check(!!rows['gone-busy'], 'a removed cwd whose shell still runs a process is kept');
-  check(isAlive(busyShell.pid), 'the busy shell was not signalled');
+  check(!!rows['gone-idle'], '#90: a removed cwd whose process is alive but idle is kept');
+  check(!!rows['gone-nopid'], '#90: a removed cwd whose pid is unknown is kept (unknown is not dead)');
+  check(isAlive(busyShell.pid) && isAlive(idleShell.pid), 'live processes were not signalled');
 
   busyShell.kill('SIGKILL');
+  idleShell.kill('SIGKILL');
   fs.rmSync(root, { recursive: true, force: true });
   console.log(failed ? `\n${failed} check(s) failed` : '\nall checks passed');
   process.exit(failed ? 1 : 0);

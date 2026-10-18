@@ -499,7 +499,7 @@ Three changes, each enough on its own to have saved those workers:
   sibling repo of a `<repo>-worktrees` folder, and every tracked cwd to its repo with
   `git rev-parse --git-common-dir`. It dedupes by that dir and lists each repo once.
 - **Fail closed per terminal.** Being unlisted is no longer enough. The cwd must also be gone from
-  disk, and the shell must have no running child (`hasLiveChild`; unknown counts as running). A
+  disk, and the shell must have no running child (`hasLiveChild`; unknown counts as running; #90 below tightened this to any live pid). A
   directory that exists proves nothing about whether someone works in it, so it is never swept.
 - **The startup sweep is a dry run**, on both backends. It logs what it would close. Only an
   explicit `/sweep` closes anything, and `/sweep?dryRun=1` reports the same decision. A restart is
@@ -514,6 +514,22 @@ any child process keeps the row.
 
 `test/sweep-multi-repo.test.js` pins it with two real repos. Against the old code it reproduces the
 incident: everything outside the first folder's repo was swept, the busy shell included.
+
+### A live pid is never swept (#90, v0.33.6+)
+
+The watcher restarted on 2026-10-18 and swept `watch-factory` and `feature-dispatch`, both live loops in
+the main checkout of a `--folder` repo, before v0.33.3's fixes reached it: the old sweep read only
+`workspaceFolders()[0]`'s worktrees and closed anything unlisted. On main that exact case is already
+safe (startup is a dry run; an existing cwd is never swept; `parseWorktrees()` lists a repo's main
+checkout as the first `git worktree list` entry, and every `--folder` repo is read). What was left was
+the issue's first requirement taken literally: an idle live shell in a removed directory, or a row whose
+pid couldn't be resolved, could still be closed by an explicit `/sweep`. Now only a confirmed-dead pid
+is swept (`isPidAlive(pid) === false`), the same fail-closed rule as `pidAlive`; alive and unknown are
+kept and logged. `hasLiveChild` had no other caller and was removed. Cost: an idle shell left in a
+removed worktree needs `close <name>`. `/sweep` is for crash leftovers, not tidying.
+
+Rollout for 0.33.6 is the same as for any headless release: this PR's description has the per-host commands.
+Deliberately untouched: port-file shutdown cleanup (#91), a separate bug in the same area.
 
 ## Key endpoints
 

@@ -1101,8 +1101,9 @@ closed only when **all** of these hold (v0.33.3+, #87):
   folder, and every tracked `cwd`, so worktrees of any repo count.
 - its `cwd` no longer exists on disk. A directory that still exists is never
   swept, listed or not.
-- its shell has no running child process. A shell still running something, or
-  one whose children can't be read, is kept and logged.
+- its process is confirmed dead (v0.33.6+, #90). A tab whose pid is alive is kept
+  whatever it is running, idle shell included, and so is one whose pid can't be
+  resolved: unknown is not dead. Each kept row is logged with its reason.
 
 Every closed or kept row is logged with its reason. If no repo can be read at
 all, the sweep closes nothing.
@@ -1565,7 +1566,7 @@ bash $BRIDGE forget task-42   # drops the row only — never touches a process
 
 Use `forget` when the process must survive (it's serving something, or you only want the registry tidied). Branch on `close`'s `outcome` field rather than its exit code — `closed`, `not-tracked` and `row-removed` are different facts.
 
-`sweep` disposes tracked terminals whose `cwd` has been removed from disk and is listed by no repo. It won't close a shell that is still running something, but it will close an idle shell whose worktree was removed underneath it. Prefer closing by name at the point you know the work is done. `sweep --dry-run` shows what it would close.
+`sweep` disposes tracked terminals whose `cwd` has been removed from disk and is listed by no repo. It only closes a terminal whose process is confirmed dead; a live shell is kept even when its worktree was removed underneath it, so close those by name. Prefer closing by name at the point you know the work is done. `sweep --dry-run` shows what it would close.
 
 ### Pattern 6: Headless work — no TUI to type into
 

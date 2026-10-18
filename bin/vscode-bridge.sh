@@ -112,6 +112,13 @@ _bridge_active() {
   # while the server is running perfectly well. cwd is not evidence about
   # whether a local HTTP server exists.
   [ -f "$HOME/.vscode-terminal-bridge/port" ] && return 0
+  # No file anywhere (#91): a restarting bridge can briefly leave none, or a
+  # bridge on an older version removed them, while the server answers fine.
+  # Files are discovery hints, not proof of absence, so ask the port we would
+  # resolve anyway (the default 31415 when nothing pins another).
+  case "$(curl -sf -m 1 "http://127.0.0.1:$(_bridge_port)/ping" 2>/dev/null)" in
+    *'"ok":true'*|*'"ok": true'*) return 0 ;;
+  esac
   return 1
 }
 

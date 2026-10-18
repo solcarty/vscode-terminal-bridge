@@ -60,10 +60,23 @@ const PORT_FALLBACK_PATH = path.join(PORT_FALLBACK_DIR, 'port');
 // Every workspace folder gets `.vscode-bridge-port`, the walk-up discovery
 // path. Module level because a window that defers to a headless bridge (#77)
 // writes the headless port into its own folders without serving anything.
-function writePortFiles(folders, port) {
+//
+// #91 — `stamps`, when given, records which file this caller wrote (inode and
+// mtime in ns). The port is not an identity: a restarted headless bridge binds
+// the same port as the instance it replaces, so "the file holds my port" can't
+// tell the old instance's files from the new one's. Shutdown removes a file
+// only while its stamp is still the one recorded here.
+function stampOf(p) {
+  try { const st = fs.statSync(p, { bigint: true }); return `${st.ino}:${st.mtimeNs}`; } catch { return null; }
+}
+
+function writePortFiles(folders, port, stamps) {
+  const wrote = p => { if (stamps) { const st = stampOf(p); if (st) stamps.set(p, st); } };
   for (const folder of folders) {
     try {
-      fs.writeFileSync(path.join(folder, '.vscode-bridge-port'), String(port), 'utf8');
+      const p = path.join(folder, '.vscode-bridge-port');
+      fs.writeFileSync(p, String(port), 'utf8');
+      wrote(p);
     } catch { /* ignore read-only folders */ }
   }
   // User-level fallback, so callers whose cwd sits outside every workspace
@@ -75,6 +88,7 @@ function writePortFiles(folders, port) {
   try {
     fs.mkdirSync(PORT_FALLBACK_DIR, { recursive: true });
     fs.writeFileSync(PORT_FALLBACK_PATH, String(port), 'utf8');
+    wrote(PORT_FALLBACK_PATH);
   } catch { /* non-fatal — workspace port files remain the primary path */ }
 }
 
@@ -2590,11 +2604,17 @@ function startBridge(bridgeHost, context) {
   // host, another window), and deleting its file leaves it undiscoverable.
   const readPort = p => { try { return fs.readFileSync(p, 'utf8').trim(); } catch { return null; } };
 
+  // #91 — and only a file this instance wrote and nobody has rewritten since.
+  // The port alone can't say: a restarted headless bridge listens on the same
+  // one, and the old instance's cleanup deleted the files its replacement had
+  // just written.
+  const portStamps = new Map();
+
   function removePortFiles() {
     const own = String(activePort);
-    for (const p of [...host.workspaceFolders().map(f => path.join(f, '.vscode-bridge-port')), PORT_FALLBACK_PATH]) {
+    for (const p of [...portStamps.keys()]) {
       try {
-        if (readPort(p) === own) fs.unlinkSync(p);
+        if (readPort(p) === own && stampOf(p) === portStamps.get(p)) fs.unlinkSync(p);
       } catch { /* ignore */ }
     }
   }
@@ -2612,7 +2632,7 @@ function startBridge(bridgeHost, context) {
     for (const p of [...folderFiles, PORT_FALLBACK_PATH]) {
       if (readPort(p) !== own) repaired.push(p);
     }
-    if (repaired.length) writePortFiles(host.workspaceFolders(), activePort);
+    if (repaired.length) writePortFiles(host.workspaceFolders(), activePort, portStamps);
     let entry = null;
     try { entry = JSON.parse(fs.readFileSync(bridgeEntryPath(), 'utf8')); } catch { /* missing or unreadable */ }
     if (!entry || String(entry.port) !== own) {
@@ -2633,7 +2653,7 @@ function startBridge(bridgeHost, context) {
   // Re-write port files when the workspace changes (e.g. /add-folder adds a worktree folder)
   context.subscriptions.push(
     host.onDidChangeWorkspaceFolders(() => {
-      writePortFiles(host.workspaceFolders(), activePort);
+      writePortFiles(host.workspaceFolders(), activePort, portStamps);
       writeBridgeRegistry(activePort);
     })
   );
@@ -2655,7 +2675,7 @@ function startBridge(bridgeHost, context) {
     activePort = server.address().port;
     console.log(`[terminal-bridge] listening on 127.0.0.1:${activePort}`);
     listening = true;
-    writePortFiles(host.workspaceFolders(), activePort);
+    writePortFiles(host.workspaceFolders(), activePort, portStamps);
     writeBridgeRegistry(activePort);
   });
 

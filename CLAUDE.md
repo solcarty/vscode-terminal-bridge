@@ -531,6 +531,29 @@ removed worktree needs `close <name>`. `/sweep` is for crash leftovers, not tidy
 Rollout for 0.33.6 is the same as for any headless release: this PR's description has the per-host commands.
 Deliberately untouched: port-file shutdown cleanup (#91), a separate bug in the same area.
 
+### Port-file ownership is a write stamp, not the port (#91, v0.33.7+)
+
+#83's "remove a file only if it holds my port" assumed distinct bridges use distinct ports. A restarted
+headless bridge binds the same port (31415) as the instance it replaces, so on 2026-10-18 the old
+instance's shutdown deleted the files the new one had just written, `bridgectl` read `bridge-unreachable`,
+and both factory supervisors crash-looped for 35 minutes (`ExecStop=bridgectl close` failed too).
+
+Each instance now keeps an in-memory map of the files it wrote, with each file's inode and mtime in ns
+(`writePortFiles(..., stamps)`, taken right after the write), and shutdown unlinks a file only when its
+stamp still matches and it still holds the port. Rejected: a pid/id inside the file, because callers
+`cat` it as a bare port; a sidecar `.owner` file, which litters every workspace and git status. A stamp
+costs nothing on disk. A rewrite by another instance changes the mtime even with identical content.
+Side effect: removal covers every file this instance wrote, including a folder since removed from the
+workspace, instead of only the current folders.
+
+Second half: `_bridge_active` returned "no bridge" when every port file was gone, though the port
+answered. Files are discovery hints, not evidence of absence, so with no file it now asks `/ping` on the
+port it would resolve anyway (1 s, default 31415) and only then gives up. Cost: one curl per call when
+no bridge exists anywhere, only on the path that used to return 1 immediately.
+
+Deliberately not changed: the startup race itself (old instance still alive while the new one writes).
+The stamp makes its outcome harmless; the headless repair timer (#83) also re-writes missing files.
+
 ## Key endpoints
 
 All endpoints are GET with query-string params (not POST/JSON — see `bridge.js`).

@@ -1652,7 +1652,7 @@ Exactly the extension's: `~/.vscode-terminal-bridge/port`, `.vscode-bridge-port`
 
 **It repairs them.** *v0.33.4+ ([#83](https://github.com/solcarty/vscode-terminal-bridge/issues/83)).* Every 30 seconds (`VSCODE_BRIDGE_REPAIR_MS`) the headless bridge checks each folder's `.vscode-bridge-port`, `~/.vscode-terminal-bridge/port` and its presence entry, and rewrites any that is missing or names another port. Each repair logs one line naming the files it rewrote. A healthy check logs nothing. It is the one bridge on its host, so another window's port in one of these files is wrong by definition.
 
-**A bridge removes only its own port files.** *v0.33.4+.* On a clean shutdown the extension and the headless bridge unlink a `.vscode-bridge-port` or `~/.vscode-terminal-bridge/port` only if it still holds their own port. Before v0.33.4, any window closing removed them whatever they held, so an older window on a headless host left the headless bridge running but unreachable.
+**A bridge removes only its own port files.** *v0.33.4+.* On a clean shutdown the extension and the headless bridge unlink a `.vscode-bridge-port` or `~/.vscode-terminal-bridge/port` only if they wrote it and it hasn't been rewritten since (v0.33.7+, #91; v0.33.4 compared the port alone, which can't tell a restarted bridge's files from the old instance's, since both use the same port). Before v0.33.4, any window closing removed them whatever they held, so an older window on a headless host left the headless bridge running but unreachable.
 
 ### Opening a VS Code window on a host that runs headless
 

@@ -42,6 +42,7 @@ case "$sub" in
   bg-task) bridge_bg_task "$@" ;;
   note)    bridge_note    "$@" ;;
   pr)      bridge_pr      "$@" ;;
+  stage)   bridge_stage   "$@" ;;
   announce) bridge_announce "$@" ;;
   agents)   bridge_agents   "$@" ;;
   output)  bridge_output  "$@" ;;
@@ -58,7 +59,7 @@ case "$sub" in
     fi
     ;;
   *)
-    echo "usage: bridgectl.sh {open|close|forget|repaint|send|nudge|status|rename|sweep|list|ping|hook-status|hook-output|bg-task|note|output|pr|announce|agents|scaffold|worker} [args...]" >&2
+    echo "usage: bridgectl.sh {open|close|forget|repaint|send|nudge|status|rename|sweep|list|ping|hook-status|hook-output|bg-task|note|output|pr|stage|announce|agents|scaffold|worker} [args...]" >&2
     echo "       bridgectl.sh open <name> <cwd> [cmd] [icon] [color] [--node=<name>] [--ref=<ref>] [--cmd-file=<path>]" >&2
     echo "       bridgectl.sh send <name> <text>|--text-file=<path> [--no-submit] [--force] [--mode=auto|paste|literal|join] [--submit-delay=<ms>]" >&2
     echo "         (send refuses when the target sits at an interactive prompt — injected text would answer it. --force overrides.)" >&2
@@ -72,6 +73,7 @@ case "$sub" in
     echo "       bridgectl.sh note set <text>|--text-file=<path> [--name=<name>]   # publish a handoff for an orchestrator to read" >&2
     echo "       bridgectl.sh note get [<name>] | note clear [--name=<name>]" >&2
     echo "       bridgectl.sh pr <name> <url>   # records a PR url on the terminal record (advisory, last write wins)" >&2
+    echo "       bridgectl.sh stage <name> <key> [--detail <text>] | stage <name> --clear   # consumer-defined stage (exit 4: bridge older than v0.34.0, ignorable)" >&2
     echo "       bridgectl.sh announce <status>   # self-reported presence status for this window's main agent" >&2
     echo "       bridgectl.sh agents   # list every live window's presence-registry entry, any cwd, no bridge required" >&2
     echo "       bridgectl.sh bg-task {start|end|clear} [--name=<name>]   # outstanding background work — a dimension of its own, not a status" >&2

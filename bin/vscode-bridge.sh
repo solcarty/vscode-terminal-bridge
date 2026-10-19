@@ -744,6 +744,46 @@ bridge_pr() {
     "http://127.0.0.1:${port}/set-pr" >/dev/null 2>&1 || true
 }
 
+# bridge_stage <name> <key> [--detail <text>] | bridge_stage <name> --clear
+#
+# Sets a consumer-defined stage on a tracked terminal (bridge v0.34.0+).
+# The bridge ships no stages: the ordered list is `terminalBridge.stages` (or
+# the headless config file), and a key outside it is stored and shown anyway.
+#
+# Exit codes: 0 set/cleared (or bridge unreachable: silent no-op like pr/status),
+# 1 the bridge refused (unknown terminal), 2 usage, and 4 when the running
+# bridge is older than v0.34.0 and does not know the route. A consumer that may
+# meet an older bridge should treat 4 — and 2 from an older bridgectl that has
+# no `stage` verb — as ignorable.
+bridge_stage() {
+  local name="" key="" detail="" clear=0 have_detail=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --clear)     clear=1 ;;
+      --detail=*)  detail="${1#--detail=}"; have_detail=1 ;;
+      --detail)    shift; detail="${1:-}"; have_detail=1 ;;
+      *)           if [ -z "$name" ]; then name="$1"; elif [ -z "$key" ]; then key="$1"; else name=""; break; fi ;;
+    esac
+    shift || true
+  done
+  if [ -z "$name" ] || { [ "$clear" = 0 ] && [ -z "$key" ]; } || { [ "$clear" = 1 ] && { [ -n "$key" ] || [ "$have_detail" = 1 ]; }; }; then
+    echo "usage: bridgectl.sh stage <name> <key> [--detail <text>] | stage <name> --clear" >&2
+    return 2
+  fi
+  _bridge_active || return 0
+  local port out
+  port=$(_bridge_port)
+  set -- --data-urlencode "name=$name"
+  if [ "$clear" = 1 ]; then set -- "$@" --data-urlencode "clear=1"; else set -- "$@" --data-urlencode "key=$key"; fi
+  [ "$have_detail" = 1 ] && set -- "$@" --data-urlencode "detail=$detail"
+  out=$(curl -sS -m 2 --get "$@" "http://127.0.0.1:${port}/set-stage" 2>/dev/null) || return 0
+  case "$out" in
+    '{'*) echo "$out" ;;
+    *)    echo '{"ok":false,"reason":"unsupported-by-bridge"}'; return 4 ;;
+  esac
+  case "$out" in *'"ok":true'*) return 0 ;; *) return 1 ;; esac
+}
+
 # bridge_announce <status> — self-reported presence status for THIS window's
 # main agent (bridge v0.27.0+, #55). The main agent is not one of the
 # bridge-managed terminals — it's the session driving them — so it can't be

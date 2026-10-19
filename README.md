@@ -94,6 +94,7 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note set <text>|--text-file=<pat
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh note get <name>                             # read one back
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh output <name> [--n=<1..3>]                  # read back what it last said
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh pr <name> <url>                             # record a PR url (advisory, last write wins)
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh stage <name> <key> [--detail <text>]         # consumer-defined stage (v0.34.0+); stage <name> --clear removes it
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh rename <name> <label> [icon] [color]   # registry only — the tab keeps its open-time title
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh announce <status>                           # this window's own agent, not a tab
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh agents                                      # every live window — cwd-independent
@@ -152,9 +153,9 @@ One row per tracked terminal whose tab is still open:
 | Part | What it shows |
 | ---- | ------------- |
 | Label | The terminal's name |
-| Description | The caller's progress text: the `rename` label minus the name (`rename feat-12 "feat-12 8/1/9 next 16:10"` shows `8/1/9 next 16:10`). With no progress text, the first line of the [note](#get-set-note--get-note--get-clear-note). |
-| Icon | The status codicon and color from the [status table](#status-values), for the row's `displayStatus` (so outstanding background work shows `bg-task` unless a person is needed) |
-| Tooltip | Status and how long it has been in it, the note, `cmdDelivery`, the PR URL when set, `node` when set |
+| Description | With a [stage](#get-set-stage) set: `<stage label> · <i>/<n>[ · <detail>]` (an unlisted key shows as plain text). Otherwise the caller's progress text: the `rename` label minus the name (`rename feat-12 "feat-12 8/1/9 next 16:10"` shows `8/1/9 next 16:10`). With no progress text, the first line of the [note](#get-set-note--get-note--get-clear-note). |
+| Icon | The status codicon and color from the [status table](#status-values), for the row's `displayStatus` (so outstanding background work shows `bg-task` unless a person is needed). With a stage set, the stage's codicon in the status's color; `needs-input`, `permission` and `error` keep their own icon, because a person is needed. |
+| Tooltip | With a stage set, the configured stages as a list first: `✓` done (before the current one, or a `terminal` stage), `▸` current with how long it has been there, `○` the rest. Then status and how long it has been in it, the note, `cmdDelivery`, the PR URL when set, `node` when set |
 | Click | Shows that terminal |
 
 **Order:** rows that need a person first (`needs-input`, `permission`, `error`), then `working`, then the rest. Within each group the newest terminal (by `createdAt`) comes first. Grouping uses the raw `status`, so a `working` terminal with a background task still sorts with `working`.
@@ -214,12 +215,13 @@ Only stdout is read. The exit status is ignored, so a command may exit non-zero 
 
 ## Settings
 
-Three, all per-window (set them in `.vscode/settings.json` for a workspace, or in user settings):
+Four, all per-window (set them in `.vscode/settings.json` for a workspace, or in user settings):
 
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `terminalBridge.agentId` | unset | Names the agent driving this window, for [presence](#get-announce--get-apibridges). Falls back to the workspace name VS Code shows in its title bar, then the first workspace folder's basename, then `null` — never fabricated. Set it when the folder name isn't the identity you want other windows to see. |
 | `terminalBridge.hostsCommand` | empty | A shell command (run with `/bin/sh -c` from your home directory) that prints the [All hosts](#the-all-hosts-view) JSON. Set: the *All hosts* view appears. Empty: no view, nothing runs. Use an absolute path if the command isn't on VS Code's `PATH`. Machine-scoped (v0.33.5+): a Remote-SSH window reads the remote host's value, so a laptop path never runs on a dev host. |
+| `terminalBridge.stages` | `[]` | Ordered `{ key, label, codicon, terminal? }` entries a consumer can put a terminal in with [`bridgectl stage`](#get-set-stage). The bridge ships none. The headless bridge reads the same array from the `stages` key of `~/.vscode-terminal-bridge/config.json` (`--config <path>` or `VSCODE_BRIDGE_CONFIG` to move it), re-read on every `/list`, so editing it needs no restart. |
 | `terminalBridge.pipelineStateDir` | `.sdo` | Directory, relative to the matched workspace folder, where [`/api/status`](#post-apistatus) appends `pipeline-state.json`. The default is a private consumer's convention kept for compatibility; point it somewhere of your own. |
 
 ## What the extension injects into every terminal it opens
@@ -467,6 +469,7 @@ Status alone answers "what state is this in". The question an orchestrator actua
 | `bgTaskStartedAt` | `pendingTasks` goes from 0 to 1 (v0.21.0+). Cleared when the count returns to 0, so it can't outlive the work it described. |
 | `lastOutputAt` | A Stop hook publishes the turn's final assistant text (v0.23.0+). Bodies come from [`/output`](#get-set-output--get-output--get-clear-output), never from `/list`. |
 | `noteUpdatedAt` | A worker publishes a note via `/set-note` (v0.22.0+). The **body is not in `/list`** — fetch it from [`/note`](#get-set-note--get-note--get-clear-note) for the entries whose timestamp moved. |
+| `stageChangedAt` | A caller sets a [stage](#get-set-stage) with a different key (v0.34.0+). Same key again only updates `stageDetail`. `stage` / `stageDetail` are `null` when none is set; the response also carries the configured `stages`. |
 | `prSetAt` | A caller sets `prUrl` via [`/set-pr`](#get-set-pr) (v0.25.0+). Last write wins. |
 
 `pendingTasks` / `bgTask` / `displayStatus` carry the background-work dimension — see [`/bg-task`](#get-bg-task) for why that is separate from `status`. `status` remains the raw turn state; `displayStatus` is what the tab renders.
@@ -1087,6 +1090,28 @@ Response:
 `list` reports it back as `prUrl` / `prSetAt`, `null` on rows where it was never set. Idempotent by name: a second call with a different url overwrites (last write wins), same as every other field on the record — no dedicated version-check machinery.
 
 **This is advisory, not a GitHub client.** The bridge does not poll, does not hold a token, and never asserts the PR is still open — `prUrl` may point at something already merged, closed, or force-pushed since it was set. Whoever needs the PR's live state checks it independently; the bridge only remembers what it was told. Unknown `name` → `404`; missing `url` → `400`.
+
+---
+
+### `GET /set-stage`
+
+A consumer-defined step for a long multi-step process (v0.34.0+). The turn status says whether the agent is working or idle; a stage says *which step* — waiting on CI and waiting on review are both `idle`.
+
+```bash
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh stage my-tab review --detail "PR 42"
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh stage my-tab --clear
+# or: curl "http://127.0.0.1:${PORT}/set-stage?name=my-tab&key=review&detail=PR%2042"   (clear=1 instead of key=)
+```
+
+```json
+{ "ok": true, "name": "my-tab", "stage": "review", "stageDetail": "PR 42", "stageChangedAt": "2026-10-19T09:00:00.000Z" }
+```
+
+**Stages are config, not code.** Define them in `terminalBridge.stages` (or the headless config file; see [Settings](#settings)): an ordered array of `{ "key", "label", "codicon", "terminal"? }`. The bridge ships none. A key that isn't listed is still stored and shown as text with a neutral icon, never an error. `terminal: true` marks a final stage (e.g. `merged`), shown as done.
+
+`/list` returns `stage`, `stageDetail` and `stageChangedAt` on each row (`null` when unset), and the configured list as a top-level `stages`, so a window deferring to a headless bridge draws the same steps. Setting the same key again updates the detail and leaves `stageChangedAt` alone, so "for <age>" stays true. Unknown `name` → `404`; missing `key` without `clear=1` → `400`. A consumer that never calls it sees no change in the panel.
+
+**Exit codes of `bridgectl stage`:** `0` set or cleared (also when no bridge is reachable, like `pr`/`status`); `1` the bridge refused (unknown terminal); `2` usage; `4` the running bridge is older than v0.34.0 and does not know the route (stdout: `{"ok":false,"reason":"unsupported-by-bridge"}`). A consumer that may meet an older install should ignore `4`, and also `2` from an older `bridgectl` that has no `stage` verb.
 
 ---
 

@@ -199,6 +199,33 @@ It degrades to silence, never an error: nothing published reads as an empty list
 
 That's the whole feature. The bridge does not poll GitHub, does not know a token, and does not assert the PR is still open — treat the value as advisory: it may have been merged, closed, or force-pushed since it was set. Whoever needs the PR's actual current state polls it themselves, outside the bridge, the same way background-job status and note bodies are left to the caller.
 
+## A stage is the consumer's step, not the bridge's (v0.34.0+)
+
+The panel icon showed only turn state, so a consumer running a long multi-step process couldn't say
+which step it was on: waiting on CI, waiting on review and finished all read `idle`. The note is the
+only other channel and is overwritten by whatever writes last.
+
+`stage` / `stageDetail` / `stageChangedAt` sit next to `note` in the registry, written by `/set-stage`
+(`bridgectl stage <name> <key> [--detail <text>] | --clear`) and returned by `/list`. Decisions worth knowing:
+
+- **The bridge ships no stages.** The ordered list is config (`terminalBridge.stages`; the headless
+  bridge reads the `stages` key of `~/.vscode-terminal-bridge/config.json`, re-read per `/list` so an
+  edit needs no restart and no tmux-session-killing bridge restart). A bridge that named stages would
+  be coupled to one consumer's process.
+- **An unlisted key is stored and shown as text with a neutral icon, never rejected.** A consumer
+  should be able to run ahead of its config; a refusal would strand the call under `set -e`.
+- **The configured list rides on `/list`** (`stages`), so a window deferring to a headless bridge (#77)
+  draws the headless host's steps, not its own setting.
+- **`stageChangedAt` moves only on a change of key**, the same rule as `statusChangedAt`: re-announcing
+  a stage with a new detail must not reset "for <age>".
+- **Attention states still win the icon.** `needs-input`, `permission` and `error` keep their own icon
+  over the stage's, because a person is needed; the stage's colour is the turn status's, so the row
+  still says working or idle. The description keeps showing the stage either way.
+- **An older bridge answers an unknown route with a bare `Not found`**, which the CLI maps to exit 4
+  (`unsupported-by-bridge`). An older `bridgectl` has no verb and exits 2 (usage). Both are documented
+  as ignorable for a consumer that may meet an older install.
+- The All hosts view passes no stages, so its rows are unchanged; a stage there is future work.
+
 ## Env var names: expand/contract off `HH_` (#57, v0.27.0+)
 
 Every terminal `/open-terminal` spawns gets `VSCODE_BRIDGE_ORCHESTRATOR_ID` and `VSCODE_BRIDGE_STATUS_URL` exported into it now, matching the `VSCODE_BRIDGE_PORT` prefix the extension already used. They used to be `HH_ORCHESTRATOR_ID` / `HH_BRIDGE_STATUS_URL` — named after `house.health`, one private consumer, even though every hook and script that talks to the bridge reads them. That's a naming leak in a general-purpose extension's public contract, not a behavior change, which is why this is expand/contract rather than a rename in place: **this release exports both old and new names side by side.** Nothing that reads either name breaks.

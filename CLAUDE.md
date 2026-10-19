@@ -693,6 +693,8 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open llm-gen /any/local/path \
 
 Why the bump lives in the PR rather than in a release job that bumps and commits: a workflow that pushes to `main` races every other merge and needs a token that can bypass branch protection. The PR's author also knows whether the change is a fix or new behaviour; a workflow would have to guess. Before this, releases happened only when someone ran `.claude/commands/release.md` by hand, so `main` reached 0.28.1 while the latest release was still v0.27.0, and #71 documented itself as v0.29.0 without ever bumping. The first automated release shipped all of that as v0.29.0.
 
+**Main is checked against the last tag too.** `version-check.yml` only sees a PR's diff, so it can't catch shipped code that reached `main` without a bump, and `release.yml` treats an already-released version as a no-op. That is how the #67 Stop-hook fix sat on `main` while installed copies stayed on `0.28.0`: nothing failed. `release.yml` now runs `version-check.js --since-tag` on every push, which diffs the highest `v*` tag against `HEAD` and goes red when shipped files changed and the version didn't move. It reports; it never bumps or tags, for the reason above.
+
 One recovery case is handled: a run that pushed the tag and then failed is finished by a re-run, as long as the tag still points at the commit being built. A tag at some other commit with no release is left alone with a warning, because packaging `HEAD` under it would publish code the tag doesn't contain. `.claude/commands/release.md` is the manual backup for that and for a workflow outage.
 
 To build a VSIX locally: `npx @vscode/vsce package --skip-license`. Install in VS Code: `Extensions → ... → Install from VSIX`.

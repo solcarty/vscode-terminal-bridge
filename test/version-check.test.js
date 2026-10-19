@@ -51,5 +51,30 @@ check('*.md does not match a nested md (vsce ships it)', vc.isShipped('bin/NOTES
 check('docs/** matches deep files', !vc.isShipped('docs/a/b.txt', rules));
 check('a later ! pattern re-includes', vc.isShipped('docs/keep.js', rules));
 
+// --since-tag: main drifting from the last tag, driven through the real CLI.
+{
+  const { execFileSync, spawnSync } = require('child_process');
+  const os = require('os');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vc-since-'));
+  const git = (...a) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { cwd: dir, encoding: 'utf8' });
+  const cli = () => spawnSync('node', [path.join(__dirname, '..', '.github', 'scripts', 'version-check.js'), '--since-tag'], { cwd: dir, encoding: 'utf8' });
+  const write = (f, v) => { fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true }); fs.writeFileSync(path.join(dir, f), v); };
+  const commit = m => { git('add', '-A'); git('commit', '-qm', m); };
+  git('init', '-q');
+  write('.vscodeignore', ignoreText);
+  write('package.json', JSON.stringify({ version: '0.1.0' }));
+  write('extension.js', '1');
+  commit('init'); git('tag', 'v0.1.0');
+  check('--since-tag: at the tag passes', cli().status === 0);
+  write('README.md', 'x'); commit('docs');
+  check('--since-tag: docs-only drift passes', cli().status === 0);
+  write('bin/vscode-bridge.sh', 'fix'); commit('fix without bump');
+  const drift = cli();
+  check('--since-tag: shipped change since the tag with no bump fails', drift.status === 1, drift.stdout);
+  write('package.json', JSON.stringify({ version: '0.1.1' })); commit('bump');
+  check('--since-tag: bumped past the tag passes', cli().status === 0);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
 console.log(fails ? `\n${fails} failure(s)` : '\nall green');
 process.exit(fails ? 1 : 0);

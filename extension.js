@@ -156,11 +156,13 @@ function startViewer(context, headless, panel) {
 
   const attached = new Map();   // name → the VS Code terminal attached to its session
   let rows = {};
+  let stages = [];
   let failing = false;
 
   const viewer = {
     port: headless.port,
     get metadata() { return rows; },
+    get stages() { return stages; },
     isLive: name => rows[name]?.live !== false,
     show(name) {
       const existing = attached.get(name);
@@ -195,6 +197,7 @@ function startViewer(context, headless, panel) {
     const list = await getLocal(headless.port, '/list', 2000);
     if (list && list.ok) {
       rows = Object.fromEntries(list.terminals.map(t => [t.name, t]));
+      stages = Array.isArray(list.stages) ? list.stages : [];
       failing = false;
     } else if (!failing) {
       failing = true;
@@ -231,6 +234,7 @@ function activate(context) {
       terminals: bridge.terminals,
       onDidWrite: bridge.onDidWriteMetadata,
       source: () => viewer,
+      getStages: () => bridge.normalizeStages(vscode.workspace.getConfiguration('terminalBridge').get('stages', [])),
     });
   } catch (err) {
     console.error('[terminal-bridge] side panel failed to register:', err);

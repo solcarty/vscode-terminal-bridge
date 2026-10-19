@@ -46,10 +46,39 @@ function formatAge(ms) {
   return `${Math.floor(h / 24)}d ${h % 24}h`;
 }
 
-function tooltipFor(meta, now) {
+// Stage : a consumer-defined step, positioned in the configured order.
+// A key the config doesn't list is still shown, as text with a neutral icon.
+const NEUTRAL_STAGE_ICON = 'circle-outline';
+
+function stageInfo(meta, stages) {
+  if (!meta.stage) return null;
+  const index = stages.findIndex(s => s.key === meta.stage);
+  return { key: meta.stage, def: index >= 0 ? stages[index] : null, index, total: stages.length };
+}
+
+function stageDescription(info, meta) {
+  const head = info.def ? `${info.def.label} · ${info.index + 1}/${info.total}` : info.key;
+  return meta.stageDetail ? `${head} · ${meta.stageDetail}` : head;
+}
+
+// Done before the current one; the current one with its age; the rest pending.
+// A `terminal` stage counts as done even when it is the current one.
+function stageLines(info, meta, stages, now) {
+  const age = meta.stageChangedAt ? formatAge(now - Date.parse(meta.stageChangedAt)) : null;
+  const forAge = age ? ` for ${age}` : '';
+  if (!info.def) return [`stage: ${info.key}${forAge}`];
+  return stages.map((s, i) => {
+    if (i === info.index) return s.terminal ? `✓ ${s.label}${forAge}` : `▸ ${s.label} — current${forAge}`;
+    return `${i < info.index ? '✓' : '○'} ${s.label}`;
+  });
+}
+
+function tooltipFor(meta, now, info, stages) {
   const status = meta.status ?? 'none';
   const age = meta.statusChangedAt ? formatAge(now - Date.parse(meta.statusChangedAt)) : null;
-  const lines = [age ? `${status} for ${age}` : status];
+  const lines = [];
+  if (info) lines.push(...stageLines(info, meta, stages, now), '');
+  lines.push(age ? `${status} for ${age}` : status);
   const pending = Number(meta.pendingTasks) || 0;
   if (pending > 0) lines.push(`background tasks: ${pending}`);
   if (meta.note) lines.push('', String(meta.note).trim(), '');
@@ -67,21 +96,26 @@ function createdMs(meta) {
 // Registry rows → ordered panel rows. `isLive(name)` is /list's `live`: a row
 // whose terminal is gone is dropped here, so it leaves the panel on the next
 // refresh even before anything deletes it from the registry.
-function buildRows(metadata, { statusMap, displayStatusKey, isLive = () => true, now = Date.now() }) {
+function buildRows(metadata, { statusMap, displayStatusKey, isLive = () => true, now = Date.now(), stages = [] }) {
   return Object.entries(metadata ?? {})
     .filter(([name]) => isLive(name))
     .map(([name, meta]) => {
       const key = displayStatusKey(meta);
       const cfg = key ? (statusMap[key] ?? null) : null;
+      const info = stageInfo(meta, stages);
+      // The stage owns the icon unless a person is needed: needs-input,
+      // permission and error keep their own, and the colour is the status's.
+      const stageIcon = info && !ATTENTION_STATES.has(key) ? (info.def?.codicon ?? NEUTRAL_STAGE_ICON) : null;
       return {
         name,
         label: name,
-        description: progressText(meta, name) || firstLine(meta.note),
+        description: info ? stageDescription(info, meta) : progressText(meta, name) || firstLine(meta.note),
+        stage: info ? info.key : null,
         status: meta.status ?? null,
         displayStatus: key ?? null,
-        codicon: cfg ? cfg.codicon : null,
+        codicon: stageIcon ?? (cfg ? cfg.codicon : null),
         color: cfg ? cfg.color : null,
-        tooltip: tooltipFor(meta, now),
+        tooltip: tooltipFor(meta, now, info, stages),
         group: groupOf(meta.status ?? null),
         createdAt: meta.createdAt ?? null,
         _created: createdMs(meta),
@@ -99,7 +133,7 @@ function buildRows(metadata, { statusMap, displayStatusKey, isLive = () => true,
 // ({ metadata, isLive(name), show(name) }) and has no untracked group, because
 // its own tabs are viewers, not terminals the bridge runs.
 function createPanel(vscode, context, deps) {
-  const { loadMetadata, statusMap, displayStatusKey, terminals, onDidWrite, source = () => null } = deps;
+  const { loadMetadata, statusMap, displayStatusKey, terminals, onDidWrite, source = () => null, getStages = () => [] } = deps;
   const changed = new vscode.EventEmitter();
   let pollTimer = null;
   let untracked = [];
@@ -111,9 +145,9 @@ function createPanel(vscode, context, deps) {
     const remote = source();
     if (remote) {
       untracked = [];
-      return buildRows(remote.metadata, { statusMap, displayStatusKey, isLive: remote.isLive });
+      return buildRows(remote.metadata, { statusMap, displayStatusKey, isLive: remote.isLive, stages: remote.stages ?? [] });
     }
-    const rows = buildRows(loadMetadata(), { statusMap, displayStatusKey, isLive });
+    const rows = buildRows(loadMetadata(), { statusMap, displayStatusKey, isLive, stages: getStages() });
     const bound = new Set(terminals.values());
     untracked = vscode.window.terminals.filter(t => !bound.has(t));
     return rows;

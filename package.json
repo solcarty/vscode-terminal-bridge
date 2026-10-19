@@ -2,7 +2,7 @@
   "name": "terminal-bridge",
   "displayName": "SDO Terminal Bridge",
   "description": "Opens, renames, and closes VS Code terminal tabs via a local HTTP API",
-  "version": "0.33.7",
+  "version": "0.34.0",
   "scripts": {
     "test": "node test/run.js"
   },
@@ -27,6 +27,21 @@
           "type": "string",
           "default": "",
           "description": "Identity this window's main agent announces to the presence registry (/announce, /api/bridges). Falls back to the workspace name, then the first folder's name, when unset."
+        },
+        "terminalBridge.stages": {
+          "type": "array",
+          "default": [],
+          "description": "Ordered stages a consumer can put a terminal in with `bridgectl stage <name> <key>`. Shown in the Terminal Bridge panel as the row icon, description and hover step list. The bridge ships none; an unlisted key is still shown, as text. The headless bridge reads the same list from ~/.vscode-terminal-bridge/config.json.",
+          "items": {
+            "type": "object",
+            "required": ["key", "label", "codicon"],
+            "properties": {
+              "key": { "type": "string" },
+              "label": { "type": "string" },
+              "codicon": { "type": "string", "description": "A codicon id, e.g. git-pull-request." },
+              "terminal": { "type": "boolean", "description": "A final stage (e.g. merged): shown as done, not current work." }
+            }
+          }
         },
         "terminalBridge.hostsCommand": {
           "type": "string",

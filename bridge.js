@@ -583,6 +583,42 @@ async function clearNote(context, name) {
 }
 
 // ---------------------------------------------------------------------------
+// stage (v0.34.0+): a consumer-defined step label per terminal. The
+// bridge ships no stages; the ordered list is config (`terminalBridge.stages`
+// or the headless config file). A key that isn't in the list is still stored
+// and shown, never rejected, so a consumer can run ahead of its config.
+function normalizeStages(raw) {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const s of raw) {
+    if (!s || typeof s.key !== 'string' || !s.key || seen.has(s.key)) continue;
+    seen.add(s.key);
+    const stage = { key: s.key, label: typeof s.label === 'string' && s.label ? s.label : s.key };
+    if (typeof s.codicon === 'string' && /^[a-z0-9-]+(~spin)?$/.test(s.codicon)) stage.codicon = s.codicon;
+    if (s.terminal === true) stage.terminal = true;
+    out.push(stage);
+  }
+  return out;
+}
+
+async function setStage(context, name, key, detail) {
+  const meta = loadMetadata(context);
+  if (!meta[name]) return null;  // never conjure an entry for an untracked name
+  if (key === null) {
+    await persistMetadata(context, name, { stage: null, stageDetail: null, stageChangedAt: null });
+    return { stage: null, stageDetail: null, stageChangedAt: null };
+  }
+  const now = new Date().toISOString();
+  // Like statusChangedAt: only a change of key moves the age; re-announcing
+  // the same stage (or updating its detail) keeps "for <age>" honest.
+  const changedAt = meta[name].stage === key && meta[name].stageChangedAt ? meta[name].stageChangedAt : now;
+  const fields = { stage: key, stageDetail: detail || null, stageChangedAt: changedAt };
+  await persistMetadata(context, name, fields);
+  return fields;
+}
+
+// ---------------------------------------------------------------------------
 // prUrl (#50, v0.25.0+): data plumbing only. The bridge stores a URL a caller
 // hands it and hands it back — no polling, no GitHub credentials, no CI
 // knowledge inside the extension. Whoever wants to know if that PR merged,
@@ -1845,6 +1881,25 @@ function startBridge(bridgeHost, context) {
         bytes: meta.noteBytes ?? 0,
       }));
 
+    } else if (url.pathname === '/set-stage') {
+      // v0.34.0+ — key=<stage> [detail=<text>] sets it, clear=1 clears it.
+      const name = url.searchParams.get('name');
+      const key = url.searchParams.get('key');
+      const clear = url.searchParams.get('clear') === '1';
+      if (!name || (!clear && !key)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'name and key (or clear=1) params required' }));
+        return;
+      }
+      const stored = await setStage(context, name, clear ? null : key, url.searchParams.get('detail'));
+      if (!stored) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Terminal not found', name }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, name, ...stored }));
+
     } else if (url.pathname === '/set-pr') {
       // #50 (v0.25.0+) — data plumbing only. Whoever polls the PR's actual
       // state (merged/closed/force-pushed) stays outside the bridge; this
@@ -2458,6 +2513,10 @@ function startBridge(bridgeHost, context) {
         // was told.
         prUrl: meta.prUrl ?? null,
         prSetAt: meta.prSetAt ?? null,
+        // v0.34.0+ — consumer-defined stage; null when never set.
+        stage: meta.stage ?? null,
+        stageDetail: meta.stageDetail ?? null,
+        stageChangedAt: meta.stageChangedAt ?? null,
         // #59 — `headless` when a live `bridgectl worker` holds the lock in
         // this row's cwd: send goes to its inbox, status comes from the
         // agent's event stream, and sessionId is what a takeover resumes.
@@ -2468,7 +2527,7 @@ function startBridge(bridgeHost, context) {
         ...host.rowFields(name, terminals.get(name)),
       }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, now: new Date().toISOString(), backend: host.kind, terminals: list }));
+      res.end(JSON.stringify({ ok: true, now: new Date().toISOString(), backend: host.kind, stages: normalizeStages(host.getSetting('stages', [])), terminals: list }));
 
     } else if (url.pathname === '/ping') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -2711,5 +2770,5 @@ function stopBridge() {
 
 module.exports = {
   startBridge, stopBridge, writePortFiles, isPidAlive,   loadMetadata, onDidWriteMetadata, displayStatusKey, terminals,
-  STATUS_MAP, BRIDGES_DIR, PORT_FALLBACK_PATH, VERSION,
+  STATUS_MAP, BRIDGES_DIR, PORT_FALLBACK_PATH, VERSION, normalizeStages,
 };

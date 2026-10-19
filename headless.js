@@ -63,7 +63,17 @@ function sessionNameFor(name) {
 // the bridge made, and a person's `tmux ls` stays theirs.
 // ---------------------------------------------------------------------------
 
-function tmuxHost({ socket, folders = [], settings = {} }) {
+// The headless counterpart of VS Code settings: a JSON file of the same keys
+// (today only `stages`). Missing or malformed reads as unset, never an error.
+const CONFIG_PATH = () => path.join(os.homedir(), '.vscode-terminal-bridge', 'config.json');
+function readConfigFile(file, key, def) {
+  try {
+    const v = JSON.parse(fs.readFileSync(file, 'utf8'))[key];
+    return v === undefined ? def : v;
+  } catch { return def; }
+}
+
+function tmuxHost({ socket, folders = [], settings = {}, configFile = CONFIG_PATH() }) {
   const run = (args, input) => tmuxRun(socket, args, input);
   let list = [];
   const closeCbs = new Set();
@@ -221,7 +231,12 @@ function tmuxHost({ socket, folders = [], settings = {} }) {
 
     workspaceFolders: () => [...folders],
     workspaceName: () => settings.workspaceName || null,
-    getSetting: (key, def) => (settings[key] !== undefined && settings[key] !== '' ? settings[key] : def),
+    // The config file is re-read per call so a stage list edited on disk
+    // applies without restarting the bridge (and its agents' tmux sessions).
+    getSetting: (key, def) => {
+      if (key === 'stages') return readConfigFile(configFile, 'stages', def);
+      return settings[key] !== undefined && settings[key] !== '' ? settings[key] : def;
+    },
     addFolder(p, index) {
       if (folders.includes(p)) return true;
       folders.splice(Math.max(0, Math.min(index, folders.length)), 0, p);
@@ -279,12 +294,14 @@ function parseArgs(argv, env = process.env) {
     folders: (env.VSCODE_BRIDGE_FOLDERS || '').split(':').filter(Boolean),
     socket: env.VSCODE_BRIDGE_TMUX_SOCKET || 'vscode-bridge',
     settings: {},
+    configFile: env.VSCODE_BRIDGE_CONFIG || CONFIG_PATH(),
   };
   for (let i = 0; i < argv.length; i++) {
     const [flag, inline] = argv[i].split(/=(.*)/s);
     const value = () => (inline !== undefined ? inline : argv[++i]);
     if (flag === '--folder') opts.folders.push(value());
     else if (flag === '--socket') opts.socket = value();
+    else if (flag === '--config') opts.configFile = path.resolve(value());
     else if (flag === '--agent-id') opts.settings.agentId = value();
     else if (flag === '--pipeline-state-dir') opts.settings.pipelineStateDir = value();
     else throw new Error(`unknown argument: ${argv[i]}`);

@@ -58,6 +58,11 @@ jobs:
             echo "::warning::$tag is tagged at another commit and has no release. Not publishing; see .claude/commands/release.md."
           fi
 
+      # Releasing is a no-op when the version is already out, which is also what
+      # happens when shipped code reached main without a bump. Say so loudly.
+      - name: Main has not drifted from the last tag
+        run: node .github/scripts/version-check.js --since-tag
+
       - name: Package
         if: steps.plan.outputs.publish == 'true'
         run: |

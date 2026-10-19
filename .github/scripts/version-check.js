@@ -7,6 +7,11 @@
 // Dependency-free on purpose: CI runs it before anything is installed.
 //
 //   node .github/scripts/version-check.js --base <sha> --head <sha>
+//   node .github/scripts/version-check.js --since-tag [--head <sha>]
+//
+// --since-tag checks the state of a branch rather than a PR: it diffs the
+// highest v* tag against head, so shipped changes that reached main without a
+// bump (a direct push, a merge race, a PR that skipped the check) fail too.
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -97,14 +102,20 @@ function main() {
   const args = {};
   const argv = process.argv.slice(2);
   for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--since-tag') { args.sinceTag = true; continue; }
     const m = /^--(base|head)(?:=(.*))?$/.exec(argv[i]);
     if (m) args[m[1]] = m[2] !== undefined ? m[2] : argv[++i];
   }
+  const git = (...a) => execFileSync('git', a, { encoding: 'utf8' });
+  if (args.sinceTag) {
+    args.head = args.head || 'HEAD';
+    args.base = highestTag(git('tag', '-l', 'v*').split('\n').filter(Boolean));
+    if (!args.base) { console.log('ok: no v* tag yet; nothing to compare against'); return; }
+  }
   if (!args.base || !args.head) {
-    console.error('usage: version-check.js --base <sha> --head <sha>');
+    console.error('usage: version-check.js --base <sha> --head <sha> | --since-tag [--head <sha>]');
     process.exit(2);
   }
-  const git = (...a) => execFileSync('git', a, { encoding: 'utf8' });
   const root = git('rev-parse', '--show-toplevel').trim();
   const changed = git('diff', '--name-only', `${args.base}...${args.head}`).split('\n').filter(Boolean);
   const read = f => { try { return git('show', `${args.head}:${f}`); } catch { return ''; } };

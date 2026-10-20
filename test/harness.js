@@ -150,7 +150,8 @@ const vscodeMock = {
 function makeTerminal(name, pid) {
   const t = {
     name,
-    processId: Promise.resolve(pid ?? 4242),
+    // pid 'never': a terminal whose process id never resolves (no shell, #6561)
+    processId: pid === 'never' ? new Promise(() => {}) : Promise.resolve(pid ?? 4242),
     sendText: (text, submit) => t.sent.push({ text, submit }),
     shows: 0,
     show: () => {

@@ -587,6 +587,32 @@ no bridge exists anywhere, only on the path that used to return 1 immediately.
 Deliberately not changed: the startup race itself (old instance still alive while the new one writes).
 The stamp makes its outcome harmless; the headless repair timer (#83) also re-writes missing files.
 
+## A write has three ways not to succeed, and `delivered` is observed (#6561, v0.36.0+)
+
+A `send` to a finished worker tab reported `submitted` and was never read, and the same night a
+14 s send returned ok to a client that had given up at 5 s and printed `bridge-unreachable`. The
+orchestrator re-sent on that, and `worker-question`'s `deliver` does the same: the text arrives twice.
+"Unreachable" was carrying two facts, so the client now says which.
+
+- **One classifier, `_bridge_write`,** for open, send, nudge, status and close: exit `1` refused (the
+  bridge answered no), `3` unreachable, `5` unconfirmed. Unreachable needs **no connection and a
+  failing `ping`**: curl's `time_connect` is the evidence that the request reached the bridge, so a
+  timeout after connecting is `5` and never `3`. `4` was already `stage`'s unsupported-by-bridge, so
+  unconfirmed took `5`. Client timeouts now exceed the extension's own submit time (send/nudge 30 s).
+- **`status` lost its `|| true`;** the hook path (`bridge_hook_status`) absorbs the code instead, since a
+  hook that exits non-zero can block the turn. Cost: `open`/`close`/`status` with no bridge now exit
+  `3` rather than silently `0`. `close` keeps `0` for `row-removed` and `not-tracked`.
+- **`delivered` comes only from a `UserPromptSubmit` hook** (`hook-prompt` -> `/prompt-submitted`),
+  firing after `lastSendAt`. Every other delivery value says what was written; this one says a turn
+  began. It also fires for a person typing in the tab, and that is accepted: a turn began either way.
+  An unwired hook leaves the old values, so the claim never gets stronger than the evidence.
+- **`no-shell`** is `timeout` plus a process id that never resolved. A tab that never produced a shell
+  was previously indistinguishable from a slow one.
+- A dead terminal's row was already removed by `close` (v0.19.0, `row-removed`); `test/close.test.js` pins it.
+
+Rejected: making the server dedupe a retried send. The client cannot tell a retry from a new message
+with the same text, and `5` already hands the caller the information it needs to check `list`.
+
 ## Key endpoints
 
 All endpoints are GET with query-string params (not POST/JSON — see `bridge.js`).

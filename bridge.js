@@ -9,7 +9,7 @@
 //   terminals                 live terminal objects, read synchronously
 //   createTerminal(opts)      { name, cwd, color, icon } → terminal
 //   whenShellReady(t, ms)     resolves to how the shell was seen ready:
-//                             'shell-integration' | 'prompt' | 'timeout'
+//                             'shell-integration' | 'prompt' | 'timeout' | 'no-shell'
 //   onDidCloseTerminal(cb)    a terminal went away
 //   onShouldReindex(cb)       something worth a re-index happened
 //   workspaceFolders()        absolute paths
@@ -274,7 +274,7 @@ async function touchLastSend(context, name, delivery = null) {
   const meta = loadMetadata(context);
   if (!meta[name]) return null;  // never conjure an entry for an untracked name
   const now = new Date().toISOString();
-  meta[name] = { ...meta[name], lastSendAt: now, lastSendDelivery: delivery };
+  meta[name] = { ...meta[name], lastSendAt: now, lastSendDelivery: delivery, lastSendDeliveredAt: null };
   await saveMetadata(context, meta);
   return now;
 }
@@ -1144,6 +1144,34 @@ const DELIVERY_NUDGE       = 'nudge';
 //                       (#59). The wrapper wrote it to the agent's stdin as a
 //                       structured message; there is no input box to strand in.
 const DELIVERY_INBOX       = 'inbox';
+//   delivered         — (#6561) a UserPromptSubmit hook fired for this tab after
+//                       lastSendAt. The only delivery value the bridge has
+//                       *observed*: every other one is a statement about what
+//                       was written, this one is the agent starting a turn. It
+//                       cannot tell your send from a person typing into the tab
+//                       in the same window; either way a turn began after it.
+const DELIVERY_DELIVERED   = 'delivered';
+// Writes a prompt hook can promote. Staged text was never submitted, and an
+// inbox message has no hooks (the worker wrapper reports from its event stream).
+const PROMOTABLE_DELIVERIES = new Set([DELIVERY_SUBMITTED, DELIVERY_UNVERIFIED, DELIVERY_NUDGE]);
+
+// A prompt was submitted in this tab (UserPromptSubmit). Moves the last send to
+// `delivered` iff one is outstanding and the prompt is not older than it.
+async function notePromptSubmitted(context, name) {
+  const meta = loadMetadata(context);
+  const row = meta[name];
+  if (!row) return null;
+  const now = new Date().toISOString();
+  const promotes = row.lastSendAt && PROMOTABLE_DELIVERIES.has(row.lastSendDelivery)
+    && now >= row.lastSendAt;
+  meta[name] = {
+    ...row,
+    lastPromptAt: now,
+    ...(promotes ? { lastSendDelivery: DELIVERY_DELIVERED, lastSendDeliveredAt: now } : {}),
+  };
+  await saveMetadata(context, meta);
+  return { lastPromptAt: now, promoted: !!promotes };
+}
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -1631,7 +1659,13 @@ function startBridge(bridgeHost, context) {
       // blind fallback is longer than the 2s client timeout that caused #53, so
       // blocking on it would trade one bug for the other. Callers that need
       // certainty poll /list.
+      // #6561 — `timeout` says the ready signal never came; `no-shell` says
+      // that AND no process id ever resolved, i.e. there is no evidence a shell
+      // exists at all. The command was still written, to nothing.
+      let shellPid = null;
+      terminal.processId.then(pid => { if (pid) shellPid = pid; }, () => {});
       const noteDelivery = (how) => {
+        if (how === 'timeout' && !shellPid) how = 'no-shell';
         // Only onto this terminal's own row: one that closed while its shell
         // was starting has no row left, and must not get one back.
         if (name && terminals.get(name) === terminal) persistMetadata(context, name, {
@@ -2257,6 +2291,24 @@ function startBridge(bridgeHost, context) {
       res.writeHead(result.ok ? 200 : code, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(body));
 
+    } else if (url.pathname === '/prompt-submitted') {
+      // #6561 — a UserPromptSubmit hook fired in this tab. Stamps lastPromptAt
+      // and, when a send is waiting on it, moves lastSendDelivery to delivered.
+      const name = url.searchParams.get('name');
+      if (!name) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'name param required' }));
+        return;
+      }
+      const r = await notePromptSubmitted(context, name);
+      if (!r) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Terminal not found', name }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, name, ...r }));
+
     } else if (url.pathname === '/heartbeat') {
       // #59 — liveness with no other side effect. A headless worker stamps it
       // from its agent's event stream: a silent stream is a wedged agent, and
@@ -2515,6 +2567,12 @@ function startBridge(bridgeHost, context) {
         // same way it doesn't derive status from staleness. null on rows that
         // predate this or were last written by an older bridge.
         lastSendDelivery: meta.lastSendDelivery ?? null,
+        // #6561 — set when lastSendDelivery became `delivered`: the first
+        // UserPromptSubmit in this tab after lastSendAt. lastPromptAt is the
+        // latest one, whether or not a send was waiting. Both null until a
+        // prompt hook has fired (it needs `hook-prompt` wired; see scaffold).
+        lastSendDeliveredAt: meta.lastSendDeliveredAt ?? null,
+        lastPromptAt: meta.lastPromptAt ?? null,
         // v0.21.0+ — the background-work dimension, tracked separately from
         // status so "waiting on a job I started" stops being reported as
         // "waiting on a human" (issue #40). displayStatus is the derived state

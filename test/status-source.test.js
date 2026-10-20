@@ -86,9 +86,9 @@ const hookSource = (state, payload, env = '') => {
 
   // hook-status sources
   check('Notification needs-input → notification',
-    hookSource('needs-input', '{"notification_type":"permission_prompt"}') === 'SRC:needs-input:notification', hookSource('needs-input', '{"notification_type":"permission_prompt"}'));
-  check('Stop with no handoff → stop-promotion',
-    hookSource('idle', '{"hook_event_name":"Stop"}') === 'SRC:needs-input:stop-promotion', hookSource('idle', '{"hook_event_name":"Stop"}'));
+    hookSource('needs-input', '{"notification_type":"permission_prompt"}') === 'SRC:needs-you:notification', hookSource('needs-input', '{"notification_type":"permission_prompt"}'));
+  check('Stop with no handoff → blocked, source stop-promotion',
+    hookSource('idle', '{"hook_event_name":"Stop"}') === 'SRC:blocked:stop-promotion', hookSource('idle', '{"hook_event_name":"Stop"}'));
 
   console.log(fails ? `\n${fails} FAILURE(S)` : '\nall green');
   process.exit(fails ? 1 : 0);

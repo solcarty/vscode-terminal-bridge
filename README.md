@@ -571,7 +571,7 @@ curl -G "http://127.0.0.1:${PORT}/send-text" \
 - `literal` — never wrap (raw `sendText`)
 - `join` — collapse interior newlines to spaces, delivering one line. The fallback if a particular target turns out not to honour bracketed paste.
 
-**Prompt-state safety.** Text injected while the target sits at a permission dialog or a numbered question is consumed as *an answer to that menu*, not read as a message. `/send-text` returns **409** when a prompt is really pending — status `permission`, or a `needs-input` that came from a Claude Code Notification hook or whose source is unknown (see `statusSource`, v0.35.0+); pass `force=1` when answering the prompt is what you actually mean. Unknown or non-live terminal → **404**.
+**Prompt-state safety.** Text injected while the target sits at a permission dialog or a numbered question is consumed as *an answer to that menu*, not read as a message. `/send-text` returns **409** when a prompt is really pending — status `permission`, or a `needs-you` (alias `needs-input`) that came from a Claude Code Notification hook or whose source is unknown (see `statusSource`, v0.35.0+); pass `force=1` when answering the prompt is what you actually mean. Unknown or non-live terminal → **404**.
 
 **Exit 0 means delivered, not received.** `sendText` queues in the terminal buffer when the target is mid-execution, so a successful response says the text was written — not that the agent read it or acted on it. To confirm pickup, compare `lastHeartbeatAt` against `lastSendAt` in `/list`: a heartbeat *after* your send means the agent has acted since your text landed (v0.20.0+). Don't watch for a status transition instead — hooks fire on tool calls, so a status can lag a pickup by minutes, and a transition that does occur can't be attributed to your send.
 
@@ -732,8 +732,12 @@ Records a tracked terminal's label, status and color in the bridge's registry, w
 | `status=` | Codicon | Color | When to use |
 | --------- | ------- | ----- | ----------- |
 | `working` | `$(loading~spin)` | cyan | `PreToolUse` — agent is actively running a tool |
-| `needs-input` | `$(bell-dot)` | yellow | `Notification` — agent needs a content decision |
-| `idle` | `$(debug-pause)` | green | `Stop` — agent turn complete |
+| `needs-you` | `$(bell-dot)` | yellow | `Notification` — a prompt is on screen and a person must answer it. `send`/`nudge` are refused (v0.37.0+) |
+| `blocked` | `$(circle-slash)` | red | The turn ended with no handoff (the note-before-exit guard), or a worker is stuck. A person is needed, but nothing is on screen: `send` goes through (v0.37.0+) |
+| `waiting` | `$(watch)` | blue | The turn ended with a handoff while background work is outstanding (`pendingTasks > 0`). `send` goes through (v0.37.0+) |
+| `stopped` | `$(debug-stop)` | green | The turn ended with a handoff and nothing is outstanding; also the idle-nudge downgrade. `send` goes through (v0.37.0+) |
+| `needs-input` | `$(bell-dot)` | yellow | **Deprecated alias of `needs-you`.** Accepted on write and stored as `needs-you`; to be removed in v0.38.0. Rows stored by an older bridge still render |
+| `idle` | `$(debug-pause)` | green | Still accepted for callers that write it themselves. The hooks write `stopped`/`waiting` instead |
 | `permission` | `$(shield)` | blue | `PermissionRequest` — tool needs explicit approval |
 | `error` | `$(error)` | red | `PostToolUseFailure` / `StopFailure` — needs human eyes |
 | `compacting` | `$(archive)` | blue | `PreCompact` — auto-compaction running |
@@ -1259,8 +1263,8 @@ curl -s "http://127.0.0.1:${PORT}/rename-terminal?name=$N&status=working" \
 | ---- | ------------- | --------------------- |
 | `UserPromptSubmit` | A prompt starts a turn | no status: `hook-prompt` stamps `lastPromptAt` and moves an outstanding send to `delivered` (v0.36.0+) |
 | `PreToolUse` | Before every tool call | `working` |
-| `Notification` | Claude needs input (permission prompt, question) | `needs-input` — `hook-status` writes `idle` instead for the ~60 s "waiting for your input" nudge (`notification_type: "idle_prompt"`, or that wording when no type is sent); every other type stays `needs-input` |
-| `Stop` | Claude's turn is complete | `idle` — wire `hook-output` here too, see [read-back](#get-set-output--get-output--get-clear-output) |
+| `Notification` | Claude needs input (permission prompt, question) | `needs-you` (`needs-input` still works in the command) — `hook-status` writes `stopped` (or `waiting`) instead for the ~60 s "waiting for your input" nudge (`notification_type: "idle_prompt"`, or that wording when no type is sent); every other type stays `needs-you` |
+| `Stop` | Claude's turn is complete | `idle` in the command; `hook-status` writes `stopped`, `waiting` when background work is outstanding, or `blocked` when the turn left no handoff — wire `hook-output` here too, see [read-back](#get-set-output--get-output--get-clear-output) |
 | `SubagentStop` | A subagent or fork finished | `working` — `hook-status` writes it only while the turn is still running (last state `working`/`subagent`); after `Stop` or during a `permission` prompt it writes nothing (v0.33.2+) |
 
 ### Recommended state scheme
@@ -1781,3 +1785,8 @@ The worker daemon (`bin/worker.js`, see [Remote jobs](#remote-jobs)) is differen
 ## License
 
 MIT
+
+
+### Does `TaskCreated` fire for a `run_in_background` Bash command? (#98)
+
+**No.** Tested 2026-10-20 on Claude Code 2.1.304 (`claude -p`, a settings file wiring `TaskCreated` and `TaskCompleted` to a log, a prompt asking for a `Bash` call with `run_in_background: true`): the command ran and finished, and neither hook fired. A background Bash command therefore never raises `pendingTasks`, and a turn that ends while one runs reads `stopped`, not `waiting`. `TaskCreated` covers the task/subagent tools only. A caller that wants `waiting` for a background command has to report it with `bridgectl bg-task start`/`end` itself.

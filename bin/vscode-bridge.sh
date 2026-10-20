@@ -1066,6 +1066,17 @@ _bridge_idle_needs_note() {
   return 1
 }
 
+# _bridge_pending_tasks <name> — outstanding background work, from /note.
+# Prints 0 on every "can't tell" so a failed read never invents a `waiting`.
+_bridge_pending_tasks() {
+  local port out n
+  port=$(_bridge_port) || { echo 0; return; }
+  out=$(curl -fsS -m 2 --get --data-urlencode "name=$1" \
+    "http://127.0.0.1:${port}/note" 2>/dev/null) || { echo 0; return; }
+  n=$(printf '%s' "$out" | sed -n 's/.*"pendingTasks"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+  echo "${n:-0}"
+}
+
 # bridge_hook_status <status> [--name=<name>]
 # bridge_hook_status <name> <status>
 #
@@ -1169,7 +1180,10 @@ bridge_hook_status() {
   # `idle_prompt` is downgraded, and any other type stays `needs-input` even if
   # the wording looks idle. The message match is the fallback for payloads
   # without a type.
-  if [ "$state" = "needs-input" ] && [ -n "$payload" ]; then
+  # `needs-input` is the deprecated name of `needs-you` (#98); either is
+  # accepted from a hook command and written as `needs-you`.
+  [ "$state" = "needs-input" ] && state="needs-you"
+  if [ "$state" = "needs-you" ] && [ -n "$payload" ]; then
     local ntype msg
     ntype=$(printf '%s' "$payload" \
       | sed -n 's/.*"notification_type"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
@@ -1196,14 +1210,21 @@ bridge_hook_status() {
   # turn-start mark, so the ~60s idle nudge that follows (downgraded to `idle`
   # above) fails open instead of re-promoting; the next `working` re-arms it.
   local handed_off="" source="hook"
-  [ "$state" = "needs-input" ] && source="notification"
+  [ "$state" = "needs-you" ] && source="notification"
   if [ "$state" = "idle" ]; then
     if printf '%s' "$payload" \
         | grep -qE '"last_assistant_message"[[:space:]]*:[[:space:]]*("[^"]|\[[[:space:]]*\{)'; then
       handed_off=1
     elif _bridge_idle_needs_note "$name" 2>/dev/null; then
-      state="needs-input"; source="stop-promotion"
+      state="blocked"; source="stop-promotion"
     fi
+  fi
+  # #98 — a turn that ended with a handoff is `stopped`, or `waiting` when
+  # background work is still outstanding. `idle` stays a valid status for
+  # callers that write it themselves; the hooks no longer do.
+  if [ "$state" = "idle" ]; then
+    if [ "$(_bridge_pending_tasks "$name")" -gt 0 ] 2>/dev/null; then
+      state="waiting"; else state="stopped"; fi
   fi
 
   if [ -n "$handed_off" ]; then

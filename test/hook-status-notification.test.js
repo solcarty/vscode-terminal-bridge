@@ -33,19 +33,19 @@ const check = (label, cond, got) => {
 };
 
 let got = decide('needs-input', '{"message":"Claude is waiting for your input","session_id":"x"}');
-check('idle nudge is downgraded to idle', got === 'idle', got);
+check('idle nudge is downgraded to idle', got === 'stopped', got);
 
 got = decide('needs-input', '{"message":"Claude needs your permission to use Bash","session_id":"x"}');
-check('permission request stays needs-input', got === 'needs-input', got);
+check('permission request stays needs-input', got === 'needs-you', got);
 
 got = decide('needs-input', '');
-check('empty payload stays needs-input', got === 'needs-input', got);
+check('empty payload stays needs-input', got === 'needs-you', got);
 
 got = decide('needs-input', '{"session_id":"x"}');
-check('payload with no message stays needs-input', got === 'needs-input', got);
+check('payload with no message stays needs-input', got === 'needs-you', got);
 
 got = decide('needs-input', '{"message":"Something else entirely"}');
-check('unrecognized message stays needs-input', got === 'needs-input', got);
+check('unrecognized message stays needs-input', got === 'needs-you', got);
 
 got = decide('working', '{"message":"Claude is waiting for your input"}');
 check('non-needs-input states are untouched', got === 'working', got);
@@ -56,22 +56,22 @@ check('non-needs-input states are untouched', got === 'working', got);
 const fixture = f => fs.readFileSync(path.join(__dirname, 'fixtures', 'claude-hooks', f), 'utf8');
 
 got = decide('needs-input', fixture('notification-idle-prompt.json'));
-check('real idle_prompt payload is downgraded to idle', got === 'idle', got);
+check('real idle_prompt payload is downgraded to idle', got === 'stopped', got);
 
 got = decide('needs-input', fixture('notification-permission-prompt.json'));
-check('real permission_prompt payload stays needs-input', got === 'needs-input', got);
+check('real permission_prompt payload stays needs-input', got === 'needs-you', got);
 
 got = decide('needs-input', '{"message":"Claude is waiting for your input","notification_type":"permission_prompt"}');
-check('notification_type permission_prompt wins over idle wording', got === 'needs-input', got);
+check('notification_type permission_prompt wins over idle wording', got === 'needs-you', got);
 
 got = decide('needs-input', '{"message":"Something new","notification_type":"some_future_type"}');
-check('unknown notification_type stays needs-input', got === 'needs-input', got);
+check('unknown notification_type stays needs-input', got === 'needs-you', got);
 
 got = decide('needs-input', '{"message":"Claude is waiting for your input","notification_type":"some_future_type"}');
-check('unknown notification_type is not demoted by idle wording', got === 'needs-input', got);
+check('unknown notification_type is not demoted by idle wording', got === 'needs-you', got);
 
 got = decide('needs-input', '{"message":"Reworded nudge","notification_type":"idle_prompt"}');
-check('idle_prompt is downgraded whatever the wording', got === 'idle', got);
+check('idle_prompt is downgraded whatever the wording', got === 'stopped', got);
 
 console.log(fails ? `\n${fails} FAILURE(S)` : '\nall green');
 process.exit(fails ? 1 : 0);

@@ -16,7 +16,7 @@ const OPEN_COMMAND = 'terminalBridge.openHostTerminal';
 const SETTING = 'hostsCommand';
 const INTERVAL_MS = Number(process.env.VSCODE_BRIDGE_HOSTS_INTERVAL_MS) || 30000;
 const TIMEOUT_MS = Number(process.env.VSCODE_BRIDGE_HOSTS_TIMEOUT_MS) || 20000;
-const ATTENTION_STATES = new Set(['needs-input', 'permission', 'error']);
+const ATTENTION_STATES = new Set(['needs-you', 'needs-input', 'blocked', 'permission', 'error']);
 
 const isNum = v => typeof v === 'number' && Number.isFinite(v);
 

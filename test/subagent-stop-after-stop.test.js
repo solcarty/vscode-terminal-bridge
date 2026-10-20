@@ -46,11 +46,11 @@ const check = (label, cond, got) => {
 reset();
 hookStatus('working', '{"hook_event_name":"PreToolUse"}');
 let got = hookStatus('idle', fixture('stop.json'));
-check('Stop with a handoff writes idle', got === 'idle', got);
+check('Stop with a handoff writes idle', got === 'stopped', got);
 got = hookStatus('working', fixture('subagent-stop-after-stop.json'));
 check('SubagentStop after Stop writes nothing', got === null, got);
 got = hookStatus('needs-input', fixture('notification-idle-prompt.json'));
-check('the idle nudge after that lands as idle', got === 'idle', got);
+check('the idle nudge after that lands as idle', got === 'stopped', got);
 
 // A real subagent inside a running turn still flips the tab back to working.
 reset();
@@ -67,7 +67,7 @@ hookStatus('permission', '{"hook_event_name":"PermissionRequest"}');
 got = hookStatus('working', fixture('subagent-stop-task.json'));
 check('SubagentStop during a permission prompt writes nothing', got === null, got);
 got = hookStatus('needs-input', fixture('notification-permission-prompt.json'));
-check('the permission notification still asserts needs-input', got === 'needs-input', got);
+check('the permission notification still asserts needs-input', got === 'needs-you', got);
 
 // With no turn-state at all, a SubagentStop can't tell whether a turn is
 // running, so it leaves the status alone rather than claim `working`.
@@ -80,10 +80,10 @@ check('SubagentStop with no tracked state writes nothing', got === null, got);
 reset();
 hookStatus('working', '{"hook_event_name":"PreToolUse"}');
 got = hookStatus('idle', '{"hook_event_name":"Stop","last_assistant_message":""}');
-check('Stop with no handoff and no note is promoted', got === 'needs-input', got);
+check('Stop with no handoff and no note is promoted', got === 'blocked', got);
 hookStatus('working', fixture('subagent-stop-after-stop.json'));
 got = hookStatus('needs-input', fixture('notification-idle-prompt.json'));
-check('the nudge after an un-handed-off turn stays needs-input', got === 'needs-input', got);
+check('the nudge after an un-handed-off turn stays needs-input', got === 'blocked', got);
 
 // A PreToolUse is never a SubagentStop, whatever the previous state.
 reset();

@@ -56,8 +56,8 @@ const wait = ms => new Promise(r => setTimeout(r, ms));
   // ── The both-at-once case a single scalar cannot express ─────────────────
   await get(port, '/rename-terminal?name=worker&status=needs-input');
   r = await row('worker');
-  check('blocked-on-human AND task-running is representable', r.status === 'needs-input' && r.bgTask === true, r);
-  check('a human being required outranks bg work in the tab', r.displayStatus === 'needs-input', r);
+  check('blocked-on-human AND task-running is representable', r.status === 'needs-you' && r.bgTask === true, r);
+  check('a human being required outranks bg work in the tab', r.displayStatus === 'needs-you', r);
 
   // ── Completion returns the tab to its turn state ─────────────────────────
   await get(port, '/rename-terminal?name=worker&status=idle');

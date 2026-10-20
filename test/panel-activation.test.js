@@ -73,7 +73,7 @@ const wait = ms => new Promise(r => setTimeout(r, ms));
   check('row icon is the STATUS_MAP codicon', beta.iconPath?.id === 'bell-dot', beta.iconPath);
   check('row icon carries the STATUS_MAP color', beta.iconPath?.color?.id === 'terminal.ansiYellow', beta.iconPath);
   check('row description is the progress text', beta.description === '3/5 reviewing', beta.description);
-  check('row tooltip leads with the status', String(beta.tooltip).startsWith('needs-input'), beta.tooltip);
+  check('row tooltip leads with the status', String(beta.tooltip).startsWith('needs-you'), beta.tooltip);
 
   before = fired;
   await get(port, '/set-note?name=alpha&text=' + encodeURIComponent('shipped: pr=7\nmore'));

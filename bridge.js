@@ -138,6 +138,12 @@ const METADATA_KEY = 'terminalBridgeMetadata';
 const STATUS_MAP = {
   // ── Lifecycle ──────────────────────────────────────────────────────────────
   'working':     { codicon: 'loading~spin',   color: 'terminal.ansiCyan' },
+  'needs-you':   { codicon: 'bell-dot',       color: 'terminal.ansiYellow' },
+  'blocked':     { codicon: 'circle-slash',   color: 'terminal.ansiRed' },
+  'waiting':     { codicon: 'watch',          color: 'terminal.ansiBlue' },
+  'stopped':     { codicon: 'debug-stop',     color: 'terminal.ansiGreen' },
+  // Deprecated alias of `needs-you` (#98), kept one release: a write of it is
+  // stored as `needs-you`, and this entry only renders rows stored before.
   'needs-input': { codicon: 'bell-dot',       color: 'terminal.ansiYellow' },
   'idle':        { codicon: 'debug-pause',    color: 'terminal.ansiGreen' },
   // ── Blocking / error states ────────────────────────────────────────────────
@@ -206,7 +212,7 @@ async function persistMetadata(context, name, update) {
 
     if (isNew) next.createdAt = now;
 
-    if ('status' in update && update.status !== (prev?.status ?? null)) {
+    if ('status' in update && update.status !== canonicalStatus(prev?.status ?? null)) {
       next.statusChangedAt = now;
       // The source describes the CURRENT value only. A change of value drops it
       // (unless this write names one), so a later real prompt is never read
@@ -746,12 +752,15 @@ async function setBgTask(context, name, op) {
 // states keep the tab. Below that, outstanding background work outranks the
 // turn state, because "idle" on a terminal with a job in flight is the reading
 // that sent an orchestrator to a tab that needed nothing.
-const DISPLAY_PRIORITY_STATES = new Set(['needs-input', 'permission', 'error']);
+const DISPLAY_PRIORITY_STATES = new Set(['needs-you', 'needs-input', 'blocked', 'permission', 'error']);
 
 function displayStatusKey(meta = {}) {
   const status = meta.status ?? null;
   if (status && DISPLAY_PRIORITY_STATES.has(status)) return status;
   if ((Number(meta.pendingTasks) || 0) > 0) return 'bg-task';
+  // `waiting` is written at Stop while work is outstanding, and nothing rewrites
+  // it when the count drops to 0, so the display derives it: no work, no wait.
+  if (status === 'waiting') return 'stopped';
   return status;
 }
 
@@ -1091,7 +1100,12 @@ async function forgetTerminal(context, name) {
 
 // Statuses where injected text would be eaten by an interactive prompt rather
 // than read as a message. Refused without force=1.
-const PROMPT_STATES = new Set(['needs-input', 'permission']);
+const PROMPT_STATES = new Set(['needs-you', 'permission']);
+
+// #98 — `needs-input` is the old name of `needs-you`. Accepted on write for
+// one release (removed in v0.38.0) and stored under the new name.
+const STATUS_ALIASES = { 'needs-input': 'needs-you' };
+const canonicalStatus = s => (s && STATUS_ALIASES[s]) || s;
 
 // #68 — where a `needs-input` came from. Only a Notification hook means a
 // prompt is on screen. `manual` (bridgectl status) and `stop-promotion` (a turn
@@ -1103,7 +1117,7 @@ const PROMPT_FREE_SOURCES = new Set(['manual', 'stop-promotion']);
 function isPendingPrompt(meta) {
   const status = meta?.status ?? null;
   if (status === 'permission') return true;
-  if (status === 'needs-input') return !PROMPT_FREE_SOURCES.has(meta.statusSource);
+  if (status === 'needs-you' || status === 'needs-input') return !PROMPT_FREE_SOURCES.has(meta.statusSource);
   return false;
 }
 
@@ -1734,7 +1748,7 @@ function startBridge(bridgeHost, context) {
       const srcRaw  = url.searchParams.get('source');
       const statusSource = STATUS_SOURCES.has(srcRaw) ? srcRaw : null;
       const statusRaw = url.searchParams.has('status') ? url.searchParams.get('status') : undefined;
-      const status  = statusRaw || undefined;  // coerce empty string to undefined
+      const status  = canonicalStatus(statusRaw || undefined);  // coerce empty string to undefined
 
       const terminal = name && terminals.get(name);
 
@@ -1934,6 +1948,7 @@ function startBridge(bridgeHost, context) {
         ok: true, name,
         note: meta.note ?? null,
         noteUpdatedAt: meta.noteUpdatedAt ?? null,
+        pendingTasks: Math.max(0, Number(meta.pendingTasks) || 0),
         truncated: meta.noteTruncated ?? false,
         bytes: meta.noteBytes ?? 0,
       }));
@@ -2854,5 +2869,5 @@ function stopBridge() {
 
 module.exports = {
   startBridge, stopBridge, writePortFiles, isPidAlive,   loadMetadata, onDidWriteMetadata, displayStatusKey, terminals,
-  STATUS_MAP, BRIDGES_DIR, PORT_FALLBACK_PATH, VERSION, normalizeStages,
+  STATUS_MAP, canonicalStatus, BRIDGES_DIR, PORT_FALLBACK_PATH, VERSION, normalizeStages,
 };

@@ -12,7 +12,7 @@ const SHOW_COMMAND = 'terminalBridge.showTerminal';
 const POLL_MS = 1000;
 
 // A person is required first, then machines that are busy, then the rest.
-const ATTENTION_STATES = new Set(['needs-input', 'permission', 'error']);
+const ATTENTION_STATES = new Set(['needs-you', 'needs-input', 'blocked', 'permission', 'error']);
 
 function groupOf(status) {
   if (ATTENTION_STATES.has(status)) return 0;

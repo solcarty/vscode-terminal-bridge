@@ -20,9 +20,9 @@ let mode = 'ok';
 const hits = [];
 const server = http.createServer((req, res) => {
   const p = req.url.split('?')[0];
-  if (p === '/ping') return json(res, 200, { ok: true });
+  if (p === '/ping') return mode === 'hang-all' ? undefined : json(res, 200, { ok: true });
   hits.push(p);
-  if (mode === 'hang') return;                       // accept, never answer
+  if (mode === 'hang' || mode === 'hang-all') return;                       // accept, never answer
   if (mode === 'refuse') return json(res, 409, { ok: false, error: 'Terminal is at an interactive prompt' });
   if (p === '/close-terminal' && mode === 'untracked') return json(res, 404, { ok: false, outcome: 'not-tracked' });
   json(res, 200, { ok: true, outcome: 'closed' });
@@ -74,6 +74,13 @@ server.listen(0, '127.0.0.1', async () => {
   }
   r = await run(cwd, 'send', 'w', 'hi');
   check('send timeout names unconfirmed on stdout', r.out.includes('"reason":"unconfirmed"'), r);
+
+  // A busy bridge answers neither the write nor /ping. It connected, so this is
+  // still unconfirmed (5), never unreachable (3): the review of #97 caught a
+  // time_connect parse that read every loopback connect as "never connected".
+  mode = 'hang-all';
+  r = await run(cwd, 'send', 'w', 'hi');
+  check('send to a bridge too busy to ping → 5, not 3', r.code === 5, r);
 
   mode = 'untracked';
   r = await run(cwd, 'close', 'gone');

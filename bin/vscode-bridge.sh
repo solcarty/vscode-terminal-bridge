@@ -173,7 +173,7 @@ _bridge_write() {
   connected="${meta#* }"
   _BRIDGE_OUT=""
   case "$connected" in
-    0|0.0*|"") connected=0 ;;
+    0|0.0|0.000|0.000000|"") connected=0 ;;  # time_connect is 0 only when no connect happened; loopback is ~0.0002
     *) connected=1 ;;
   esac
   if [ "$connected" = 0 ] && ! bridge_ping "$port"; then

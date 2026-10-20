@@ -749,6 +749,15 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh open llm-gen /any/local/path \
 
 `bridge.js` — the bridge: registry, HTTP server and every route, shared by both entry points. `extension.js` — the VS Code entry point and backend; the side panel is `panel.js`, the All hosts view `hosts.js`. `headless.js` — the headless entry point and its tmux backend. No build step required. `bin/worker.js` is the separate, `vscode`-free worker daemon described above.
 
+## Merging is a workflow, and CI runs on one small runner (#7261)
+
+Every bridge PR used to end at a hand-merge. `pr-merge.yml` + `.github/scripts/pr-merge.sh` now squash-merge a PR carrying `integrate:ready` with green `test`/`version` jobs, a green `review/agent` (if any), no `merge:sol` on it or the issue it closes, and not a draft. The README's *Merging* section is the contract. Decisions:
+
+- **A self-contained script, not agent-workflows' `bin/pr-merge`.** That one reads per-project env files and a CI-run classifier from a private repo; a public repo can't depend on it, and this repo has two checks, so reading check-runs by name is enough. The decision logic (order of checks, `--match-head-commit`, hold read failing closed) is the same.
+- **Fork PRs never touch the runner.** A self-hosted runner on a public repo is arbitrary code execution for whoever opens a PR. `version-check` jobs carry `head.repo.full_name == github.repository`, `pr-merge` checks out `main` rather than the PR, and the script refuses a cross-repo PR. The fork approval policy is `all_external_contributors`.
+- **`MERGE_TOKEN` is optional but needed for releases.** A merge by `GITHUB_TOKEN` doesn't start `release.yml`; a PAT's does. Without it the merge works and `release` must be dispatched by hand.
+- **One runner, labels `[self-hosted, bridge]`**, sized small: the repo has no npm dependencies, CI needs Node and tmux.
+
 ## Releasing (#6952, v0.29.0+)
 
 **Every PR that changes shipped code bumps `version` in `package.json`: patch for a fix, minor for new behaviour or a new endpoint. Merging publishes it.** Nothing else is needed, and nothing commits back to `main`.

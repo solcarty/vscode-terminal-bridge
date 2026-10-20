@@ -1776,6 +1776,14 @@ Unlike the local bridge, every worker endpoint requires `Authorization: Bearer <
 
 Every release on the [Releases](../../releases) page is published by CI when a PR merges to `main`. A PR that changes anything the VSIX ships (everything except `*.md`, `test/**`, `.claude/**` and `.github/**`, per `.vscodeignore`) must bump `version` in `package.json` past the latest `v*` tag: patch for a fix, minor for new behaviour or a new endpoint. The `version-check` workflow fails the PR otherwise. On merge, the `release` workflow tags `v<version>` and attaches `terminal-bridge-<version>.vsix` to a new GitHub Release; a merge whose version is already released publishes nothing.
 
+### Merging
+
+The `pr-merge` workflow squash-merges a PR with no hand-merge once all of these hold on its head commit: the PR carries the `integrate:ready` label, is not a draft, comes from this repo (a fork PR is never auto-merged), the `test` and `version` jobs of `version-check` passed, `review/agent` is `success` when that status exists, and neither the PR nor an issue it closes carries `merge:sol` (the hold label). The merge is pinned to the head it read, so a later push is refused. It wakes on a finished `version-check` run, a successful `review/agent` status, or the label being added; the logic is `.github/scripts/pr-merge.sh <PR> [--check]`.
+
+For the merge to trigger `release`, set a `MERGE_TOKEN` repo secret (a PAT with contents and pull-requests write). Without it the merge still happens but runs as `GITHUB_TOKEN`, which GitHub does not let start other workflows, so run `gh workflow run release` afterwards.
+
+CI runs on one small self-hosted runner labelled `[self-hosted, bridge]` (needs Node 20, `tmux`, `gh`, `jq`). PR jobs run only for same-repo PRs, so a fork PR never reaches it.
+
 ## Security
 
 The local bridge (`extension.js`, or `headless.js` in headless mode) binds to `127.0.0.1` only — it is **not** accessible from other machines on the network, and has no authentication because it controls only your local VS Code instance.

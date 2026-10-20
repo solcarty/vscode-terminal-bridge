@@ -12,7 +12,9 @@ permissions:
 
 jobs:
   version:
-    runs-on: ubuntu-latest
+    # Only the repo's own PRs run on the self-hosted runner; a fork PR never does.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, bridge]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,7 +29,8 @@ jobs:
           --head "${{ github.event.pull_request.head.sha }}"
 
   test:
-    runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, bridge]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

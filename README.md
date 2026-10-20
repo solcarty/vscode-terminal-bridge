@@ -462,6 +462,7 @@ Status alone answers "what state is this in". The question an orchestrator actua
 | `createdAt` | Terminal first tracked. Never advances afterwards. |
 | `updatedAt` | Any metadata write — status, rename, pid, color. |
 | `statusChangedAt` | The status **value** changes. A `PreToolUse` hook firing `status=working` every few seconds does *not* reset it, or "how long has this been working" becomes unanswerable. |
+| `statusSource` | *(v0.35.0+)* Where the current `needs-input` came from: `notification` (Claude Code's Notification hook — a prompt is on screen), `manual` (`bridgectl status`/`/rename-terminal`'s `source=manual`) or `stop-promotion` (a turn ended with no handoff). Only `notification`, an unknown source (`null`, e.g. a row from an older bridge) and `permission` make `send`/`nudge` refuse. Cleared whenever the status value changes. |
 | `lastHeartbeatAt` | **Any** `/rename-terminal` call lands, including the idempotent no-ops. |
 | `cmdDeliveredAt` | `open`'s startup command is actually written to the shell — see [`cmdDelivery`](#open-is-idempotent-by-name-and-the-response-is-not-a-delivery-claim) (v0.25.0+). |
 | `lastSendAt` | A `/send-text` call **submits** text into this terminal (v0.20.0+), or a `/nudge-terminal` lands (v0.24.0+). Staged text (`submit=0`) and refused sends don't stamp. |
@@ -552,7 +553,7 @@ curl -G "http://127.0.0.1:${PORT}/send-text" \
 - `literal` — never wrap (raw `sendText`)
 - `join` — collapse interior newlines to spaces, delivering one line. The fallback if a particular target turns out not to honour bracketed paste.
 
-**Prompt-state safety.** Text injected while the target sits at a permission dialog or a numbered question is consumed as *an answer to that menu*, not read as a message. `/send-text` returns **409** when the tracked status is `needs-input` or `permission`; pass `force=1` when answering the prompt is what you actually mean. Unknown or non-live terminal → **404**.
+**Prompt-state safety.** Text injected while the target sits at a permission dialog or a numbered question is consumed as *an answer to that menu*, not read as a message. `/send-text` returns **409** when a prompt is really pending — status `permission`, or a `needs-input` that came from a Claude Code Notification hook or whose source is unknown (see `statusSource`, v0.35.0+); pass `force=1` when answering the prompt is what you actually mean. Unknown or non-live terminal → **404**.
 
 **Exit 0 means delivered, not received.** `sendText` queues in the terminal buffer when the target is mid-execution, so a successful response says the text was written — not that the agent read it or acted on it. To confirm pickup, compare `lastHeartbeatAt` against `lastSendAt` in `/list`: a heartbeat *after* your send means the agent has acted since your text landed (v0.20.0+). Don't watch for a status transition instead — hooks fire on tool calls, so a status can lag a pickup by minutes, and a transition that does occur can't be attributed to your send.
 
@@ -593,7 +594,7 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh nudge my-task
   "lastSendAt": "2026-08-05T11:57:10.221Z" }
 ```
 
-**Why this isn't automatic.** A blind second Enter on a target that *did* consume the first one is an empty submit — harmless in most TUIs, promised by none. Whether that risk beats leaving a message stranded depends on what was sent, which is the caller's knowledge and not the bridge's. Same 409 refusal as `/send-text` when the tracked status is `needs-input` or `permission`, for a sharper reason: Enter at a menu selects whatever is highlighted.
+**Why this isn't automatic.** A blind second Enter on a target that *did* consume the first one is an empty submit — harmless in most TUIs, promised by none. Whether that risk beats leaving a message stranded depends on what was sent, which is the caller's knowledge and not the bridge's. Same 409 refusal as `/send-text` (a pending prompt: `permission`, or a `needs-input` from a Notification or of unknown source), for a sharper reason: Enter at a menu selects whatever is highlighted.
 
 It stamps `lastSendAt` and sets `lastSendDelivery` to `nudge`, so the pickup comparison keeps working after a nudge — a heartbeat later than the nudge is the agent acting on the message it just released.
 

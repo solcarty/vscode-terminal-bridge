@@ -208,6 +208,13 @@ async function persistMetadata(context, name, update) {
 
     if ('status' in update && update.status !== (prev?.status ?? null)) {
       next.statusChangedAt = now;
+      // The source describes the CURRENT value only. A change of value drops it
+      // (unless this write names one), so a later real prompt is never read
+      // through a stale source.
+      if (!('statusSource' in update)) next.statusSource = null;
+    } else if ('statusSource' in update && prev?.statusSource === 'notification') {
+      // Same value re-written: a pending prompt's source is never downgraded.
+      next.statusSource = 'notification';
     }
 
     meta[name] = next;
@@ -1086,6 +1093,20 @@ async function forgetTerminal(context, name) {
 // than read as a message. Refused without force=1.
 const PROMPT_STATES = new Set(['needs-input', 'permission']);
 
+// #68 — where a `needs-input` came from. Only a Notification hook means a
+// prompt is on screen. `manual` (bridgectl status) and `stop-promotion` (a turn
+// end with no handoff) are flags for the orchestrator, not prompts. Anything
+// else, including a missing source (row from an older version), is refused:
+// fail-safe, since injected text at a real menu is read as its answer.
+const STATUS_SOURCES = new Set(['notification', 'manual', 'stop-promotion']);
+const PROMPT_FREE_SOURCES = new Set(['manual', 'stop-promotion']);
+function isPendingPrompt(meta) {
+  const status = meta?.status ?? null;
+  if (status === 'permission') return true;
+  if (status === 'needs-input') return !PROMPT_FREE_SOURCES.has(meta.statusSource);
+  return false;
+}
+
 const PASTE_START = '\x1b[200~';
 const PASTE_END   = '\x1b[201~';
 
@@ -1238,7 +1259,7 @@ async function sendTextToTerminal(context, name, text, opts = {}) {
   const worker = readWorker(meta.cwd);
   if (worker) return sendToWorkerInbox(context, name, worker, text, { submit, force, status });
 
-  if (!force && PROMPT_STATES.has(status)) {
+  if (!force && isPendingPrompt(meta)) {
     return {
       ok: false, code: 409, name, status,
       error: `Terminal is at an interactive prompt (status=${status}); text would be read as an answer to it. Re-send with force=1 if that's intended.`,
@@ -1332,7 +1353,7 @@ async function nudgeTerminal(context, name, opts = {}) {
     return { ok: false, code: 400, name, status, mode: 'headless',
       error: 'Headless worker: there is no input box to nudge. Inbox sends are delivered whole (delivery=inbox) and never strand.' };
   }
-  if (!force && PROMPT_STATES.has(status)) {
+  if (!force && isPendingPrompt(meta)) {
     return {
       ok: false, code: 409, name, status,
       error: `Terminal is at an interactive prompt (status=${status}); a bare Enter would select whatever it has highlighted. Re-send with force=1 if that's intended.`,
@@ -1676,6 +1697,8 @@ function startBridge(bridgeHost, context) {
       const iconId  = url.searchParams.get('icon')  || undefined;
       const quiet   = url.searchParams.get('quiet') === '1';
       // status= is present in the query string but may be empty string → treat as undefined
+      const srcRaw  = url.searchParams.get('source');
+      const statusSource = STATUS_SOURCES.has(srcRaw) ? srcRaw : null;
       const statusRaw = url.searchParams.has('status') ? url.searchParams.get('status') : undefined;
       const status  = statusRaw || undefined;  // coerce empty string to undefined
 
@@ -1743,7 +1766,7 @@ function startBridge(bridgeHost, context) {
       // touches the tab any more; quiet= survives for callers that pass it.
       if (quiet) {
         if (status !== undefined) {
-          await persistMetadata(context, name, { status: status === 'none' ? null : status });
+          await persistMetadata(context, name, { status: status === 'none' ? null : status, ...(statusSource ? { statusSource } : {}) });
         }
         const quietMeta = loadMetadata(context)[name] ?? {};
         const quietCfg  = (() => {
@@ -1767,7 +1790,7 @@ function startBridge(bridgeHost, context) {
       // it's a function of BOTH dimensions (see displayStatusKey), so it has to
       // read the stored state rather than just this call's.
       if (status !== undefined) {
-        await persistMetadata(context, name, { status: status === 'none' ? null : status });
+        await persistMetadata(context, name, { status: status === 'none' ? null : status, ...(statusSource ? { statusSource } : {}) });
       }
 
       const shown = await recordPresentation(context, name, {
@@ -2469,6 +2492,9 @@ function startBridge(bridgeHost, context) {
         createdAt: meta.createdAt ?? null,
         updatedAt: meta.updatedAt ?? null,
         statusChangedAt: meta.statusChangedAt ?? null,
+        // #68 — where the current `needs-input` came from (notification |
+        // manual | stop-promotion); null when unknown or not applicable.
+        statusSource: meta.statusSource ?? null,
         lastHeartbeatAt: meta.lastHeartbeatAt ?? null,
         // v0.20.0+ — set by /send-text on a submitted send. Compare against
         // lastHeartbeatAt to tell "delivered but not picked up" from

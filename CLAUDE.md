@@ -129,6 +129,12 @@ present it decides on its own: only `idle_prompt` is downgraded, and an unknown 
 `needs-input` even when the wording looks idle. The message match is now only the fallback for
 payloads that have no type.
 
+## The send guard refuses a pending prompt, not every `needs-input` (#68, v0.35.0+)
+
+`send`/`nudge` refused on any `needs-input`, but a row reaches it three ways and only a Notification hook means a menu is on screen. A worker that hits its attempt cap sets `HUMAN_INTERVENTION` and `needs-input` itself, as its mission says, and that is exactly when the orchestrator must send the next instruction; the guard refused, the orchestrator may not `--force`, and a human had to type into the tab (house.health#5907, tab 5795). Sol chose to change the bridge, not the orchestrator's rule.
+
+`/rename-terminal` takes `source=notification|manual|stop-promotion`; the row stores it as `statusSource` and `/list` reports it. `bridgectl status` sends `manual`, `hook-status` sends `notification` for a `needs-input` and `stop-promotion` for the #4589 promotion. **Fail-safe:** the guard (`isPendingPrompt`) lets only `manual` and `stop-promotion` through, so a missing or unrecognised source — an older `bridgectl` calling a newer bridge, a row from before this version — is still refused. The source is dropped when the status value changes, so a later real prompt is never read through a stale one, and a same-value write never downgrades a `notification` source. The headless worker path returns before the guard and is unchanged.
+
 ## Background work is a second dimension, not a status (v0.21.0+)
 
 `status` is last-writer-wins, and the states written into it aren't mutually exclusive. Turn state (`working`/`idle`/`needs-input`, from `PreToolUse`/`Notification`/`Stop`) and outstanding background work (`bg-task`, from `TaskCreated`) were sharing one field. An agent that started a background task and then ended its turn wrote `bg-task` and had it overwritten moments later — so the tab read `needs-input`, the one status asserting a human is required, for exactly the interval the work was in flight. An orchestrator reading `list` sent attention to a tab that needed nothing.

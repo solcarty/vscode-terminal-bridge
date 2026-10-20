@@ -935,12 +935,13 @@ bridge_status() {
     echo "usage: bridgectl.sh status <name> <state>" >&2
     return 2
   fi
-  local name="$1" state="$2"
+  local name="$1" state="$2" source="${3:-manual}"
   local port
   port=$(_bridge_port)
   curl -fsS -m 1 --get \
     --data-urlencode "name=$name" \
     --data-urlencode "status=$state" \
+    --data-urlencode "source=$source" \
     "http://127.0.0.1:${port}/rename-terminal" >/dev/null 2>&1 || true
 }
 
@@ -1150,13 +1151,14 @@ bridge_hook_status() {
   # and every `send` to it needed --force. A confirmed handoff clears the
   # turn-start mark, so the ~60s idle nudge that follows (downgraded to `idle`
   # above) fails open instead of re-promoting; the next `working` re-arms it.
-  local handed_off=""
+  local handed_off="" source="hook"
+  [ "$state" = "needs-input" ] && source="notification"
   if [ "$state" = "idle" ]; then
     if printf '%s' "$payload" \
         | grep -qE '"last_assistant_message"[[:space:]]*:[[:space:]]*("[^"]|\[[[:space:]]*\{)'; then
       handed_off=1
     elif _bridge_idle_needs_note "$name" 2>/dev/null; then
-      state="needs-input"
+      state="needs-input"; source="stop-promotion"
     fi
   fi
 
@@ -1165,7 +1167,7 @@ bridge_hook_status() {
   else
     _bridge_turn_track "$name" "$state" 2>/dev/null || true
   fi
-  bridge_status "$name" "$state"
+  bridge_status "$name" "$state" "$source"
 }
 
 # _bridge_claude_hook_spec <ctl> — the canonical Claude Code hook wiring, one

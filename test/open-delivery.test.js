@@ -53,6 +53,15 @@ const wait = ms => new Promise(r => setTimeout(r, ms));
   check('a shell that never reported ready is recorded as written blind, not confirmed',
     r && r.cmdDelivery === 'timeout', r);
 
+  // #6561: a process id that never resolved on top of that is no shell at all.
+  h.vscodeMock._createPid = 'never';
+  await get(port, '/open-terminal?name=noshell&cwd=/tmp/n&cmd=echo%20hi');
+  h.vscodeMock._createPid = undefined;
+  await wait(300);
+  r = await row('noshell');
+  check('no shell integration and no process id reads no-shell, not timeout',
+    r && r.cmdDelivery === 'no-shell', r);
+
   // No command means nothing to deliver, and must not read as a failed one.
   await get(port, '/open-terminal?name=bare&cwd=/tmp/c');
   await wait(300);

@@ -32,13 +32,13 @@ registry_line=$(node -e '
   console.log(`${cfg.host} ${cfg.port} ${cfg.token}`);
 ' "$nodes_file" "$node_name") || {
   echo "bridge-tail: unknown node \"$node_name\" — check $nodes_file" >&2
-  bridge_status "$tab_name" error
+  bridge_status "$tab_name" error || true
   exit 1
 }
 read -r host port token <<< "$registry_line"
 
 offset=0
-bridge_status "$tab_name" working
+bridge_status "$tab_name" working || true
 
 while true; do
   resp=$(curl -fsS -m 5 --get \
@@ -92,11 +92,11 @@ while true; do
 
   if [ "$done_flag" = "1" ]; then
     if [ "$exit_code" = "0" ]; then
-      bridge_status "$tab_name" task-done
+      bridge_status "$tab_name" task-done || true
       exit 0
     else
       echo "[bridge-tail] job exited $exit_code" >&2
-      bridge_status "$tab_name" error
+      bridge_status "$tab_name" error || true
       exit 1
     fi
   fi

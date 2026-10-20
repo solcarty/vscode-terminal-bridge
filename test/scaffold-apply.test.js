@@ -53,11 +53,11 @@ check('the matcher-scoped PreToolUse group is left untouched',
   cfg.hooks.PreToolUse);
 check('the scaffolded PreToolUse hook goes in its own group, inheriting no matcher',
   cfg.hooks.PreToolUse[1].matcher === undefined, cfg.hooks.PreToolUse);
-check('all 8 hooks are present after one run',
-  ['PreToolUse', 'Notification', 'Stop', 'SubagentStart', 'SubagentStop', 'TaskCreated', 'TaskCompleted']
-    .flatMap(e => cmds(cfg, e)).filter(c => c.includes('bridgectl.sh')).length === 8, cfg.hooks);
+check('all 9 hooks are present after one run',
+  ['UserPromptSubmit', 'PreToolUse', 'Notification', 'Stop', 'SubagentStart', 'SubagentStop', 'TaskCreated', 'TaskCompleted']
+    .flatMap(e => cmds(cfg, e)).filter(c => c.includes('bridgectl.sh')).length === 9, cfg.hooks);
 check('the report names what was added, per event',
-  (r.stdout.match(/^\s+added\s/gm) || []).length === 8, r.stdout);
+  (r.stdout.match(/^\s+added\s/gm) || []).length === 9, r.stdout);
 check('the previous contents are backed up', fs.existsSync(live + '.bak'), fs.readdirSync(dir));
 
 // 2. Idempotent — the upgrade path has to be re-runnable.
@@ -65,8 +65,8 @@ const before = fs.readFileSync(live, 'utf8');
 r = apply(live);
 check('a second run exits 0', r.status === 0, r.stderr);
 check('a second run adds nothing', fs.readFileSync(live, 'utf8') === before, r.stdout);
-check('a second run reports already-present for all 8',
-  (r.stdout.match(/^\s+already-present\s/gm) || []).length === 8, r.stdout);
+check('a second run reports already-present for all 9',
+  (r.stdout.match(/^\s+already-present\s/gm) || []).length === 9, r.stdout);
 
 // 3. Malformed JSON: refuse. A settings.json that doesn't parse disables every
 //    setting in it, so a partial write is worse than no write at all.
@@ -90,8 +90,8 @@ check('the wrong-shaped file is untouched', read(wrongShape).hooks.Stop === 'bas
 const fresh = path.join(dir, 'nested', 'deeper', 'settings.json');
 r = apply(fresh);
 check('a missing settings.json is created', r.status === 0 && fs.existsSync(fresh), r.stderr);
-check('the created file has all 8 hooks',
-  Object.values(read(fresh).hooks).flatMap(g => g).flatMap(g => g.hooks).length === 8, read(fresh).hooks);
+check('the created file has all 9 hooks',
+  Object.values(read(fresh).hooks).flatMap(g => g).flatMap(g => g.hooks).length === 9, read(fresh).hooks);
 check('no .bak for a file that did not exist', !fs.existsSync(fresh + '.bak'), fs.readdirSync(path.dirname(fresh)));
 
 // 6. Without --apply the printed snippet still works, and says the same thing.

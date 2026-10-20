@@ -47,6 +47,7 @@ case "$sub" in
   agents)   bridge_agents   "$@" ;;
   output)  bridge_output  "$@" ;;
   hook-output) bridge_hook_output "$@" ;;
+  hook-prompt) bridge_hook_prompt "$@" ;;
   list)   bridge_list   "$@" ;;
   hook-status) bridge_hook_status "$@" ;;
   scaffold)    bridge_scaffold    "$@" ;;
@@ -59,7 +60,7 @@ case "$sub" in
     fi
     ;;
   *)
-    echo "usage: bridgectl.sh {open|close|forget|repaint|send|nudge|status|rename|sweep|list|ping|hook-status|hook-output|bg-task|note|output|pr|stage|announce|agents|scaffold|worker} [args...]" >&2
+    echo "usage: bridgectl.sh {open|close|forget|repaint|send|nudge|status|rename|sweep|list|ping|hook-status|hook-output|hook-prompt|bg-task|note|output|pr|stage|announce|agents|scaffold|worker} [args...]" >&2
     echo "       bridgectl.sh open <name> <cwd> [cmd] [icon] [color] [--node=<name>] [--ref=<ref>] [--cmd-file=<path>]" >&2
     echo "       bridgectl.sh send <name> <text>|--text-file=<path> [--no-submit] [--force] [--mode=auto|paste|literal|join] [--submit-delay=<ms>]" >&2
     echo "         (send refuses when the target sits at an interactive prompt — injected text would answer it. --force overrides.)" >&2

@@ -103,6 +103,7 @@ bash ~/.vscode-terminal-bridge/bin/bridgectl.sh sweep [--dry-run]               
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh ping [--node=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-status <status> [--name=<name>]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-output                                 # Stop hook: publish the turn's final text
+bash ~/.vscode-terminal-bridge/bin/bridgectl.sh hook-prompt                                 # UserPromptSubmit hook: confirm a send was read
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend {cline|claude} [--dir=<repo>] [--force]
 bash ~/.vscode-terminal-bridge/bin/bridgectl.sh scaffold --backend claude --apply [--settings=<path>]   # merge the hooks, don't print them
 ```
@@ -117,7 +118,20 @@ bridge_status "$NAME" working
 
 Both handle port discovery (walking up for `.vscode-bridge-port`, preferring `$VSCODE_BRIDGE_PORT` when set — see [Multi-window setup](#multi-window-setup)), falling back to `~/.vscode-terminal-bridge/port` when the caller's cwd sits outside every workspace folder. `bridge_open` and `bridge_status` return a non-zero exit code and print an error to stderr on real failures (bridge unreachable, malformed args, bridge-reported error) rather than swallowing them. Source: `bin/` in this repo.
 
-**Mutating vs. query commands.** `open`/`close`/`status`/`rename`/`sweep` no-op silently when the bridge isn't reachable — hooks call them outside VS Code and shouldn't fail under `set -e`. **`list` is different:** it prints `{"ok":false,"reason":"bridge-unreachable"}` and exits non-zero, because an empty result with exit 0 is indistinguishable from "bridge is up, tracking zero terminals". Anything polling `list` to decide whether a terminal is still alive would read that silence as fact and conclude a dead tab was simply an empty list. **If you consume `list`, check the exit code** rather than treating empty output as "no terminals".
+**Every write ends one of three ways (v0.36.0+, #6561).** `open`, `send`, `nudge`, `status` and `close` tell *refused*, *unreachable* and *unconfirmed* apart by exit code:
+
+| Exit | Outcome | Meaning | stdout |
+|---|---|---|---|
+| `0` | ok | The bridge answered `ok:true`. (`close` also exits 0 for `row-removed` and `not-tracked`.) | the bridge's JSON |
+| `1` | refused | The bridge answered, and the answer was no (unknown name, a pending prompt, bad args). | the bridge's own `{"ok":false,...}` body |
+| `3` | unreachable | No connection was made **and** `ping` fails too. | `{"ok":false,"reason":"bridge-unreachable"}` |
+| `5` | unconfirmed | The request was sent and no reply came back in time. **The write may have happened.** | `{"ok":false,"reason":"unconfirmed",...}` |
+
+Never treat `5` as "not sent" and never retry it blind: a retried `send` pastes the same text twice. Check `list` first (`lastSendAt`, `lastSendDelivery`, or whether the tab exists) and act on what it shows. `2` stays usage, and `4` stays `stage`'s `unsupported-by-bridge`. `send` and `nudge` wait 30 s (a paste send measured 14 s on a busy host), `open` 10 s, `status` and `close` 5 s. `open` prints its reason to stderr instead of stdout. `status` no longer swallows failures: a refused, unreachable or timed-out rename exits non-zero. The hooks (`hook-status`, `hook-prompt`, `hook-output`) absorb every code and always exit 0, because a hook that fails blocks the turn.
+
+Before v0.36.0 `open`/`close`/`status` returned 0 silently when no bridge could be found; they now exit `3`. A cleanup path that runs them under `set -e` and expects that silence should add `|| true`.
+
+**Query commands.** `list` prints `{"ok":false,"reason":"bridge-unreachable"}` and exits non-zero, `rename` and `sweep` still no-op silently when the bridge isn't reachable. **`list` is the one to be careful with:** it prints `{"ok":false,"reason":"bridge-unreachable"}` and exits non-zero, because an empty result with exit 0 is indistinguishable from "bridge is up, tracking zero terminals". Anything polling `list` to decide whether a terminal is still alive would read that silence as fact and conclude a dead tab was simply an empty list. **If you consume `list`, check the exit code** rather than treating empty output as "no terminals".
 
 `send` follows `list`, not the mutating commands: a message you believe was delivered but wasn't is worse than a loud failure, so an unreachable bridge, an unknown name, or a dead terminal all exit non-zero with a JSON reason.
 
@@ -399,6 +413,7 @@ The bundled `bridgectl.sh open` client checks this response and returns a non-ze
 | `shell-integration` | The shell reported ready, then the command was written. Confirmed. |
 | `prompt` | [Headless](#headless-mode-no-vs-code-window) only: the tmux pane's cursor sat after a prompt, then the command was written. Confirmed the same way. |
 | `timeout` | The ready signal never arrived; written blind after a fallback delay. The write happened — whether the shell consumed it is unknown. |
+| `no-shell` | As `timeout`, **and** the terminal's process id never resolved either (v0.36.0+). Nothing shows that a shell exists; the command was written to nothing. |
 | `none` | Nothing to deliver. |
 | `null` | Rows from before v0.25.0, or a tab that hasn't reached either outcome yet. |
 
@@ -504,6 +519,9 @@ Watching for a status *transition* instead doesn't work: hooks fire on tool call
 | `submitted` | Direct path (single-line / `literal` / `join`): text and Enter written back to back, no placeholder in between. |
 | `submit-unverified` | Paste path: the Enter was written after a delay, but whether the input widget took it is unobservable. |
 | `nudge` | The last write was a bare Enter from [`/nudge-terminal`](#get-nudge-terminal), not a message. |
+| `delivered` | A `UserPromptSubmit` hook fired in that tab after `lastSendAt` (v0.36.0+). The only value the bridge has *observed* rather than inferred. `lastSendDeliveredAt` says when. |
+
+**`delivered` needs the `UserPromptSubmit` hook** (`bridgectl hook-prompt`, added by `scaffold`; re-run `scaffold --backend claude --apply`). Without it a send stays `submitted` or `submit-unverified` forever, which is the old behaviour. It is also moved by a person typing into the tab after your send: either way a turn began after it. Staged text (`submit=0`) is never promoted, and a new send resets `lastSendDeliveredAt` to `null`. `lastPromptAt` is the latest prompt seen, send or not.
 
 **`submit-unverified` + `lastHeartbeatAt` older than `lastSendAt` is the stranded-message signature** — and it's distinguishable from an agent that is merely busy, which was the gap: both look identical through `status` and the heartbeat alone. `/nudge-terminal` is the fix; re-sending the text would duplicate it if the paste did in fact land.
 
@@ -1239,6 +1257,7 @@ curl -s "http://127.0.0.1:${PORT}/rename-terminal?name=$N&status=working" \
 
 | Hook | When it fires | Recommended `status=` |
 | ---- | ------------- | --------------------- |
+| `UserPromptSubmit` | A prompt starts a turn | no status: `hook-prompt` stamps `lastPromptAt` and moves an outstanding send to `delivered` (v0.36.0+) |
 | `PreToolUse` | Before every tool call | `working` |
 | `Notification` | Claude needs input (permission prompt, question) | `needs-input` — `hook-status` writes `idle` instead for the ~60 s "waiting for your input" nudge (`notification_type: "idle_prompt"`, or that wording when no type is sent); every other type stays `needs-input` |
 | `Stop` | Claude's turn is complete | `idle` — wire `hook-output` here too, see [read-back](#get-set-output--get-output--get-clear-output) |

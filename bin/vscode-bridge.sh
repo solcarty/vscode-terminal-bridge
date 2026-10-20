@@ -135,6 +135,64 @@ bridge_ping() {
   curl -fsS -m 1 "http://127.0.0.1:${port}/ping" >/dev/null 2>&1
 }
 
+# _bridge_write <path> <max-seconds> <curl --get args...> (#6561)
+#
+# One client for every write (open, send, nudge, status, close), because a write
+# has three different ways to not succeed and callers must be able to tell them
+# apart. Sets _BRIDGE_OUT to the bridge's reply (when there was one) and returns:
+#
+#   0  ok          the bridge answered ok:true
+#   1  refused     the bridge answered, and the answer was no (body in _BRIDGE_OUT)
+#   3  unreachable no connection was made AND `ping` fails too
+#   5  unconfirmed the request was sent and no reply came back in time. The
+#                  write MAY have happened: never retry it blind, and never read
+#                  it as "not sent". (4 stays `stage`'s unsupported-by-bridge.)
+#
+# A timeout used to print bridge-unreachable even though the text was delivered
+# (a send took 14 s against a 5 s limit); callers that retried on it pasted the
+# same message twice. curl reports whether it ever connected via time_connect,
+# which is the evidence that separates "never reached" from "reached, no reply".
+_BRIDGE_OUT=""
+_bridge_write() {
+  local path="$1" max="$2"; shift 2
+  local port raw rc=0 meta connected
+  port=$(_bridge_port)
+  max="${VSCODE_BRIDGE_WRITE_MAX:-$max}"   # test knob: lets a suite wait out a timeout in ms, not 30 s
+  # -sS, not -fsS: a 4xx body ({"ok":false,"reason":...}) is the refusal.
+  raw=$(curl -sS -m "$max" --connect-timeout 3 -w '\n%{http_code} %{time_connect}' \
+    --get "$@" "http://127.0.0.1:${port}${path}" 2>/dev/null) || rc=$?
+  meta="${raw##*$'\n'}"
+  _BRIDGE_OUT="${raw%$'\n'*}"
+  [ "$raw" = "$meta" ] && _BRIDGE_OUT=""
+  if [ "$rc" -eq 0 ]; then
+    case "$_BRIDGE_OUT" in
+      *'"ok":true'*) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+  connected="${meta#* }"
+  _BRIDGE_OUT=""
+  case "$connected" in
+    0|0.0|0.000|0.000000|"") connected=0 ;;  # time_connect is 0 only when no connect happened; loopback is ~0.0002
+    *) connected=1 ;;
+  esac
+  if [ "$connected" = 0 ] && ! bridge_ping "$port"; then
+    return 3
+  fi
+  return 5
+}
+
+# _bridge_write_report <rc> — print the JSON for the rc's outcome and return
+# it. Refused prints the bridge's own body, the others a fixed one.
+_bridge_write_report() {
+  case "$1" in
+    0|1) _bridge_emit_json "$_BRIDGE_OUT" ;;
+    3)   echo '{"ok":false,"reason":"bridge-unreachable"}' ;;
+    5)   echo '{"ok":false,"reason":"unconfirmed","detail":"sent; no reply before the client timed out - the write may have happened"}' ;;
+  esac
+  return "$1"
+}
+
 # bridge_ping_node <node-name> — checks a worker registered in
 # ~/.vscode-terminal-bridge/nodes.json directly (bypasses the local bridge
 # entirely). Returns 0 if reachable, 1 otherwise. Use this once after adding
@@ -170,7 +228,7 @@ bridge_ping_node() {
 # Write the command to <path> and pass this instead of a positional cmd; the
 # bridge runs `bash <path>` in the terminal instead.
 bridge_open() {
-  _bridge_active || return 0
+  _bridge_active || { echo "bridge_open: bridge unreachable (no port file, no /ping)" >&2; return 3; }
   local name="$1" cwd="$2"; shift 2
   local cmd="" icon="" color="" node="" ref="" cmdFile=""
   local positional=()
@@ -193,16 +251,16 @@ bridge_open() {
   [ -n "$color" ] && set -- "$@" --data-urlencode "color=$color"
   [ -n "$node" ]  && set -- "$@" --data-urlencode "node=$node"
   [ -n "$ref" ]   && set -- "$@" --data-urlencode "ref=$ref"
-  local response
+  local response rc=0
   # 10s, not 2s (#6944): open can outlast 2s (a node= round-trip), and a client
   # that gave up and retried is how one name used to get two tabs.
-  if ! response=$(curl -fsS -m 10 --get "$@" "http://127.0.0.1:${port}/open-terminal" 2>&1); then
-    echo "bridge_open: failed to reach bridge on port $port: $response" >&2
-    return 1
-  fi
-  case "$response" in
-    *'"ok":true'*) : ;;
-    *) echo "bridge_open: bridge reported failure: $response" >&2; return 1 ;;
+  _bridge_write /open-terminal 10 "$@" || rc=$?
+  response="$_BRIDGE_OUT"
+  case "$rc" in
+    0) : ;;
+    1) echo "bridge_open: refused: $response" >&2; return 1 ;;
+    3) echo "bridge_open: bridge unreachable on port $port" >&2; return 3 ;;
+    *) echo "bridge_open: unconfirmed: no reply from port $port in 10s; the tab may exist - check list before retrying" >&2; return 5 ;;
   esac
   # Not a failure — the tab opened — but the icon was not a codicon id.
   case "$response" in
@@ -310,10 +368,8 @@ bridge_send() {
 
   if ! _bridge_active; then
     echo '{"ok":false,"reason":"bridge-unreachable"}'
-    return 1
+    return 3
   fi
-  local port
-  port=$(_bridge_port)
   set -- --data-urlencode "name=$name"
   [ -n "$textFile" ] && set -- "$@" --data-urlencode "textFile=$textFile"
   [ -z "$textFile" ] && set -- "$@" --data-urlencode "text=$text"
@@ -322,19 +378,12 @@ bridge_send() {
   [ "$submit" = "0" ] && set -- "$@" --data-urlencode "submit=0"
   [ "$force" = "1" ]  && set -- "$@" --data-urlencode "force=1"
 
-  local out
-  # -sS (not -fsS) so the bridge's own 404/409 JSON body reaches the caller
-  # instead of curl swallowing it — the reason a send was refused is the whole
-  # point of the response.
-  if ! out=$(curl -sS -m 5 --get "$@" "http://127.0.0.1:${port}/send-text" 2>/dev/null); then
-    echo '{"ok":false,"reason":"bridge-unreachable"}'
-    return 1
-  fi
-  echo "$out"
-  case "$out" in
-    *'"ok":true'*) return 0 ;;
-    *) return 1 ;;
-  esac
+  # 30s (#6561): a paste send measured 14 s on a busy host. The client must
+  # outwait the extension's own submit and verify time, or a delivered send
+  # reads as a failure and its caller sends it again.
+  local rc=0
+  _bridge_write /send-text 30 "$@" || rc=$?
+  _bridge_write_report "$rc"
 }
 
 # bridge_nudge <name> [--force] — send a bare Enter into a tracked terminal.
@@ -365,21 +414,13 @@ bridge_nudge() {
 
   if ! _bridge_active; then
     echo '{"ok":false,"reason":"bridge-unreachable"}'
-    return 1
+    return 3
   fi
-  local port out
-  port=$(_bridge_port)
   set -- --data-urlencode "name=$name"
   [ "$force" = "1" ] && set -- "$@" --data-urlencode "force=1"
-  if ! out=$(curl -sS -m 5 --get "$@" "http://127.0.0.1:${port}/nudge-terminal" 2>/dev/null); then
-    echo '{"ok":false,"reason":"bridge-unreachable"}'
-    return 1
-  fi
-  _bridge_emit_json "$out"
-  case "$out" in
-    *'"ok":true'*) return 0 ;;
-    *) return 1 ;;
-  esac
+  local rc=0
+  _bridge_write /nudge-terminal 30 "$@" || rc=$?
+  _bridge_write_report "$rc"
 }
 
 # bridge_worker [options] — run an agent headless inside this terminal (#59).
@@ -476,14 +517,13 @@ _bridge_emit_json() {
 # "the terminal you asked to be gone is gone" is not a failure. Silent no-op
 # (no output at all) still means the bridge was unreachable.
 bridge_close() {
-  _bridge_active || return 0
-  local name="$1"
-  local port out
-  port=$(_bridge_port)
-  out=$(curl -sS -m 1 --get --data-urlencode "name=$name" \
-    "http://127.0.0.1:${port}/close-terminal" 2>/dev/null) || return 0
-  _bridge_emit_json "$out"
-  return 0
+  local name="$1" rc=0
+  _bridge_active || { _bridge_write_report 3; return; }
+  _bridge_write /close-terminal 5 --data-urlencode "name=$name" || rc=$?
+  # not-tracked is a 404 with ok:false, but "the terminal you asked to be gone
+  # is gone" is not a failure: it keeps exit 0 with the other outcomes.
+  case "$_BRIDGE_OUT" in *'"outcome":"not-tracked"'*) rc=0 ;; esac
+  _bridge_write_report "$rc" || return $?
 }
 
 # bridge_forget <name> — drop a tracked row WITHOUT touching any process.
@@ -930,19 +970,23 @@ bridge_rename() {
 #   merged        — skill-driven, merge-sweep finds merged PR
 #   none          — strip prefix and reset color (manual reset)
 bridge_status() {
-  _bridge_active || return 0
   if [ "$#" -lt 2 ]; then
     echo "usage: bridgectl.sh status <name> <state>" >&2
     return 2
   fi
-  local name="$1" state="$2" source="${3:-manual}"
-  local port
-  port=$(_bridge_port)
-  curl -fsS -m 1 --get \
+  local name="$1" state="$2" source="${3:-manual}" rc=0
+  # #6561: no `|| true`. A refused, unreachable or timed-out status write exits
+  # non-zero (1 / 3 / 5). Hooks that must not fail a turn go through
+  # bridge_hook_status, which absorbs the code itself.
+  if ! _bridge_active; then
+    echo '{"ok":false,"reason":"bridge-unreachable"}' >&2
+    return 3
+  fi
+  _bridge_write /rename-terminal 5 \
     --data-urlencode "name=$name" \
     --data-urlencode "status=$state" \
-    --data-urlencode "source=$source" \
-    "http://127.0.0.1:${port}/rename-terminal" >/dev/null 2>&1 || true
+    --data-urlencode "source=$source" || rc=$?
+  _bridge_write_report "$rc" >&2 || return $?
 }
 
 # ---------------------------------------------------------------------------
@@ -1167,7 +1211,24 @@ bridge_hook_status() {
   else
     _bridge_turn_track "$name" "$state" 2>/dev/null || true
   fi
-  bridge_status "$name" "$state" "$source"
+  # A hook on every tool call must never fail the turn (exit 2 would block it):
+  # the code is for `bridgectl status`, not for hooks.
+  bridge_status "$name" "$state" "$source" 2>/dev/null || true
+}
+
+# bridge_hook_prompt   (stdin: a UserPromptSubmit hook payload)  (#6561)
+#
+# Tells the bridge a prompt was submitted in this tab, which is what moves a
+# send from `submitted` to `delivered`. Best effort and silent, like
+# hook-output: a hook on every prompt must never fail or block the turn.
+bridge_hook_prompt() {
+  [ -t 0 ] || cat >/dev/null 2>&1 || true
+  [ -n "${VSCODE_BRIDGE_WORKER:-}" ] && return 0
+  _bridge_active || return 0
+  local name="${CLAUDE_TAB_NAME:-${PWD##*/}}"
+  curl -fsS -m 2 --get --data-urlencode "name=$name" \
+    "http://127.0.0.1:$(_bridge_port)/prompt-submitted" >/dev/null 2>&1 || true
+  return 0
 }
 
 # _bridge_claude_hook_spec <ctl> — the canonical Claude Code hook wiring, one
@@ -1179,6 +1240,7 @@ bridge_hook_status() {
 _bridge_claude_hook_spec() {
   local ctl="$1"
   printf '%s\t%s\n' \
+    UserPromptSubmit "bash $ctl hook-prompt" \
     PreToolUse    "bash $ctl hook-status working" \
     Notification  "bash $ctl hook-status needs-input" \
     Stop          "bash $ctl hook-status idle" \

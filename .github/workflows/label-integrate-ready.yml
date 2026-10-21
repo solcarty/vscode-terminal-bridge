@@ -1,0 +1,39 @@
+name: Label integrate:ready
+
+# A non-draft `issue-*` PR into `main` gets `integrate:ready` when it is opened or marked ready, so
+# nobody has to label by hand. pr-merge.yml still decides when it merges (green version-check, green
+# review/agent, no merge:sol); this only supplies the label it requires. Drafts, other branch
+# names, other bases and fork PRs get nothing.
+#
+# A label added with GITHUB_TOKEN does not fire `labeled` workflows, which is fine: pr-merge.yml
+# also runs when ci finishes (`workflow_run`), and the label is on the PR well before that.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  label:
+    if: >-
+      github.event.pull_request.draft == false &&
+      startsWith(github.event.pull_request.head.ref, 'issue-') &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, bridge]
+    timeout-minutes: 5
+    steps:
+      - name: Add integrate:ready
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        # curl, not gh: the self-hosted runners have no gh on PATH.
+        run: |
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/issues/$PR/labels" \
+            -d '{"labels":["integrate:ready"]}' > /dev/null

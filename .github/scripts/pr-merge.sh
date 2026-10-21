@@ -61,12 +61,18 @@ esac
 # Hold: merge:sol on the PR, or on any issue it closes (`Closes #N`, `Closes owner/repo#N`, or an
 # issue-<N>-* branch). An issue that cannot be read stops the script, so the hold never fails open.
 has_label merge:sol && stop held-for-sol "PR #$PR carries merge:sol"
-refs="$( { f .body | grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?):? +([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#[0-9]+' \
-             | sed -E 's/^[^ ]+ +//'
-           f .headRefName | sed -nE 's/^issue-([0-9]+)(-.*)?$/#\1/p'; } | sort -u)"
-for ref in $refs; do
+body_refs="$(f .body | grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?):? +([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#[0-9]+' | sed -E 's/^[^ ]+ +//')"
+branch_refs="$(f .headRefName | sed -nE 's/^issue-([0-9]+)(-.*)?$/#\1/p')"
+# An issue-<N>-* branch names an issue in the tracker repo, which is often not this one. A ref taken
+# only from the branch that does not exist here is skipped; any other read failure still stops.
+for ref in $(printf '%s\n%s\n' "$body_refs" "$branch_refs" | sort -u); do
   r="${ref%#*}"; n="${ref#*#}"; r="${r:-$REPO}"
-  il="$(gh issue view "$n" -R "$r" --json labels)" || die "could not read $r#$n for the merge:sol hold"
+  if ! il="$(gh issue view "$n" -R "$r" --json labels 2>&1)"; then
+    if ! grep -qxF "$ref" <<<"$body_refs" && grep -q 'Could not resolve to an issue or pull request' <<<"$il"; then
+      continue
+    fi
+    die "could not read $r#$n for the merge:sol hold"
+  fi
   has_label merge:sol "$il" && stop held-for-sol "issue $r#$n carries merge:sol"
 done
 

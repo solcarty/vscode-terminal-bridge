@@ -167,7 +167,7 @@ One row per tracked terminal whose tab is still open:
 | Part | What it shows |
 | ---- | ------------- |
 | Label | The terminal's name |
-| Description | With a [stage](#get-set-stage) set: `<stage label> · <i>/<n>[ · <detail>]` (an unlisted key shows as plain text). Otherwise the caller's progress text: the `rename` label minus the name (`rename feat-12 "feat-12 8/1/9 next 16:10"` shows `8/1/9 next 16:10`). With no progress text, the first line of the [note](#get-set-note--get-note--get-clear-note). |
+| Description | With a [stage](#get-set-stage) set: `<stage label>[ · <detail>]`, the caller's detail exactly as sent (an unlisted key shows its key in place of the label). The stage's place in the configured list is in the tooltip, not here. Otherwise the caller's progress text: the `rename` label minus the name (`rename feat-12 "feat-12 8/1/9 next 16:10"` shows `8/1/9 next 16:10`). With no progress text, the first line of the [note](#get-set-note--get-note--get-clear-note). |
 | Icon | The status codicon and color from the [status table](#status-values), for the row's `displayStatus` (so outstanding background work shows `bg-task` unless a person is needed). With a stage set, the stage's codicon in the status's color; `needs-input`, `permission` and `error` keep their own icon, because a person is needed. |
 | Tooltip | With a stage set, the configured stages as a list first: `✓` done (before the current one, or a `terminal` stage), `▸` current with how long it has been there, `○` the rest. Then status and how long it has been in it, the note, `cmdDelivery`, the PR URL when set, `node` when set |
 | Click | Shows that terminal |

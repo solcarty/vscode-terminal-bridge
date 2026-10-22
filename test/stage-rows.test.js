@@ -36,16 +36,19 @@ for (const status of ['needs-input', 'permission', 'error']) {
   const r = one({ status, stage: 'review', stageChangedAt: at(10) });
   check(`${status} overrides the stage icon and colour`,
     r.codicon === STATUS_MAP[status].codicon && r.color === STATUS_MAP[status].color, r);
-  check(`${status}: the stage still shows in the description`, r.description === 'Review · 2/3', r);
+  check(`${status}: the stage still shows in the description`, r.description === 'Review', r);
 }
 
 // description
-check('description is <label> · i/n',
-  one({ status: 'idle', stage: 'build' }).description === 'Build · 1/3');
+check('description is the label alone, no stage position',
+  one({ status: 'idle', stage: 'build' }).description === 'Build');
 check('description appends the detail',
-  one({ status: 'idle', stage: 'review', stageDetail: 'PR 12' }).description === 'Review · 2/3 · PR 12');
+  one({ status: 'idle', stage: 'review', stageDetail: 'PR 12' }).description === 'Review · PR 12');
 check('a stage beats the progress label and the note',
-  one({ status: 'idle', baseLabel: 'w step 4', note: 'a note', stage: 'build' }).description === 'Build · 1/3');
+  one({ status: 'idle', baseLabel: 'w step 4', note: 'a note', stage: 'build' }).description === 'Build');
+
+check('a caller count is the only fraction',
+  one({ status: 'idle', stage: 'review', stageDetail: '12/39 checks' }).description === 'Review · 12/39 checks');
 
 // unknown key
 {

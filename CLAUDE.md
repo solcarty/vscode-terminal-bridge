@@ -236,6 +236,12 @@ only other channel and is overwritten by whatever writes last.
 - **An older bridge answers an unknown route with a bare `Not found`**, which the CLI maps to exit 4
   (`unsupported-by-bridge`). An older `bridgectl` has no verb and exits 2 (usage). Both are documented
   as ignorable for a consumer that may meet an older install.
+- **The description is the caller's text, not the bridge's** (v0.38.0, #105). It is `<label>[ · <detail>]`.
+  Until v0.37 the bridge also put the stage's position in it (`CI · 6/15`), and a consumer whose detail
+  carried its own count rendered two fractions side by side (`CI · 6/15 · 12/39 checks`). The position
+  is the bridge's opinion about a consumer's process, and the tooltip list already shows it, so it was
+  dropped rather than put behind a setting: a flag per display detail is the bridge specifying its
+  consumers' output. The bridge adds no text of its own to a description.
 - The All hosts view passes no stages, so its rows are unchanged; a stage there is future work.
 
 ## Env var names: expand/contract off `HH_` (#57, v0.27.0+)

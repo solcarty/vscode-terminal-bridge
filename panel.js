@@ -57,7 +57,7 @@ function stageInfo(meta, stages) {
 }
 
 function stageDescription(info, meta) {
-  const head = info.def ? `${info.def.label} · ${info.index + 1}/${info.total}` : info.key;
+  const head = info.def ? info.def.label : info.key;
   return meta.stageDetail ? `${head} · ${meta.stageDetail}` : head;
 }
 
